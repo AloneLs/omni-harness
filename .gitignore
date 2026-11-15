@@ -1,0 +1,45 @@
+# --- build artifacts ---
+node_modules/
+dist/
+src-tauri/target/
+*.exe
+*.dll
+*.pdb
+*.lib
+*.obj
+*.exp
+*.ilk
+
+# --- tauri generated schemas are source-controlled, capability bundles are not ---
+!src-tauri/icons/
+
+# --- logs / temp ---
+*.log
+npm-debug.log*
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# --- editor / OS ---
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# --- local env / secrets ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+providers_snapshot.json
+telegram_config.json
+bootstrap.json
+
+# --- rust ---
+**/*.rs.bk
+Cargo.lock.orig
