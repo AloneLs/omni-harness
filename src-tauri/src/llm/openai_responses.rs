@@ -5,7 +5,49 @@ use crate::llm::{LlmError, StreamEvent, TokenUsage};
 use futures_util::StreamExt;
 use std::collections::HashMap;
 
+pub async fn stream_openai_codex(
+    client: &reqwest::Client,
+    caps_registry: &CapabilityRegistry,
+    request: ChatRequest,
+    sender: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> Result<(), LlmError> {
+    let empty_pool = KeyPool::new();
+    stream_openai_responses_inner(
+        client,
+        "https://chatgpt.com/backend-api/codex/responses",
+        &empty_pool,
+        "openai_codex",
+        caps_registry,
+        request,
+        sender,
+        true,
+    )
+    .await
+}
+
 pub async fn stream_openai_responses(
+    client: &reqwest::Client,
+    base_url: &str,
+    key_pool: &KeyPool,
+    provider_name: &str,
+    caps_registry: &CapabilityRegistry,
+    request: ChatRequest,
+    sender: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> Result<(), LlmError> {
+    stream_openai_responses_inner(
+        client,
+        base_url,
+        key_pool,
+        provider_name,
+        caps_registry,
+        request,
+        sender,
+        false,
+    )
+    .await
+}
+
+async fn stream_openai_responses_inner(
     client: &reqwest::Client,
     base_url: &str,
     key_pool: &KeyPool,
@@ -13,6 +55,7 @@ pub async fn stream_openai_responses(
     caps_registry: &CapabilityRegistry,
     mut request: ChatRequest,
     sender: tokio::sync::mpsc::Sender<StreamEvent>,
+    use_codex_oauth: bool,
 ) -> Result<(), LlmError> {
     let clean_base = base_url.trim_end_matches('/');
     let target_url = if clean_base.ends_with("/responses") {
@@ -21,10 +64,20 @@ pub async fn stream_openai_responses(
         format!("{}/responses", clean_base)
     };
 
-    let max_attempts = (key_pool.pool_size(provider_name) * 2).max(5) as u32;
+    let max_attempts = if use_codex_oauth { 6 } else { (key_pool.pool_size(provider_name) * 2).max(5) as u32 };
     let mut unavailable_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut excluded_oauth: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_oauth_err: Option<LlmError> = None;
     for attempt in 1..=max_attempts {
-        let api_key = key_pool.next_key_async(provider_name, base_url).await?;
+        let (api_key, oauth_acc) = if use_codex_oauth {
+            let acc = match crate::llm::oauth_accounts::acquire_valid_account(client, "openai_codex", &excluded_oauth).await {
+                Ok(a) => a,
+                Err(e) => return Err(last_oauth_err.unwrap_or(LlmError::ProviderError { status: 401, message: e })),
+            };
+            (acc.access_token.clone(), Some(acc))
+        } else {
+            (key_pool.next_key_async(provider_name, base_url).await?, None)
+        };
         let caps = caps_registry.get(&request.model);
         normalize_request(&mut request, &caps);
 
@@ -69,11 +122,21 @@ pub async fn stream_openai_responses(
             payload["tools"] = serde_json::json!(mapped_tools);
         }
 
-        let req_builder = client
+        if use_codex_oauth {
+            payload["store"] = serde_json::json!(false);
+        }
+        let mut req_builder = client
             .post(&target_url)
             .header("Authorization", format!("Bearer {}", api_key))
-            .header("Content-Type", "application/json")
-            .json(&payload);
+            .header("Content-Type", "application/json");
+        if let Some(ref acc) = oauth_acc {
+            if let Some(ref aid) = acc.account_id {
+                if !aid.trim().is_empty() {
+                    req_builder = req_builder.header("ChatGPT-Account-Id", aid.trim());
+                }
+            }
+        }
+        let req_builder = req_builder.json(&payload);
 
         let response = match req_builder.send().await {
             Ok(resp) => resp,
@@ -354,6 +417,26 @@ pub async fn stream_openai_responses(
         }
 
         let code = status.as_u16();
+        if let Some(ref acc) = oauth_acc {
+            let cd = if code == 429 { 120 } else { 30 };
+            crate::llm::oauth_accounts::mark_account_cooldown(&acc.id, cd, &error_body).await;
+            excluded_oauth.insert(acc.id.clone());
+            last_oauth_err = Some(LlmError::ProviderError { status: code, message: error_body.clone() });
+            if attempt < max_attempts && matches!(code, 401 | 403 | 429 | 500..=504) {
+                if code == 401 {
+                    let _ = crate::llm::oauth_accounts::force_refresh_account(client, &acc.id).await;
+                }
+                let _ = sender
+                    .send(StreamEvent::RetryNotice {
+                        reason: format!("ChatGPT Codex HTTP {} ({}) - switching account", code, acc.email),
+                        attempt,
+                        model: request.model.clone(),
+                    })
+                    .await;
+                continue;
+            }
+            return Err(LlmError::ProviderError { status: code, message: error_body });
+        }
         if matches!(code, 401 | 402 | 403) {
             key_pool.mark_unavailable(provider_name, base_url, &api_key, None).await;
             unavailable_keys.insert(api_key.clone());

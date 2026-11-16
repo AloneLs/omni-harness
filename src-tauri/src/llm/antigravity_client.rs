@@ -1,0 +1,518 @@
+use crate::llm::capabilities::CapabilityRegistry;
+use crate::llm::oauth_accounts;
+use crate::llm::request_compat::{ChatRequest, ContentPart, MessageContent};
+use crate::llm::{LlmError, StreamEvent, TokenUsage};
+use futures_util::StreamExt;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+
+static AG_THOUGHT_SIGNATURES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+
+fn sig_store() -> &'static Mutex<HashMap<String, String>> {
+    AG_THOUGHT_SIGNATURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn save_thought_sig(call_id: &str, sig: String) {
+    if let Ok(mut map) = sig_store().lock() {
+        if map.len() > 2000 {
+            map.clear();
+        }
+        map.insert(call_id.to_string(), sig);
+    }
+}
+
+fn get_thought_sig(call_id: &str) -> String {
+    if let Ok(map) = sig_store().lock() {
+        if let Some(sig) = map.get(call_id) {
+            return sig.clone();
+        }
+    }
+    "skip_thought_signature_validator".to_string()
+}
+
+fn clean_schema_for_antigravity(val: &serde_json::Value) -> serde_json::Value {
+    const UNSUPPORTED: &[&str] = &[
+        "patternProperties",
+        "additionalProperties",
+        "$schema",
+        "$id",
+        "$ref",
+        "$defs",
+        "definitions",
+        "examples",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "multipleOf",
+        "pattern",
+        "format",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "minProperties",
+        "maxProperties",
+    ];
+    match val {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if k == "properties" {
+                    if let serde_json::Value::Object(props_map) = v {
+                        let mut cleaned_props = serde_json::Map::new();
+                        for (pk, pv) in props_map {
+                            cleaned_props.insert(pk.clone(), clean_schema_for_antigravity(pv));
+                        }
+                        out.insert(k.clone(), serde_json::Value::Object(cleaned_props));
+                    }
+                    continue;
+                }
+                if UNSUPPORTED.contains(&k.as_str()) {
+                    continue;
+                }
+                if (k == "anyOf" || k == "oneOf") && v.is_array() {
+                    if let Some(first) = v.as_array().and_then(|a| a.first()) {
+                        if let serde_json::Value::Object(sub) = clean_schema_for_antigravity(first) {
+                            for (sk, sv) in sub {
+                                out.entry(sk).or_insert(sv);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                out.insert(k.clone(), clean_schema_for_antigravity(v));
+            }
+            if let Some(serde_json::Value::Array(req_arr)) = out.get("required").cloned() {
+                let prop_keys: std::collections::HashSet<String> = out
+                    .get("properties")
+                    .and_then(|p| p.as_object())
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                let filtered: Vec<serde_json::Value> = req_arr
+                    .into_iter()
+                    .filter(|item| item.as_str().map(|s| prop_keys.contains(s)).unwrap_or(false))
+                    .collect();
+                if filtered.is_empty() {
+                    out.remove("required");
+                } else {
+                    out.insert("required".to_string(), serde_json::Value::Array(filtered));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(arr) => {
+            serde_json::Value::Array(arr.iter().map(clean_schema_for_antigravity).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+pub async fn stream_antigravity(
+    client: &reqwest::Client,
+    caps_registry: &CapabilityRegistry,
+    request: ChatRequest,
+    sender: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> Result<(), LlmError> {
+    let model_clean = request.model.strip_prefix("models/").unwrap_or(&request.model).to_string();
+    let caps = caps_registry.get(&request.model);
+
+    let mut system_parts: Vec<serde_json::Value> = Vec::new();
+    let mut contents: Vec<serde_json::Value> = Vec::new();
+    let mut call_id_to_name: HashMap<String, String> = HashMap::new();
+
+    for msg in &request.messages {
+        if msg.role == "system" {
+            let txt = msg.content.as_text_lossy();
+            if !txt.trim().is_empty() {
+                system_parts.push(serde_json::json!({ "text": txt }));
+            }
+        } else if msg.role == "assistant" {
+            let mut parts: Vec<serde_json::Value> = Vec::new();
+            let txt = msg.content.as_text_lossy();
+            if !txt.is_empty() {
+                parts.push(serde_json::json!({ "text": txt }));
+            }
+            if let Some(ref tcs) = msg.tool_calls {
+                for tc in tcs {
+                    call_id_to_name.insert(tc.id.clone(), tc.function.name.clone());
+                    let parsed_args: serde_json::Value =
+                        serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
+                    let sig = get_thought_sig(&tc.id);
+                    parts.push(serde_json::json!({
+                        "functionCall": {
+                            "name": tc.function.name,
+                            "args": parsed_args,
+                        },
+                        "thoughtSignature": sig,
+                    }));
+                }
+            }
+            if !parts.is_empty() {
+                contents.push(serde_json::json!({
+                    "role": "model",
+                    "parts": parts,
+                }));
+            }
+        } else if msg.role == "tool" {
+            let fn_name = msg
+                .name
+                .clone()
+                .or_else(|| msg.tool_call_id.as_ref().and_then(|id| call_id_to_name.get(id).cloned()))
+                .unwrap_or_else(|| "tool".to_string());
+            let raw_out = msg.content.as_text_lossy();
+            let resp_val = serde_json::from_str::<serde_json::Value>(&raw_out)
+                .unwrap_or_else(|_| serde_json::json!({ "result": raw_out }));
+            contents.push(serde_json::json!({
+                "role": "user",
+                "parts": [{
+                    "functionResponse": {
+                        "name": fn_name,
+                        "response": resp_val,
+                    }
+                }]
+            }));
+        } else {
+            let mut parts: Vec<serde_json::Value> = Vec::new();
+            match &msg.content {
+                MessageContent::Text(t) => {
+                    if !t.is_empty() {
+                        parts.push(serde_json::json!({ "text": t }));
+                    }
+                }
+                MessageContent::Parts(vec_parts) => {
+                    for p in vec_parts {
+                        match p {
+                            ContentPart::Text { text } => {
+                                parts.push(serde_json::json!({ "text": text }));
+                            }
+                            ContentPart::ImageUrl { image_url } => {
+                                if let Some(stripped) = image_url.url.strip_prefix("data:") {
+                                    if let Some(semi) = stripped.find(';') {
+                                        let mime = &stripped[..semi];
+                                        if let Some(b64_pos) = stripped.find("base64,") {
+                                            let data = &stripped[b64_pos + 7..];
+                                            parts.push(serde_json::json!({
+                                                "inlineData": {
+                                                    "mimeType": mime,
+                                                    "data": data,
+                                                }
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !parts.is_empty() {
+                contents.push(serde_json::json!({
+                    "role": "user",
+                    "parts": parts,
+                }));
+            }
+        }
+    }
+
+    let mut gen_cfg = serde_json::Map::new();
+    if let Some(t) = request.temperature {
+        gen_cfg.insert("temperature".to_string(), serde_json::json!(t));
+    }
+    if let Some(p) = request.top_p {
+        gen_cfg.insert("topP".to_string(), serde_json::json!(p));
+    }
+    if let Some(mt) = request.max_completion_tokens.or(request.max_tokens) {
+        gen_cfg.insert("maxOutputTokens".to_string(), serde_json::json!(mt));
+    }
+
+    let m_low = model_clean.to_lowercase();
+    if let Some(budget) = request.thinking_budget {
+        if m_low.contains("gemini-3") || m_low.contains("gemini-4") {
+            let lvl = match request.reasoning_effort.as_deref() {
+                Some("low") => "LOW",
+                Some("medium") => "MEDIUM",
+                _ => "HIGH",
+            };
+            gen_cfg.insert(
+                "thinkingConfig".to_string(),
+                serde_json::json!({
+                    "includeThoughts": true,
+                    "thinkingLevel": lvl,
+                }),
+            );
+        } else if caps.supports_reasoning || m_low.contains("2.5") || m_low.contains("thinking") || m_low.contains("claude") {
+            gen_cfg.insert(
+                "thinkingConfig".to_string(),
+                serde_json::json!({
+                    "includeThoughts": true,
+                    "thinkingBudget": budget,
+                }),
+            );
+        }
+    }
+
+    let mut inner_req = serde_json::json!({
+        "contents": contents,
+        "generationConfig": serde_json::Value::Object(gen_cfg),
+    });
+    if !system_parts.is_empty() {
+        inner_req["systemInstruction"] = serde_json::json!({ "role": "user", "parts": system_parts });
+    }
+    inner_req["session_id"] = serde_json::json!(oauth_accounts::machine_session_id());
+    if let Some(ref tools) = request.tools {
+        if !tools.is_empty() {
+            let decls: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    let mut cleaned = clean_schema_for_antigravity(&t.function.parameters);
+                    if let serde_json::Value::Object(ref mut obj) = cleaned {
+                        obj.entry("type".to_string()).or_insert(serde_json::json!("object"));
+                    }
+                    serde_json::json!({
+                        "name": t.function.name,
+                        "description": t.function.description,
+                        "parameters": cleaned,
+                    })
+                })
+                .collect();
+            inner_req["tools"] = serde_json::json!([{ "functionDeclarations": decls }]);
+        }
+    }
+
+    let target_url = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
+    let mut excluded_ids = HashSet::new();
+    let mut last_err: Option<LlmError> = None;
+    let max_attempts = 6u32;
+
+    for attempt in 1..=max_attempts {
+        let mut acc = match oauth_accounts::acquire_valid_account(client, "antigravity", &excluded_ids).await {
+            Ok(a) => a,
+            Err(e) => {
+                return Err(last_err.unwrap_or(LlmError::ProviderError { status: 401, message: e }));
+            }
+        };
+
+        let project_id = match acc.project_id.clone() {
+            Some(p) if !p.trim().is_empty() => p,
+            _ => oauth_accounts::fetch_antigravity_project_id(client, &acc.access_token).await,
+        };
+
+        let envelope = serde_json::json!({
+            "project": project_id,
+            "model": model_clean,
+            "request": inner_req,
+            "requestType": "agent",
+            "userAgent": "antigravity",
+            "requestId": format!("agent-{}-{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8]),
+        });
+
+        let response = match client
+            .post(target_url)
+            .bearer_auth(&acc.access_token)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", oauth_accounts::antigravity_hub_ua())
+            .header("X-Machine-Session-Id", oauth_accounts::machine_session_id())
+            .json(&envelope)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                oauth_accounts::mark_account_cooldown(&acc.id, 15, &err.to_string()).await;
+                excluded_ids.insert(acc.id.clone());
+                if attempt == max_attempts {
+                    return Err(LlmError::Network(err));
+                }
+                let _ = sender
+                    .send(StreamEvent::RetryNotice {
+                        reason: format!("Antigravity network error ({}): {}", acc.email, err),
+                        attempt,
+                        model: request.model.clone(),
+                    })
+                    .await;
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if status.as_u16() == 401 {
+            if let Ok(refreshed) = oauth_accounts::force_refresh_account(client, &acc.id).await {
+                acc = refreshed;
+                if let Ok(r2) = client
+                    .post(target_url)
+                    .bearer_auth(&acc.access_token)
+                    .header("Content-Type", "application/json")
+                    .header("User-Agent", oauth_accounts::antigravity_hub_ua())
+                    .header("X-Machine-Session-Id", oauth_accounts::machine_session_id())
+                    .json(&envelope)
+                    .send()
+                    .await
+                {
+                    if r2.status().is_success() {
+                        return parse_antigravity_sse(r2, sender).await;
+                    }
+                }
+            }
+            oauth_accounts::mark_account_cooldown(&acc.id, 300, "401 Unauthorized").await;
+            excluded_ids.insert(acc.id.clone());
+            if attempt == max_attempts {
+                return Err(LlmError::ProviderError {
+                    status: 401,
+                    message: format!("Antigravity authentication failed for {}", acc.email),
+                });
+            }
+            continue;
+        }
+
+        if status.is_success() {
+            return parse_antigravity_sse(response, sender).await;
+        }
+
+        let code = status.as_u16();
+        let err_body = response.text().await.unwrap_or_default();
+        let cooldown = if code == 429 { 120 } else { 30 };
+        oauth_accounts::mark_account_cooldown(&acc.id, cooldown, &err_body).await;
+        excluded_ids.insert(acc.id.clone());
+        last_err = Some(LlmError::ProviderError {
+            status: code,
+            message: format!("{} ({})", err_body, acc.email),
+        });
+
+        if attempt < max_attempts && (code == 429 || code >= 500 || code == 403) {
+            let _ = sender
+                .send(StreamEvent::RetryNotice {
+                    reason: format!("Antigravity {} ({}): switching account", code, acc.email),
+                    attempt,
+                    model: request.model.clone(),
+                })
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            continue;
+        }
+
+        return Err(LlmError::ProviderError {
+            status: code,
+            message: err_body,
+        });
+    }
+
+    Err(LlmError::ProviderError {
+        status: 429,
+        message: "All Antigravity accounts exhausted or rate-limited.".to_string(),
+    })
+}
+
+async fn parse_antigravity_sse(
+    response: reqwest::Response,
+    sender: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> Result<(), LlmError> {
+    let mut byte_stream = response.bytes_stream();
+    let mut line_buffer = String::new();
+    let mut token_usage: Option<TokenUsage> = None;
+    let mut finish_reason: Option<String> = None;
+    let mut tool_idx: usize = 0;
+
+    while let Some(chunk_res) = byte_stream.next().await {
+        let chunk = match chunk_res {
+            Ok(c) => c,
+            Err(e) => return Err(LlmError::Network(e)),
+        };
+        let text = String::from_utf8_lossy(&chunk);
+        line_buffer.push_str(&text);
+
+        while let Some(pos) = line_buffer.find('\n') {
+            let line = line_buffer[..pos].trim_end_matches('\r').to_string();
+            line_buffer = line_buffer[pos + 1..].to_string();
+            let trimmed = line.trim();
+            if !trimmed.starts_with("data:") {
+                continue;
+            }
+            let payload_str = trimmed.trim_start_matches("data:").trim();
+            if payload_str.is_empty() || payload_str == "[DONE]" {
+                continue;
+            }
+            let Ok(outer) = serde_json::from_str::<serde_json::Value>(payload_str) else {
+                continue;
+            };
+            let v = outer.get("response").unwrap_or(&outer);
+
+            if let Some(usage) = v.get("usageMetadata") {
+                let prompt = usage.get("promptTokenCount").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                let cached = usage.get("cachedContentTokenCount").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                let comp = usage.get("candidatesTokenCount").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                let thoughts = usage.get("thoughtsTokenCount").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                token_usage = Some(TokenUsage {
+                    prompt_tokens: prompt,
+                    completion_tokens: comp + thoughts,
+                    total_tokens: prompt + comp + thoughts,
+                    cached_tokens: cached,
+                    cache_read_input_tokens: cached,
+                    cache_creation_input_tokens: 0,
+                });
+            }
+
+            if let Some(cands) = v.get("candidates").and_then(|c| c.as_array()) {
+                for cand in cands {
+                    if let Some(fr) = cand.get("finishReason").and_then(|f| f.as_str()) {
+                        finish_reason = Some(fr.to_string());
+                    }
+                    if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                        for part in parts {
+                            let is_thought = part.get("thought").and_then(|b| b.as_bool()).unwrap_or(false);
+                            if let Some(txt) = part.get("text").and_then(|t| t.as_str()) {
+                                if !txt.is_empty() {
+                                    if is_thought {
+                                        let _ = sender
+                                            .send(StreamEvent::ReasoningDelta {
+                                                delta: txt.to_string(),
+                                            })
+                                            .await;
+                                    } else {
+                                        let _ = sender
+                                            .send(StreamEvent::ContentDelta {
+                                                delta: txt.to_string(),
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            if let Some(fc) = part.get("functionCall") {
+                                if let Some(fname) = fc.get("name").and_then(|n| n.as_str()) {
+                                    let call_id = format!("ag_call_{}", uuid::Uuid::new_v4().simple());
+                                    if let Some(sig) = part
+                                        .get("thoughtSignature")
+                                        .or_else(|| fc.get("thoughtSignature"))
+                                        .and_then(|s| s.as_str())
+                                    {
+                                        save_thought_sig(&call_id, sig.to_string());
+                                    }
+                                    let args_str = fc
+                                        .get("args")
+                                        .map(|a| a.to_string())
+                                        .unwrap_or_else(|| "{}".to_string());
+                                    let _ = sender
+                                        .send(StreamEvent::ToolCallComplete {
+                                            index: tool_idx,
+                                            id: call_id,
+                                            name: fname.to_string(),
+                                            arguments: args_str,
+                                        })
+                                        .await;
+                                    tool_idx += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = sender
+        .send(StreamEvent::Finish {
+            finish_reason,
+            usage: token_usage,
+        })
+        .await;
+    Ok(())
+}

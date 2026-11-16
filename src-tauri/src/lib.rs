@@ -2185,6 +2185,81 @@ async fn open_path_in_explorer(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn oauth_list_accounts(provider: Option<String>) -> Result<Vec<llm::oauth_accounts::OAuthAccountPublic>, String> {
+    Ok(llm::oauth_accounts::list_accounts(provider.as_deref()).await)
+}
+
+#[tauri::command]
+async fn oauth_start_login(
+    app: tauri::AppHandle,
+    provider: String,
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    llm::oauth_accounts::start_oauth_login(app, client, &provider).await
+}
+
+#[tauri::command]
+async fn oauth_complete_manual_login(
+    app: tauri::AppHandle,
+    provider: String,
+    code_or_url: String,
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<llm::oauth_accounts::OAuthAccountPublic, String> {
+    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    llm::oauth_accounts::complete_manual_oauth(app, client, &provider, &code_or_url).await
+}
+
+#[tauri::command]
+async fn oauth_import_local_accounts(
+    app: tauri::AppHandle,
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<Vec<llm::oauth_accounts::OAuthAccountPublic>, String> {
+    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    llm::oauth_accounts::import_local_accounts(app, client).await
+}
+
+#[tauri::command]
+async fn oauth_toggle_account(id: String, enabled: bool) -> Result<(), String> {
+    llm::oauth_accounts::toggle_account(&id, enabled).await
+}
+
+#[tauri::command]
+async fn oauth_delete_account(id: String) -> Result<(), String> {
+    llm::oauth_accounts::delete_account(&id).await
+}
+
+#[tauri::command]
+async fn oauth_fetch_antigravity_models(
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    llm::oauth_accounts::fetch_antigravity_models(&client).await
+}
+
+#[tauri::command]
+async fn oauth_fetch_codex_models(
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    llm::oauth_accounts::fetch_codex_models(&client).await
+}
+
+#[tauri::command]
+async fn oauth_fetch_claude_models(
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    llm::oauth_accounts::fetch_claude_models(&client).await
+}
+
+#[tauri::command]
 async fn list_subagents(
     state: State<'_, AppManagedState>,
 ) -> Result<Vec<engine::subagents::SubagentInfo>, String> {
@@ -2657,6 +2732,15 @@ pub fn run() {
             install_app_to_dir,
             set_windows_autostart,
             create_desktop_shortcut,
+            oauth_list_accounts,
+            oauth_start_login,
+            oauth_complete_manual_login,
+            oauth_import_local_accounts,
+            oauth_toggle_account,
+            oauth_delete_account,
+            oauth_fetch_antigravity_models,
+            oauth_fetch_codex_models,
+            oauth_fetch_claude_models,
             list_subagents,
             save_custom_subagent,
             delete_custom_subagent,

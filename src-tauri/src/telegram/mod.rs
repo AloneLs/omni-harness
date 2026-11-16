@@ -722,9 +722,32 @@ impl TelegramBotManager {
         let _media_collector = self.media_collector.clone();
 
         tokio::spawn(async move {
+            let startup_ts = chrono::Utc::now().timestamp();
             let mut offset = config_arc.read().await.offset;
+            if let Ok(drain_val) = tg_client
+                .request(
+                    "getUpdates",
+                    json!({
+                        "offset": -1,
+                        "timeout": 0,
+                        "allowed_updates": ["message", "channel_post", "callback_query"]
+                    }),
+                    1,
+                )
+                .await
+            {
+                if let Some(arr) = drain_val.as_array() {
+                    if let Some(last_id) = arr.iter().filter_map(|u| u["update_id"].as_i64()).max() {
+                        if last_id + 1 > offset {
+                            offset = last_id + 1;
+                            persist_session_snapshot(&config_arc, &config_path_arc, &sessions_arc, Some(offset)).await;
+                        }
+                    }
+                }
+            }
 
             while running_flag.load(Ordering::SeqCst) {
+                let prev_offset = offset;
                 let res = tg_client
                     .request(
                         "getUpdates",
@@ -750,6 +773,10 @@ impl TelegramBotManager {
                                 }
 
                                 if let Some(msg) = u.get("message").or_else(|| u.get("channel_post")) {
+                                    let msg_date = msg["date"].as_i64().unwrap_or(startup_ts);
+                                    if msg_date < startup_ts - 5 {
+                                        continue;
+                                    }
                                     let chat_id = msg["chat"]["id"].as_i64().unwrap_or(0);
                                     if chat_id == 0 {
                                         continue;
@@ -863,6 +890,9 @@ impl TelegramBotManager {
                     }
                 }
 
+                if offset > prev_offset {
+                    persist_session_snapshot(&config_arc, &config_path_arc, &sessions_arc, Some(offset)).await;
+                }
                 tokio::time::sleep(Duration::from_millis(150)).await;
             }
         });

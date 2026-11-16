@@ -5,6 +5,8 @@ pub mod image_gen;
 pub mod key_pool;
 pub mod models_dev;
 pub mod openai_chat;
+pub mod antigravity_client;
+pub mod oauth_accounts;
 pub mod openai_responses;
 pub mod request_compat;
 pub mod token_counter;
@@ -176,6 +178,16 @@ pub async fn dispatch_stream_with_protocol(
     let p_lower = provider_name.to_lowercase();
     let proto = api_protocol.unwrap_or("auto").trim().to_lowercase();
     let caps = caps_registry.get(&request.model);
+
+    if proto == "antigravity" {
+        return antigravity_client::stream_antigravity(client, caps_registry, request, sender).await;
+    }
+    if proto == "openai_codex" {
+        return openai_responses::stream_openai_codex(client, caps_registry, request, sender).await;
+    }
+    if proto == "claude_oauth" {
+        return anthropic::stream_anthropic_oauth(client, caps_registry, request, sender).await;
+    }
 
     let use_google = match proto.as_str() {
         "google_gemini" | "gemini" => true,

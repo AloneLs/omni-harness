@@ -14,7 +14,7 @@ export interface DetectedModelInfo {
   supportsFiles: boolean;
 }
 
-export type ApiProtocol = 'auto' | 'chat_completions' | 'responses' | 'anthropic_messages' | 'google_gemini';
+export type ApiProtocol = 'auto' | 'chat_completions' | 'responses' | 'anthropic_messages' | 'google_gemini' | 'antigravity' | 'openai_codex' | 'claude_oauth';
 
 export interface ProviderConfig {
   id: string;

@@ -1,7 +1,9 @@
 <script lang="ts">
 import { slide, fade, scale } from 'svelte/transition';
 import { flip } from 'svelte/animate';
+import { onMount } from 'svelte';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { settingsStore, type ApiProtocol, type DetectedModelInfo, type ProviderConfig } from '../../lib/stores/settings.svelte';
 import Icon from '../Icon.svelte';
 
@@ -27,6 +29,244 @@ let pendingModels = $state<DetectedModelInfo[]>([]);
 let cardModelInputs = $state<Record<string, string>>({});
 
 let fetchTimer: ReturnType<typeof setTimeout> | null = null;
+
+interface OAuthAccountItem {
+  id: string;
+  provider: string;
+  email: string;
+  projectId?: string | null;
+  accountId?: string | null;
+  enabled: boolean;
+  expiresAtMs: number;
+  cooldownUntilMs?: number | null;
+  lastError?: string | null;
+}
+
+const OAUTH_PROVIDERS = [
+  { id: 'antigravity', title: 'Antigravity (Google)', subtitle: 'Gemini, Claude & GPT-OSS via Google OAuth' },
+  { id: 'openai_codex', title: 'ChatGPT Codex (OpenAI)', subtitle: 'Plus/Pro/Team subscription via OAuth' },
+  { id: 'claude_oauth', title: 'Claude (Anthropic)', subtitle: 'Pro/Max subscription via Claude Code OAuth' }
+] as const;
+
+let oauthAccounts = $state<OAuthAccountItem[]>([]);
+let oauthStatus = $state<string | null>(null);
+let oauthManualInputs = $state<Record<string, string>>({});
+let oauthPendingMode = $state<Record<string, string>>({});
+let oauthBusy = $state<Record<string, boolean>>({});
+let oauthProxyOpen = $state<boolean>(false);
+let oauthProxyEnabled = $state<boolean>(typeof localStorage !== 'undefined' && localStorage.getItem('omni_oauth_proxy_enabled') === '1');
+let oauthProxyUrl = $state<string>(typeof localStorage !== 'undefined' ? (localStorage.getItem('omni_oauth_proxy_url') || '') : '');
+
+function saveOAuthProxy() {
+  if (typeof localStorage !== 'undefined') {
+    localStorage.setItem('omni_oauth_proxy_enabled', oauthProxyEnabled ? '1' : '0');
+    localStorage.setItem('omni_oauth_proxy_url', oauthProxyUrl.trim());
+  }
+  for (const prov of Object.values(settingsStore.data.providers)) {
+    if (prov.apiProtocol === 'antigravity' || prov.apiProtocol === 'openai_codex' || prov.apiProtocol === 'claude_oauth') {
+      settingsStore.updateProvider(prov.id, {
+        proxyEnabled: oauthProxyEnabled,
+        proxyUrl: oauthProxyUrl.trim()
+      });
+    }
+  }
+  oauthStatus = oauthProxyEnabled && oauthProxyUrl.trim() ? `OAuth proxy saved: ${oauthProxyUrl.trim()}` : 'OAuth proxy disabled';
+}
+
+function getOAuthProxyParams(oauthProv?: string): { proxyEnabled: boolean; proxyUrl: string | null } {
+  const existing = oauthProv
+    ? Object.values(settingsStore.data.providers).find((p) => p.apiProtocol === oauthProv)
+    : null;
+  if (existing && existing.proxyEnabled && existing.proxyUrl?.trim()) {
+    return { proxyEnabled: true, proxyUrl: existing.proxyUrl.trim() };
+  }
+  if (oauthProxyEnabled && oauthProxyUrl.trim()) {
+    return { proxyEnabled: true, proxyUrl: oauthProxyUrl.trim() };
+  }
+  return { proxyEnabled: false, proxyUrl: null };
+}
+
+async function loadOAuthAccounts() {
+  try {
+    const res = await invoke<OAuthAccountItem[]>('oauth_list_accounts', { provider: null });
+    if (Array.isArray(res)) {
+      oauthAccounts = res;
+    }
+  } catch {}
+}
+
+onMount(() => {
+  loadOAuthAccounts();
+  let unlisten: (() => void) | null = null;
+  listen<{ provider?: string }>('oauth-accounts-updated', async (ev) => {
+    await loadOAuthAccounts();
+    if (ev.payload?.provider) {
+      await ensureOAuthProviderRegistered(ev.payload.provider);
+    }
+  }).then((fn) => (unlisten = fn)).catch(() => {});
+  return () => {
+    if (unlisten) unlisten();
+  };
+});
+
+async function ensureOAuthProviderRegistered(oauthProv: string) {
+  const existing = Object.values(settingsStore.data.providers).find((p) => p.apiProtocol === oauthProv);
+  const px = getOAuthProxyParams(oauthProv);
+  const cmdName =
+    oauthProv === 'antigravity'
+      ? 'oauth_fetch_antigravity_models'
+      : oauthProv === 'openai_codex'
+        ? 'oauth_fetch_codex_models'
+        : 'oauth_fetch_claude_models';
+
+  let models: DetectedModelInfo[] = [];
+  try {
+    const raw = await invoke<any[]>(cmdName, px);
+    if (Array.isArray(raw)) {
+      models = raw.map((m) => ({
+        id: m.id,
+        name: m.name || m.id,
+        contextWindow: m.contextWindow || 200000,
+        maxOutputTokens: m.maxOutputTokens || 32768,
+        supportsReasoning: Boolean(m.supportsReasoning),
+        supportsVision: m.supportsVision !== false,
+        supportsTools: m.supportsTools !== false,
+        supportsAudio: Boolean(m.supportsAudio),
+        supportsFiles: true
+      }));
+    }
+  } catch (err: any) {
+    oauthStatus = err instanceof Error ? err.message : String(err);
+  }
+
+  if (models.length === 0) {
+    const fallbackIds =
+      oauthProv === 'antigravity'
+        ? ['gemini-3.8-flash', 'gemini-4-argon', 'claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-oss-120b']
+        : oauthProv === 'openai_codex'
+          ? ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6.1-terra', 'gpt-6-luna', 'gpt-6-chat-thinking']
+          : ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'];
+    models = fallbackIds.map((id) => ({
+      id,
+      name: id,
+      contextWindow: oauthProv === 'openai_codex' ? 524288 : 200000,
+      maxOutputTokens: 65536,
+      supportsReasoning: true,
+      supportsVision: true,
+      supportsTools: true,
+      supportsAudio: id.includes('gemini'),
+      supportsFiles: true
+    }));
+  }
+
+  const capsMap: Record<string, DetectedModelInfo> = {};
+  for (const m of models) capsMap[m.id] = m;
+
+  if (existing) {
+    settingsStore.updateProvider(existing.id, {
+      availableModels: models.map((m) => m.id),
+      modelCapabilities: capsMap,
+      defaultModel: models.some((m) => m.id === existing.defaultModel) ? existing.defaultModel : models[0].id,
+      proxyEnabled: px.proxyEnabled,
+      proxyUrl: px.proxyUrl || ''
+    });
+  } else {
+    const meta =
+      oauthProv === 'antigravity'
+        ? { id: 'antigravity-oauth', name: 'Antigravity', baseUrl: 'https://daily-cloudcode-pa.googleapis.com' }
+        : oauthProv === 'openai_codex'
+          ? { id: 'openai-codex-oauth', name: 'ChatGPT Codex', baseUrl: 'https://chatgpt.com/backend-api/codex' }
+          : { id: 'claude-oauth', name: 'Claude OAuth', baseUrl: 'https://api.anthropic.com/v1' };
+    settingsStore.addProvider({
+      id: meta.id,
+      name: meta.name,
+      baseUrl: meta.baseUrl,
+      apiKey: '',
+      apiProtocol: oauthProv as ApiProtocol,
+      proxyEnabled: px.proxyEnabled,
+      proxyUrl: px.proxyUrl || '',
+      defaultModel: models[0].id,
+      availableModels: models.map((m) => m.id),
+      modelCapabilities: capsMap,
+      supportsReasoning: true,
+      enabled: true
+    });
+  }
+}
+
+async function startOAuthLogin(provId: string) {
+  oauthBusy = { ...oauthBusy, [provId]: true };
+  oauthStatus = null;
+  try {
+    const res = await invoke<{ authUrl: string; mode: string }>('oauth_start_login', {
+      provider: provId,
+      ...getOAuthProxyParams(provId)
+    });
+    oauthPendingMode = { ...oauthPendingMode, [provId]: res.mode || 'manual' };
+    oauthStatus = res.mode === 'callback'
+      ? `Browser opened for ${provId}. Waiting for callback (or paste redirect URL below)...`
+      : `Browser opened for ${provId}. Paste the authorization code or redirect URL below.`;
+  } catch (err: any) {
+    oauthStatus = err instanceof Error ? err.message : String(err);
+  } finally {
+    oauthBusy = { ...oauthBusy, [provId]: false };
+  }
+}
+
+async function completeManualOAuth(provId: string) {
+  const code = (oauthManualInputs[provId] || '').trim();
+  if (!code) return;
+  oauthBusy = { ...oauthBusy, [provId]: true };
+  oauthStatus = null;
+  try {
+    const acc = await invoke<OAuthAccountItem>('oauth_complete_manual_login', {
+      provider: provId,
+      codeOrUrl: code,
+      ...getOAuthProxyParams(provId)
+    });
+    oauthManualInputs = { ...oauthManualInputs, [provId]: '' };
+    oauthPendingMode = { ...oauthPendingMode, [provId]: '' };
+    await loadOAuthAccounts();
+    await ensureOAuthProviderRegistered(provId);
+    oauthStatus = `Connected ${acc.email} (${provId})`;
+  } catch (err: any) {
+    oauthStatus = err instanceof Error ? err.message : String(err);
+  } finally {
+    oauthBusy = { ...oauthBusy, [provId]: false };
+  }
+}
+
+async function importLocalOAuth() {
+  oauthBusy = { ...oauthBusy, import: true };
+  oauthStatus = null;
+  try {
+    const res = await invoke<OAuthAccountItem[]>('oauth_import_local_accounts', getOAuthProxyParams());
+    await loadOAuthAccounts();
+    const provs = new Set(res.map((a) => a.provider));
+    for (const p of provs) {
+      await ensureOAuthProviderRegistered(p);
+    }
+    oauthStatus = res.length > 0 ? `Imported ${res.length} local account(s)` : 'No local Antigravity/Codex accounts found on this PC';
+  } catch (err: any) {
+    oauthStatus = err instanceof Error ? err.message : String(err);
+  } finally {
+    oauthBusy = { ...oauthBusy, import: false };
+  }
+}
+
+async function toggleOAuthAcc(acc: OAuthAccountItem) {
+  try {
+    await invoke('oauth_toggle_account', { id: acc.id, enabled: !acc.enabled });
+    await loadOAuthAccounts();
+  } catch {}
+}
+
+async function deleteOAuthAcc(acc: OAuthAccountItem) {
+  try {
+    await invoke('oauth_delete_account', { id: acc.id });
+    await loadOAuthAccounts();
+  } catch {}
+}
 
 let providersList = $derived(Object.values(settingsStore.data.providers));
 
@@ -340,27 +580,172 @@ function handleSaveProvider(e: Event) {
 </script>
 
 <div class="space-y-5 text-[13px] text-[#E5E5E8]">
-  <div class="flex items-center justify-between">
+  <div class="flex items-center justify-between gap-3">
     <div>
       <h2 class="text-sm font-medium text-[#EDEDEF]">Models & Providers</h2>
-      <p class="text-xs text-[#73737A] mt-0.5">Auto-discover models via /models and detect capabilities.</p>
+      <p class="text-xs text-[#73737A] mt-0.5">Connect API keys or subscription OAuth accounts.</p>
     </div>
 
-    {#if providersList.length > 0 || showForm}
+    <div class="flex items-center gap-2 shrink-0">
       <button
         type="button"
-        class="h-8 px-3 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.08] text-xs font-medium text-[#E5E5E8] flex items-center gap-1.5 active:scale-[0.97] transition-all whitespace-nowrap"
-        onclick={() => (showForm ? closeForm() : openCreateForm())}
+        onclick={() => (oauthProxyOpen = !oauthProxyOpen)}
+        class="h-8 px-3 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border text-xs transition-all whitespace-nowrap {oauthProxyEnabled && oauthProxyUrl.trim() ? 'border-[#8B5CF6]/50 text-[#D8B4FE]' : 'border-white/[0.08] text-[#A3A3AA]'}"
       >
-        {#if showForm}
-          <Icon name="close" class="w-3.5 h-3.5 text-[#A3A3AA]" strokeWidth={1.8} />
-          <span>Cancel</span>
-        {:else}
-          <Icon name="plus" class="w-3.5 h-3.5 text-[#D4D4D8]" strokeWidth={1.8} />
-          <span>Add Provider</span>
-        {/if}
+        {oauthProxyEnabled && oauthProxyUrl.trim() ? 'Proxy: ON' : 'OAuth Proxy'}
       </button>
+      <button
+        type="button"
+        disabled={oauthBusy.import}
+        onclick={importLocalOAuth}
+        class="h-8 px-3 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.08] text-xs text-[#D4D4D8] active:scale-[0.97] transition-all whitespace-nowrap disabled:opacity-50"
+        title="Import existing Antigravity, Codex, or Claude credentials from this PC"
+      >
+        {oauthBusy.import ? 'Importing...' : 'Import from PC'}
+      </button>
+
+      {#if providersList.length > 0 || showForm}
+        <button
+          type="button"
+          class="h-8 px-3 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.08] text-xs font-medium text-[#E5E5E8] flex items-center gap-1.5 active:scale-[0.97] transition-all whitespace-nowrap"
+          onclick={() => (showForm ? closeForm() : openCreateForm())}
+        >
+          {#if showForm}
+            <Icon name="close" class="w-3.5 h-3.5 text-[#A3A3AA]" strokeWidth={1.8} />
+            <span>Cancel</span>
+          {:else}
+            <Icon name="plus" class="w-3.5 h-3.5 text-[#D4D4D8]" strokeWidth={1.8} />
+            <span>Add Provider</span>
+          {/if}
+        </button>
+      {/if}
+    </div>
+  </div>
+
+  {#if oauthProxyOpen}
+    <div class="p-3 rounded-[6px] bg-[#18181B]/70 border border-white/[0.08] flex items-center gap-2.5">
+      <label class="flex items-center gap-1.5 text-xs text-[#D4D4D8] shrink-0 cursor-pointer">
+        <input type="checkbox" bind:checked={oauthProxyEnabled} class="accent-[#8B5CF6]" />
+        <span>Enable Proxy</span>
+      </label>
+      <input
+        type="text"
+        bind:value={oauthProxyUrl}
+        placeholder="http://127.0.0.1:7890 or socks5://127.0.0.1:1080"
+        class="flex-1 h-7 px-2.5 rounded-[5px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#5C5C64] outline-none"
+      />
+      <button
+        type="button"
+        onclick={saveOAuthProxy}
+        class="h-7 px-3 rounded-[5px] bg-[#27272A] hover:bg-[#323236] border border-white/[0.08] text-[11px] text-[#EDEDEF] shrink-0"
+      >
+        Apply
+      </button>
+    </div>
+  {/if}
+
+  <div class="rounded-[6px] bg-[#18181B]/70 border border-white/[0.07] divide-y divide-white/[0.06]">
+    {#if oauthStatus}
+      <div class="px-3.5 py-2 bg-[#121214] text-[11px] text-[#A3A3AA]">
+        {oauthStatus}
+      </div>
     {/if}
+
+    {#each OAUTH_PROVIDERS as op}
+      {@const accs = oauthAccounts.filter((a) => a.provider === op.id)}
+      <div class="px-3.5 py-2.5 space-y-2">
+        <div class="flex items-center justify-between gap-3">
+          <div class="flex items-center gap-2.5 min-w-0">
+            <span class="text-xs font-medium text-[#E5E5E8] truncate">{op.title}</span>
+            <span class="text-[11px] text-[#686870] truncate hidden sm:inline">{op.subtitle}</span>
+            {#if accs.length > 0}
+              <span class="px-1.5 py-0.5 rounded-[4px] bg-white/[0.05] font-mono text-[10px] text-[#A3A3AA] shrink-0">{accs.length}</span>
+            {/if}
+          </div>
+          <div class="flex items-center gap-1.5 shrink-0">
+            {#if accs.length > 0}
+              <button
+                type="button"
+                onclick={() => ensureOAuthProviderRegistered(op.id)}
+                class="h-7 px-2.5 rounded-[5px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.07] text-[11px] text-[#D4D4D8] transition-colors"
+              >
+                Sync Models
+              </button>
+            {/if}
+            <button
+              type="button"
+              onclick={() => (oauthPendingMode = { ...oauthPendingMode, [op.id]: oauthPendingMode[op.id] ? '' : 'manual' })}
+              class="h-7 px-2 rounded-[5px] bg-transparent hover:bg-white/[0.05] border border-white/[0.06] text-[11px] text-[#8E8E95] hover:text-[#D4D4D8] transition-colors"
+              title="Paste callback URL or code manually"
+            >
+              Code
+            </button>
+            <button
+              type="button"
+              disabled={oauthBusy[op.id]}
+              onclick={() => startOAuthLogin(op.id)}
+              class="h-7 px-2.5 rounded-[5px] bg-[#27272A] hover:bg-[#323236] border border-white/[0.08] text-[11px] text-[#EDEDEF] transition-colors disabled:opacity-50"
+            >
+              {oauthBusy[op.id] ? 'Opening...' : '+ Connect'}
+            </button>
+          </div>
+        </div>
+
+        {#if oauthPendingMode[op.id]}
+          <div class="flex items-center gap-1.5">
+            <input
+              type="text"
+              bind:value={oauthManualInputs[op.id]}
+              placeholder="Paste redirect URL or authorization code..."
+              class="flex-1 h-7 px-2.5 rounded-[5px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#5C5C64] outline-none focus:border-white/[0.2]"
+            />
+            <button
+              type="button"
+              disabled={oauthBusy[op.id] || !(oauthManualInputs[op.id] || '').trim()}
+              onclick={() => completeManualOAuth(op.id)}
+              class="h-7 px-2.5 rounded-[5px] bg-[#27272A] hover:bg-[#323236] border border-white/[0.08] text-[11px] text-[#EDEDEF] disabled:opacity-40"
+            >
+              Verify
+            </button>
+          </div>
+        {/if}
+
+        {#if accs.length > 0}
+          <div class="space-y-1">
+            {#each accs as acc (acc.id)}
+              <div class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[5px] bg-[#121214] border border-white/[0.05] text-[11px]">
+                <div class="flex items-center gap-2 min-w-0">
+                  <span class="w-1.5 h-1.5 rounded-full shrink-0 {acc.enabled ? (acc.cooldownUntilMs && acc.cooldownUntilMs > Date.now() ? 'bg-[#F59E0B]' : 'bg-[#22C55E]') : 'bg-[#52525B]'}"></span>
+                  <span class="font-mono text-[#D4D4D8] truncate">{acc.email}</span>
+                  {#if acc.projectId}
+                    <span class="font-mono text-[10px] text-[#686870] truncate">{acc.projectId}</span>
+                  {/if}
+                  {#if acc.lastError}
+                    <span class="text-[10px] text-[#F87171] truncate max-w-[180px]" title={acc.lastError}>{acc.lastError}</span>
+                  {/if}
+                </div>
+                <div class="flex items-center gap-1 shrink-0">
+                  <button
+                    type="button"
+                    onclick={() => toggleOAuthAcc(acc)}
+                    class="px-2 py-0.5 rounded bg-white/[0.04] hover:bg-white/[0.08] text-[10px] text-[#A3A3AA]"
+                  >
+                    {acc.enabled ? 'Disable' : 'Enable'}
+                  </button>
+                  <button
+                    type="button"
+                    onclick={() => deleteOAuthAcc(acc)}
+                    class="px-2 py-0.5 rounded bg-white/[0.04] hover:bg-[#EF4444]/15 text-[10px] text-[#73737A] hover:text-[#FCA5A5]"
+                  >
+                    Remove
+                  </button>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/each}
   </div>
 
 {#snippet providerForm()}
@@ -472,8 +857,8 @@ function handleSaveProvider(e: Event) {
 
         <div class="space-y-1.5">
           <span class="text-xs text-[#A3A3AA] block">API Protocol</span>
-          <div class="grid grid-cols-5 gap-1 p-1 rounded-[6px] bg-[#121214] border border-white/[0.06]">
-            {#each [['auto', 'Auto'], ['chat_completions', 'Chat'], ['responses', 'Responses'], ['anthropic_messages', 'Anthropic'], ['google_gemini', 'Google AI']] as [val, label]}
+          <div class="grid grid-cols-4 gap-1 p-1 rounded-[6px] bg-[#121214] border border-white/[0.06]">
+            {#each [['auto', 'Auto'], ['chat_completions', 'Chat'], ['responses', 'Responses'], ['anthropic_messages', 'Anthropic'], ['google_gemini', 'Google AI'], ['antigravity', 'Antigravity'], ['openai_codex', 'Codex OAuth'], ['claude_oauth', 'Claude OAuth']] as [val, label]}
               <button
                 type="button"
                 class="py-1.5 px-2 rounded-[4px] font-mono text-[11px] transition-colors {apiProtocol === val ? 'bg-white/[0.12] text-[#EDEDEF] font-medium' : 'text-[#73737A] hover:text-[#D4D4D8]'}"

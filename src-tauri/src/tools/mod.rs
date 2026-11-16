@@ -11,7 +11,7 @@ pub mod workspace;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +98,7 @@ impl ToolDispatcher {
         }
     }
 
-    pub fn for_workspace(&self, workspace_root: &Path, chat_id: &str) -> std::sync::Arc<Self> {
+    pub fn for_workspace(&self, workspace_root: &std::path::Path, chat_id: &str) -> std::sync::Arc<Self> {
         let mut roots = vec![workspace_root.to_path_buf()];
         let chat_tmp = crate::state::AppState::resolve_chat_temp_dir(Some(chat_id));
         let _ = std::fs::create_dir_all(&chat_tmp);
