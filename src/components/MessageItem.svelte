@@ -1,8 +1,8 @@
 <script lang="ts">
-import { fly } from 'svelte/transition';
+import { fly, slide } from 'svelte/transition';
 import { invoke } from '@tauri-apps/api/core';
 import Icon from './Icon.svelte';
-import type { ChatMessage } from '../lib/stores/chat.svelte';
+import { chatStore, type ChatMessage } from '../lib/stores/chat.svelte';
 import { renderMarkdown, extractVizBlocks } from '../lib/markdown';
 import TimelineBlock from './TimelineBlock.svelte';
 import InteractiveVizCard from './InteractiveVizCard.svelte';
@@ -27,6 +27,7 @@ let copied = $state<boolean>(false);
 let errorCopied = $state<boolean>(false);
 let isUserExpanded = $state<boolean>(false);
 let confirmRetry = $state<boolean>(false);
+let diffSummaryExpanded = $state<boolean>(false);
 let confirmRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 let hasHeavyHistory = $derived(
@@ -72,10 +73,55 @@ let splitPipeline = $derived.by(() => {
   if (!hasWork) {
     return { timelineSteps: [], finalContent: message.content };
   }
-  if (!message.streaming && last && last.kind === 'message') {
+  if (last && last.kind === 'message') {
     return { timelineSteps: allSteps.slice(0, -1), finalContent: last.text };
   }
   return { timelineSteps: allSteps, finalContent: '' };
+});
+
+let turnDiffSummary = $derived.by(() => {
+  if (message.role !== 'assistant' || message.streaming) {
+    return null;
+  }
+  const calls = message.toolCalls || [];
+  const byPath = new Map<string, { path: string; fileName: string; dirPath: string; added: number; removed: number }>();
+  const snapshotIds: string[] = [];
+
+  for (const tc of calls) {
+    if (tc.status !== 'success') continue;
+    if (tc.toolName !== 'edit_file' && tc.toolName !== 'write_file' && tc.toolName !== 'patch_file') continue;
+    if (!tc.output) continue;
+    try {
+      const parsed = JSON.parse(tc.output);
+      const rawPath = parsed.path || parsed.file_path || '';
+      const sid = parsed.snapshotId || '';
+      const added = Number(parsed.addedLines || 0);
+      const removed = Number(parsed.removedLines || 0);
+      if (sid && !snapshotIds.includes(sid)) snapshotIds.push(sid);
+      if (!rawPath) continue;
+      const norm = String(rawPath).replace(/\\/g, '/');
+      const idx = norm.lastIndexOf('/');
+      const fileName = idx === -1 ? norm : norm.slice(idx + 1);
+      const dirPath = idx === -1 ? '' : norm.slice(0, idx);
+      const prev = byPath.get(norm);
+      if (prev) {
+        prev.added += added;
+        prev.removed += removed;
+      } else {
+        byPath.set(norm, { path: String(rawPath), fileName, dirPath, added, removed });
+      }
+    } catch {}
+  }
+
+  const files = Array.from(byPath.values());
+  if (files.length === 0 || snapshotIds.length === 0) return null;
+  let totalAdded = 0;
+  let totalRemoved = 0;
+  for (const f of files) {
+    totalAdded += f.added;
+    totalRemoved += f.removed;
+  }
+  return { files, snapshotIds, totalAdded, totalRemoved };
 });
 
 let parsedMarkdown = $derived.by(() => {
@@ -382,6 +428,71 @@ function handleContainerClick(event: MouseEvent) {
       {/if}
 
 
+
+      {#if turnDiffSummary}
+        <div class="mt-2.5 rounded-[8px] bg-[#121215] border border-white/[0.08] overflow-hidden">
+          <div class="px-3 py-2 flex items-center justify-between gap-3">
+            <button
+              type="button"
+              onclick={() => (diffSummaryExpanded = !diffSummaryExpanded)}
+              class="flex items-center gap-2 text-xs text-[#D4D4D8] hover:text-white transition-colors min-w-0"
+            >
+              <span class="font-medium">{turnDiffSummary.files.length} {turnDiffSummary.files.length === 1 ? 'file' : 'files'} changed</span>
+              <span class="font-mono text-[11px] text-[#4ADE80]">+{turnDiffSummary.totalAdded}</span>
+              <span class="font-mono text-[11px] text-[#F87171]">-{turnDiffSummary.totalRemoved}</span>
+              <Icon
+                name="chevron-down"
+                class="w-3.5 h-3.5 text-[#73737A] transition-transform duration-150 {diffSummaryExpanded ? 'rotate-180' : '-rotate-90'}"
+                strokeWidth={1.6}
+              />
+            </button>
+
+            <button
+              type="button"
+              onclick={() =>
+                chatStore.openDiffReview(
+                  message.id,
+                  turnDiffSummary.files.map((f) => f.fileName).slice(0, 3).join(', '),
+                  turnDiffSummary.snapshotIds
+                )
+              }
+              class="h-6 px-2.5 rounded-[5px] bg-[#1C1C21] hover:bg-[#27272D] border border-white/[0.08] text-[11px] font-medium text-[#E5E5E8] transition-colors shrink-0"
+            >
+              Review
+            </button>
+          </div>
+
+          {#if diffSummaryExpanded}
+            <div transition:slide={{ duration: 150 }} class="border-t border-white/[0.06] divide-y divide-white/[0.04]">
+              {#each turnDiffSummary.files as f (f.path)}
+                <button
+                  type="button"
+                  onclick={() =>
+                    chatStore.openDiffReview(
+                      message.id,
+                      f.fileName,
+                      turnDiffSummary.snapshotIds,
+                      f.path
+                    )
+                  }
+                  class="w-full px-3 py-1.5 flex items-center justify-between gap-3 hover:bg-white/[0.03] text-left transition-colors"
+                >
+                  <div class="flex items-baseline gap-2 min-w-0">
+                    <span class="font-mono text-xs text-[#EDEDEF] truncate">{f.fileName}</span>
+                    {#if f.dirPath}
+                      <span class="font-mono text-[11px] text-[#66666D] truncate">{f.dirPath}</span>
+                    {/if}
+                  </div>
+                  <div class="flex items-center gap-1.5 shrink-0 font-mono text-[11px]">
+                    <span class="text-[#4ADE80]">+{f.added}</span>
+                    <span class="text-[#F87171]">-{f.removed}</span>
+                  </div>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/if}
 
       {#if !message.streaming && !message.error}
         <div class="space-y-1 pt-0.5">

@@ -36,6 +36,8 @@ fn main() {
                 if std::fs::copy(&dll, &dest).is_ok() {
                     copied = true;
                 }
+                let profile_dest = target_profile_dir.join("WebView2Loader.dll");
+                let _ = std::fs::copy(&dll, &profile_dest);
             }
         }
         if !copied && !dest.exists() {

@@ -260,8 +260,14 @@ function formatRelativeAge(timestamp: number): string {
         </div>
       {/if}
 
+      {@const projectChats = visibleRecent.filter((c) => Boolean(c.projectPath))}
+      {@const standaloneChats = visibleRecent.filter((c) => !c.projectPath)}
+      {@const orderedRecent = [...projectChats, ...standaloneChats]}
       <div class="space-y-0.5">
-        {#each visibleRecent as chat (chat.id)}
+        {#each orderedRecent as chat, chatIdx (chat.id)}
+          {#if projectChats.length > 0 && standaloneChats.length > 0 && chatIdx === projectChats.length}
+            <div class="my-2 border-t border-white/[0.07]"></div>
+          {/if}
           <div
             animate:flip={{ duration: 170 }}
             in:pinReceive={{ key: chat.id }}

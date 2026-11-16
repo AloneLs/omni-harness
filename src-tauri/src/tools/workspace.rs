@@ -984,6 +984,25 @@ fn apply_single_edit_cascade(source: &str, old_text: &str, new_text: &str, repla
         return Ok((restored, match_count));
     }
 
+    let esc_o = norm_old.replace("\n", "\\n");
+    if esc_o != norm_old && norm_src.contains(&esc_o) {
+        let match_count = norm_src.matches(&esc_o).count();
+        if !replace_all && match_count > 1 {
+            return Err(format!(
+                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
+                match_count
+            ));
+        }
+        let esc_n = norm_new.replace("\n", "\\n");
+        let out = if replace_all {
+            norm_src.replace(&esc_o, &esc_n)
+        } else {
+            norm_src.replacen(&esc_o, &esc_n, 1)
+        };
+        let restored = if is_crlf { out.replace('\n', "\r\n") } else { out };
+        return Ok((restored, match_count));
+    }
+
     let trim_lines = |s: &str| -> Vec<String> {
         s.lines().map(|l| l.trim_end().to_string()).collect()
     };

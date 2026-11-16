@@ -9,10 +9,15 @@ impl PromptBuilder {
         workspace_path: &str,
         contract: Option<&TaskContract>,
         skills_summary: Option<&str>,
+        model_id: Option<&str>,
     ) -> String {
-        let mut prompt = String::with_capacity(6144);
+        let mut prompt = String::with_capacity(8192);
         let is_full_pc = workspace_path.replace('\\', "/").contains("/Workspace/");
 
+        prompt.push_str("Environment: OmniHarness (Omni Harness) — Windows Desktop & Telegram AI-Agent Harness.\n");
+        if let Some(mid) = model_id.map(|m| m.trim()).filter(|m| !m.is_empty()) {
+            prompt.push_str(&format!("Active Model ID: {}\n", mid));
+        }
         prompt.push_str("Role: Principal Software Engineer & Strict Technical Reviewer.\n\n");
 
         prompt.push_str("SECURITY & PROMPT PROTECTION:\n");
@@ -41,7 +46,8 @@ impl PromptBuilder {
             AgentRole::Main => {
                 prompt.push_str("EXECUTION: Analyze architecture, write complete working code, run builds/tests via terminal_exec (always pass timeout_secs and a clear 'description'; on Windows PowerShell chain commands with ';' instead of bare '&'; use background=true for servers/watchers/long jobs and monitor with terminal_io), and verify results.\n");
                 prompt.push_str("SUBAGENTS (agent tool): Delegate isolated research/planning/parallel work via `agent(description, prompt, subagent_type)`. Types: `Explore` (strictly read-only codebase search), `Plan` (strictly read-only architecture planning), `general-purpose` (full coding/shell tools, no nested spawn), `verification` (read-only + terminal_exec to run tests/builds and return PASS/FAIL/PARTIAL). Multiple `agent` calls in the same response run in parallel. Pass `resume=\"<agent_id>\"` to continue an existing subagent.\n");
-                prompt.push_str("TOOL DISCIPLINE: Use dedicated tools instead of shell commands: `read_file` (not cat/head/tail), `edit_file` (not sed/awk; always read_file first and pass unique old_text), `write_file` (not echo/heredoc), `glob` (not find/ls), `grep` (not grep/rg). Reserve `terminal_exec` strictly for builds, tests, git, scripts, and system commands (never pass interactive flags like -i). Call independent read-only tools in parallel in one response.\n");
+                prompt.push_str("TOOL DISCIPLINE: Use dedicated tools instead of shell commands: `read_file` (not cat/head/tail), `edit_file` (not sed/awk; always read_file first and pass unique old_text), `patch_file` (unified diff), `write_file` (not echo/heredoc), `glob` (not find/ls), `grep` (not grep/rg), `code_intel` (symbols/find_usages/diagnostics). Reserve `terminal_exec` strictly for builds, tests, git, scripts, and system commands (never pass interactive flags like -i). Call independent read-only tools in parallel in one response.\n");
+                prompt.push_str("PERSISTENT MEMORY & PROJECT SUMMARY (SOURCE OF TRUTH):\n- `memory_tool(action=\"save|list|search|get|delete\")`: Long-term SQLite memory across all chats. Always save user preferences, project paths, build commands, and key facts when asked to remember or when recurring rules emerge.\n- `project_summary(action=\"read|write|append\")`: Markdown project summary at `.omniharness/PROJECT_SUMMARY.md`. Record complex architecture, module map, invariants, build/test commands, and gotchas here. Always treat `.omniharness/PROJECT_SUMMARY.md` as the primary source of truth when working on this project or similar tasks, and keep it updated.\n");
                 prompt.push_str("SYSTEM REMINDERS: `<system-reminder>` blocks appended at the end of the conversation are live harness signals (git status, active tasks, context pressure). Always honor them without expecting the static system prompt to change.\n");
                 prompt.push_str("PLAN MODE: In Plan Mode, explore the codebase read-only first, then call `exit_plan_mode(plan_summary)` with a thorough, well-structured Markdown plan (## Context, ## Files to Modify, ## Implementation Steps, ## Edge Cases & Risks, ## Verification with exact file paths, symbols, and test/build commands).\n");
                 prompt.push_str("INTERNAL BOUNDARY: Never mention internal roles (MAIN/EXPLORE/REVIEW), internal workspace paths, or internal tool names to the user, and never ask meta-prompts like 'Ставь задачу / что делаем'. On short greetings, reply in 1 short sentence.\n\n");

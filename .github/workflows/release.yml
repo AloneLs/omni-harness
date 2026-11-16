@@ -80,7 +80,25 @@ jobs:
           New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
 
           Copy-Item "src-tauri\target\release\omni-harness.exe" -Destination $pkgDir -Force
-          Copy-Item "src-tauri\target\release\WebView2Loader.dll" -Destination $pkgDir -Force
+
+          # Locate x64 WebView2Loader.dll in target directory
+          $dllItem = Get-ChildItem -Path "src-tauri\target" -Filter "WebView2Loader.dll" -Recurse |
+            Where-Object { ($_.FullName -match "\\x64\\" -or $_.DirectoryName -match "x64") -and $_.Length -gt 100000 } |
+            Select-Object -First 1
+
+          if (-not $dllItem) {
+            $dllItem = Get-ChildItem -Path "src-tauri\target" -Filter "WebView2Loader.dll" -Recurse |
+              Where-Object { $_.Length -gt 100000 } |
+              Select-Object -First 1
+          }
+
+          if (-not $dllItem) {
+            throw "WebView2Loader.dll not found in src-tauri\target"
+          }
+
+          Write-Output "Found WebView2Loader.dll at: $($dllItem.FullName) ($($dllItem.Length) bytes)"
+          Copy-Item $dllItem.FullName -Destination "$pkgDir\WebView2Loader.dll" -Force
+          Copy-Item $dllItem.FullName -Destination "src-tauri\target\release\WebView2Loader.dll" -Force
           Copy-Item "README.md" -Destination $pkgDir -Force
           Copy-Item "LICENSE" -Destination $pkgDir -Force
 

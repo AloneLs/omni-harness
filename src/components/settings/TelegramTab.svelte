@@ -306,9 +306,9 @@ async function saveBotSettings() {
       <div class="space-y-1.5">
         {#each pairedChats as chat}
           <div class="flex items-center justify-between px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.05]">
-            <div class="flex items-center gap-2.5 min-w-0">
-              <span class="text-xs text-[#EDEDEF] truncate">{chat.name}</span>
-              <span class="font-mono text-[11px] text-[#73737A]">{chat.chatId}</span>
+            <div class="flex items-baseline gap-2.5 min-w-0">
+              <span class="text-xs leading-none text-[#EDEDEF] truncate">{chat.name}</span>
+              <span class="font-mono text-[11px] leading-none text-[#73737A] shrink-0">{chat.chatId}</span>
             </div>
             <button
               type="button"

@@ -769,12 +769,29 @@ impl SingleAgentRunner {
         let _ = state.transition(TaskStateEnum::Planning);
 
         if history.is_empty() {
-            let sys_prompt = PromptBuilder::build_system_prompt(
+            let mut sys_prompt = PromptBuilder::build_system_prompt(
                 &AgentRole::Main,
                 workspace_root,
                 None,
                 None,
+                Some(model_name),
             );
+            if let Some(d) = db {
+                if let Ok(entries) = d.list_memory_entries(None) {
+                    if !entries.is_empty() {
+                        sys_prompt.push_str("\n--- LONG-TERM MEMORY (memory_entries) ---\n");
+                        let mut used_chars = 0usize;
+                        for e in entries.into_iter().take(25) {
+                            let line = format!("- [{} / {}]: {}\n", e.category, e.key, e.content.trim());
+                            if used_chars + line.len() > 2500 {
+                                break;
+                            }
+                            used_chars += line.len();
+                            sys_prompt.push_str(&line);
+                        }
+                    }
+                }
+            }
             history.push(ChatMessage::system(sys_prompt));
         }
 

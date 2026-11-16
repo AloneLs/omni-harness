@@ -156,6 +156,30 @@ impl ToolDispatcher {
         ));
 
         declarations.push(make_decl(
+            "memory_tool",
+            "Manage persistent long-term SQLite memory entries across all sessions (save, list, search, get, delete). Use when asked to remember facts, paths, build commands, or user preferences.",
+            &[
+                ("action", "string", "save | list | search | get | delete"),
+                ("category", "string", "Category e.g. project | build | preference | general"),
+                ("key", "string", "Short unique key within category (for save/get/delete)"),
+                ("content", "string", "Memory content to store (for save)"),
+                ("query", "string", "Search query (for search)"),
+                ("id", "string", "Entry ID (optional for get/delete)"),
+            ],
+            &["action"],
+        ));
+
+        declarations.push(make_decl(
+            "project_summary",
+            "Read, write, or append to the project's Markdown source-of-truth summary (.omniharness/PROJECT_SUMMARY.md). Use to persist architecture, key modules, build/test commands, and invariants.",
+            &[
+                ("action", "string", "read | write | append"),
+                ("content", "string", "Markdown content (for write or append)"),
+            ],
+            &["action"],
+        ));
+
+        declarations.push(make_decl(
             "tg_send_file",
             "Send a file asynchronously to the active Telegram chat (returns immediately with uploadId while uploading in background), check upload status, or cancel an active upload.",
             &[
@@ -486,6 +510,124 @@ impl ToolDispatcher {
                     &self.read_guard,
                 )?;
                 Ok(json!(res))
+            }
+            "memory_tool" => {
+                let db_opt = self.db.read().ok().and_then(|g| g.clone());
+                let Some(db) = db_opt else {
+                    return Err("Memory database is not initialized.".to_string());
+                };
+                let action = args.get("action").and_then(|v| v.as_str()).ok_or("Missing action")?;
+                match action {
+                    "save" => {
+                        let category = args.get("category").and_then(|v| v.as_str()).unwrap_or("general").trim();
+                        let key = args.get("key").and_then(|v| v.as_str()).ok_or("Missing key")?.trim();
+                        let content = args.get("content").and_then(|v| v.as_str()).ok_or("Missing content")?;
+                        if key.is_empty() || content.trim().is_empty() {
+                            return Err("key and content must not be empty".to_string());
+                        }
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let tok = (content.chars().count() as f64 / 3.5).ceil() as i64;
+                        if let Ok(Some(mut existing)) = db.get_memory_entry_by_key(category, key) {
+                            existing.content = content.to_string();
+                            existing.token_count = tok;
+                            existing.updated_at = now;
+                            db.update_memory_entry(&existing).map_err(|e| e.to_string())?;
+                            Ok(json!({ "status": "updated", "entry": existing }))
+                        } else {
+                            let entry = crate::db::memory::MemoryEntry {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                category: category.to_string(),
+                                key: key.to_string(),
+                                content: content.to_string(),
+                                token_count: tok,
+                                created_at: now.clone(),
+                                updated_at: now,
+                            };
+                            db.create_memory_entry(&entry).map_err(|e| e.to_string())?;
+                            Ok(json!({ "status": "created", "entry": entry }))
+                        }
+                    }
+                    "list" => {
+                        let category = args.get("category").and_then(|v| v.as_str()).filter(|c| !c.trim().is_empty());
+                        let entries = db.list_memory_entries(category).map_err(|e| e.to_string())?;
+                        Ok(json!({ "entries": entries }))
+                    }
+                    "search" => {
+                        let query = args.get("query").and_then(|v| v.as_str()).ok_or("Missing query")?;
+                        let entries = db.search_memory_entries(query).map_err(|e| e.to_string())?;
+                        Ok(json!({ "entries": entries }))
+                    }
+                    "get" => {
+                        if let Some(id) = args.get("id").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+                            let entry = db.get_memory_entry(id).map_err(|e| e.to_string())?;
+                            Ok(json!({ "entry": entry }))
+                        } else {
+                            let category = args.get("category").and_then(|v| v.as_str()).unwrap_or("general");
+                            let key = args.get("key").and_then(|v| v.as_str()).ok_or("Provide id or key")?;
+                            let entry = db.get_memory_entry_by_key(category, key).map_err(|e| e.to_string())?;
+                            Ok(json!({ "entry": entry }))
+                        }
+                    }
+                    "delete" => {
+                        if let Some(id) = args.get("id").and_then(|v| v.as_str()).filter(|s| !s.trim().is_empty()) {
+                            db.delete_memory_entry(id).map_err(|e| e.to_string())?;
+                            Ok(json!({ "status": "deleted", "id": id }))
+                        } else {
+                            let category = args.get("category").and_then(|v| v.as_str()).unwrap_or("general");
+                            let key = args.get("key").and_then(|v| v.as_str()).ok_or("Provide id or key")?;
+                            if let Some(entry) = db.get_memory_entry_by_key(category, key).map_err(|e| e.to_string())? {
+                                db.delete_memory_entry(&entry.id).map_err(|e| e.to_string())?;
+                                Ok(json!({ "status": "deleted", "id": entry.id }))
+                            } else {
+                                Err("Memory entry not found".to_string())
+                            }
+                        }
+                    }
+                    other => Err(format!("Unsupported memory_tool action: {}", other)),
+                }
+            }
+            "project_summary" => {
+                let action = args.get("action").and_then(|v| v.as_str()).ok_or("Missing action")?;
+                let summary_path = std::path::Path::new(&ws_root).join(".omniharness").join("PROJECT_SUMMARY.md");
+                match action {
+                    "read" => {
+                        if summary_path.is_file() {
+                            let txt = std::fs::read_to_string(&summary_path).map_err(|e| e.to_string())?;
+                            Ok(json!({ "path": summary_path.to_string_lossy(), "exists": true, "content": txt }))
+                        } else {
+                            Ok(json!({ "path": summary_path.to_string_lossy(), "exists": false, "content": "" }))
+                        }
+                    }
+                    "write" => {
+                        if plan_mode {
+                            return Err("Plan Mode: project_summary write is disabled in read-only Plan mode.".to_string());
+                        }
+                        let content = args.get("content").and_then(|v| v.as_str()).ok_or("Missing content")?;
+                        workspace::atomic_write_bytes(&summary_path, content.as_bytes())?;
+                        Ok(json!({ "status": "written", "path": summary_path.to_string_lossy(), "bytes": content.len() }))
+                    }
+                    "append" => {
+                        if plan_mode {
+                            return Err("Plan Mode: project_summary append is disabled in read-only Plan mode.".to_string());
+                        }
+                        let content = args.get("content").and_then(|v| v.as_str()).ok_or("Missing content")?;
+                        let mut existing = if summary_path.is_file() {
+                            std::fs::read_to_string(&summary_path).unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+                        if !existing.is_empty() && !existing.ends_with('\n') {
+                            existing.push('\n');
+                        }
+                        if !existing.is_empty() {
+                            existing.push('\n');
+                        }
+                        existing.push_str(content);
+                        workspace::atomic_write_bytes(&summary_path, existing.as_bytes())?;
+                        Ok(json!({ "status": "appended", "path": summary_path.to_string_lossy(), "bytes": existing.len() }))
+                    }
+                    other => Err(format!("Unsupported project_summary action: {}", other)),
+                }
             }
             "tg_send_file" => {
                 let cid = chat_id.unwrap_or("");

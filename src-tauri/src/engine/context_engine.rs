@@ -186,6 +186,34 @@ pub fn spill_tool_output_if_needed(
 
 pub fn read_project_memory_prefix(workspace_root: &str) -> String {
     let root = Path::new(workspace_root);
+    let mut out = String::new();
+
+    let summary_path = root.join(".omniharness").join("PROJECT_SUMMARY.md");
+    if summary_path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&summary_path) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                let cap = if trimmed.chars().count() > 8000 {
+                    format!("{}...", safe_slice_head(trimmed, 8000))
+                } else {
+                    trimmed.to_string()
+                };
+                let age_note = std::fs::metadata(&summary_path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| SystemTime::now().duration_since(t).ok())
+                    .map(|d| d.as_secs() / 86400)
+                    .filter(|days| *days >= 1)
+                    .map(|days| format!("\n<system-reminder>PROJECT_SUMMARY.md is {} day(s) old. Verify critical claims against live files if code changed.</system-reminder>", days))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "\n--- PROJECT SUMMARY (.omniharness/PROJECT_SUMMARY.md - SOURCE OF TRUTH) ---\n{}{}\n",
+                    cap, age_note
+                ));
+            }
+        }
+    }
+
     for candidate in ["AGENTS.md", "CLAUDE.md", ".omniharness/rules.md"] {
         let p = root.join(candidate);
         if p.is_file() {
@@ -205,12 +233,13 @@ pub fn read_project_memory_prefix(workspace_root: &str) -> String {
                         .filter(|days| *days >= 1)
                         .map(|days| format!("\n<system-reminder>Memory file {} is {} day(s) old. Verify its claims against live files before acting.</system-reminder>", candidate, days))
                         .unwrap_or_default();
-                    return format!("\n--- PROJECT MEMORY ({}) ---\n{}{}\n", candidate, cap, age_note);
+                    out.push_str(&format!("\n--- PROJECT MEMORY ({}) ---\n{}{}\n", candidate, cap, age_note));
+                    break;
                 }
             }
         }
     }
-    String::new()
+    out
 }
 
 pub fn read_git_short_status(workspace_root: &str) -> Option<String> {

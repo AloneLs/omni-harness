@@ -88,6 +88,7 @@ impl DebateSwarmRunner {
                     workspace_root,
                     contract.as_ref(),
                     None,
+                    None,
                 );
 
                 let mut messages = vec![ChatMessage::system(role_prompt)];

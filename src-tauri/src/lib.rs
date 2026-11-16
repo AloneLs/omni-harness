@@ -314,6 +314,60 @@ async fn list_snapshots_for_chat(
         .map_err(|e| e.to_string())
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TurnFileDiff {
+    path: String,
+    before_text: String,
+    after_text: String,
+    added_lines: i64,
+    removed_lines: i64,
+    existed_before: bool,
+}
+
+#[tauri::command]
+async fn get_turn_file_diffs(
+    state: State<'_, AppManagedState>,
+    snapshot_ids: Vec<String>,
+) -> Result<Vec<TurnFileDiff>, String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_path: std::collections::HashMap<String, (Option<Vec<u8>>, Option<Vec<u8>>, i64, i64, bool)> =
+        std::collections::HashMap::new();
+
+    for sid in snapshot_ids {
+        if let Ok(snap) = state.app_state.db.get_file_snapshot(&sid) {
+            let entry = by_path.entry(snap.file_path.clone()).or_insert_with(|| {
+                order.push(snap.file_path.clone());
+                (snap.before_blob.clone(), snap.after_blob.clone(), 0, 0, snap.existed_before)
+            });
+            entry.1 = snap.after_blob;
+            entry.2 += snap.added_lines;
+            entry.3 += snap.removed_lines;
+        }
+    }
+
+    let mut out = Vec::with_capacity(order.len());
+    for path in order {
+        if let Some((before_b, after_b, added, removed, existed_before)) = by_path.remove(&path) {
+            let before_text = before_b
+                .map(|b| String::from_utf8_lossy(&b).to_string())
+                .unwrap_or_default();
+            let after_text = after_b
+                .map(|b| String::from_utf8_lossy(&b).to_string())
+                .unwrap_or_default();
+            out.push(TurnFileDiff {
+                path,
+                before_text,
+                after_text,
+                added_lines: added,
+                removed_lines: removed,
+                existed_before,
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[tauri::command]
 async fn rollback_file_snapshot(
     state: State<'_, AppManagedState>,
@@ -651,6 +705,13 @@ async fn connect_mcp_server(
     server: mcp::McpServerConfig,
 ) -> Result<(), String> {
     state.mcp_catalog.connect_server(&server).await
+}
+
+#[tauri::command]
+async fn list_mcp_tools(
+    state: State<'_, AppManagedState>,
+) -> Result<Vec<mcp::McpToolWithServer>, String> {
+    Ok(state.mcp_catalog.list_all_tools().await)
 }
 
 #[tauri::command]
@@ -1165,6 +1226,7 @@ async fn start_chat_stream(
                     &workspace_str,
                     None,
                     None,
+                    Some(&model_id),
                 );
                 h.push(llm::request_compat::ChatMessage::system(sys_prompt));
                 h.extend(initial_history);
@@ -2436,10 +2498,25 @@ pub fn run() {
                     "show" => {
                         if let Some(win) = app.get_webview_window("main") {
                             let _ = win.show();
+                            let _ = win.unminimize();
                             let _ = win.set_focus();
                         }
                     }
                     _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        if let Some(win) = tray.app_handle().get_webview_window("main") {
+                            let _ = win.show();
+                            let _ = win.unminimize();
+                            let _ = win.set_focus();
+                        }
+                    }
                 })
                 .build(app)?;
 
@@ -2485,6 +2562,7 @@ pub fn run() {
             get_file_snapshot,
             list_snapshots_for_chat,
             rollback_file_snapshot,
+            get_turn_file_diffs,
             get_events_since,
             list_session_checkpoints,
             rewind_checkpoint,
@@ -2508,6 +2586,7 @@ pub fn run() {
             delete_mcp_server,
             connect_mcp_server,
             disconnect_mcp_server,
+            list_mcp_tools,
             import_mcp_config,
             call_mcp_tool,
             create_memory_entry,

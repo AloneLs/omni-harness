@@ -1744,30 +1744,25 @@ async fn handle_authorized_message(
             let _ = tg_client.send_html(tg_chat_id, help_html, rm.as_ref()).await;
         }
         "/new" => {
-            let model_id = resolve_provider_and_model(ctx, providers_snap, sessions, tg_chat_id)
-                .await
-                .map(|(_, m)| m.id)
-                .unwrap_or_default();
             {
                 let mut map = sessions.write().await;
                 let entry = map.entry(tg_chat_id).or_default();
                 entry.active_chat_id = None;
                 entry.pending_rename = false;
             }
-            match ensure_active_chat(ctx, sessions, tg_chat_id, &model_id, Some("Telegram Chat")).await {
-                Ok(_) => {
-                    persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
-                    let (html, _, _) =
-                        build_status_html(ctx, providers_snap, sessions, tg_chat_id).await;
-                    let rm = serde_json::to_value(TelegramMenuBuilder::main_menu()).ok();
-                    let _ = tg_client.send_html(tg_chat_id, &html, rm.as_ref()).await;
-                }
-                Err(e) => {
-                    let _ = tg_client
-                        .send_html(tg_chat_id, &escape_html(&format_user_error(&e)), None)
-                        .await;
-                }
-            }
+            persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
+            let (html, _, _) =
+                build_status_html(ctx, providers_snap, sessions, tg_chat_id).await;
+            let rm = serde_json::to_value(TelegramMenuBuilder::main_menu()).ok();
+            let _ = tg_client
+                .send_html(
+                    tg_chat_id,
+                    &format!("{}
+
+<i>Новая сессия готова — отправьте сообщение, чтобы создать чат.</i>", html),
+                    rm.as_ref(),
+                )
+                .await;
         }
         "/chats" | "/sessions" => {
             render_chats_page(tg_client, ctx, sessions, choices_arc, tg_chat_id, 0, None).await;
@@ -2018,25 +2013,26 @@ async fn handle_callback_query(
             send_or_edit(tg_client, tg_chat_id, Some(msg_id), &html, rm.as_ref()).await;
         }
         "tg:cmd:new" => {
-            let model_id = resolve_provider_and_model(ctx, providers_snap, sessions, tg_chat_id)
-                .await
-                .map(|(_, m)| m.id)
-                .unwrap_or_default();
             {
                 let mut map = sessions.write().await;
                 let entry = map.entry(tg_chat_id).or_default();
                 entry.active_chat_id = None;
                 entry.pending_rename = false;
             }
-            if let Ok(_) =
-                ensure_active_chat(ctx, sessions, tg_chat_id, &model_id, Some("Telegram Chat")).await
-            {
-                persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
-            }
+            persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
             let (html, _, _) =
                 build_status_html(ctx, providers_snap, sessions, tg_chat_id).await;
             let rm = serde_json::to_value(TelegramMenuBuilder::main_menu()).ok();
-            send_or_edit(tg_client, tg_chat_id, Some(msg_id), &html, rm.as_ref()).await;
+            send_or_edit(
+                tg_client,
+                tg_chat_id,
+                Some(msg_id),
+                &format!("{}
+
+<i>Новая сессия готова — отправьте сообщение, чтобы создать чат.</i>", html),
+                rm.as_ref(),
+            )
+            .await;
         }
         "tg:cmd:chats" => {
             render_chats_page(tg_client, ctx, sessions, choices_arc, tg_chat_id, 0, Some(msg_id))
@@ -2720,6 +2716,7 @@ async fn run_telegram_agent_turn(
                     &workspace_str,
                     None,
                     None,
+                    Some(&model.id),
                 );
                 h.push(crate::llm::request_compat::ChatMessage::system(sys_prompt));
                 for m in &existing_msgs {

@@ -8,6 +8,7 @@ import FilePreviewDrawer from './components/FilePreviewDrawer.svelte';
 import DotGridCanvas from './components/DotGridCanvas.svelte';
 import Sidebar from './components/Sidebar.svelte';
 import ChatView from './components/ChatView.svelte';
+import DiffReviewPanel from './components/DiffReviewPanel.svelte';
 import TodoContractPanel from './components/TodoContractPanel.svelte';
 import FirstRunModal from './components/FirstRunModal.svelte';
 import ProvidersTab from './components/settings/ProvidersTab.svelte';
@@ -46,6 +47,17 @@ onMount(() => {
     invoke('window_show').catch(() => {});
     launchSpring.target = { opacity: 1, scale: 1, y: 0 };
   });
+  const blockAltCapture = (e: KeyboardEvent) => {
+    if (e.key === 'Alt' || e.code === 'AltLeft' || e.code === 'AltRight') {
+      e.preventDefault();
+    }
+  };
+  window.addEventListener('keydown', blockAltCapture, { capture: true });
+  window.addEventListener('keyup', blockAltCapture, { capture: true });
+  return () => {
+    window.removeEventListener('keydown', blockAltCapture, { capture: true });
+    window.removeEventListener('keyup', blockAltCapture, { capture: true });
+  };
 });
 
 $effect(() => {
@@ -204,6 +216,7 @@ function handleGlobalKeyup(e: KeyboardEvent) {
     </div>
 
     <div class="flex-1 flex min-h-0 overflow-hidden relative z-10">
+      <DiffReviewPanel />
       <ChatView onToggleContracts={toggleContractsPanel} />
 
       {#if contractsWidth.current > 0.5}

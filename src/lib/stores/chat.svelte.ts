@@ -99,6 +99,24 @@ export interface FilePreviewRequest {
   removedTexts?: string[];
 }
 
+export interface TurnFileDiff {
+  path: string;
+  beforeText: string;
+  afterText: string;
+  addedLines: number;
+  removedLines: number;
+  existedBefore: boolean;
+}
+
+export interface InlineReviewComment {
+  id: string;
+  path: string;
+  lineNumber: number;
+  lineType: 'add' | 'del' | 'ctx';
+  lineText: string;
+  comment: string;
+}
+
 class ChatStore {
   sessions = $state<ChatSession[]>([]);
   activeChatId = $state<string | null>(null);
@@ -118,6 +136,14 @@ class ChatStore {
   showArchived = $state<boolean>(false);
   agentMode = $state<'build' | 'plan'>('build');
   filePreview = $state<FilePreviewRequest | null>(null);
+  diffReview = $state<{
+    messageId: string;
+    title: string;
+    focusPath?: string;
+    files: TurnFileDiff[];
+    loading: boolean;
+  } | null>(null);
+  inlineReviewComments = $state<InlineReviewComment[]>([]);
   sideQuestion = $state<{
     chatId: string;
     question: string;
@@ -359,6 +385,50 @@ class ChatStore {
 
   public clearSideQuestion(): void {
     this.sideQuestion = null;
+  }
+
+  public async openDiffReview(
+    messageId: string,
+    title: string,
+    snapshotIds: string[],
+    focusPath?: string
+  ): Promise<void> {
+    this.diffReview = { messageId, title, focusPath, files: [], loading: true };
+    try {
+      const files = await invoke<TurnFileDiff[]>('get_turn_file_diffs', { snapshotIds });
+      if (this.diffReview?.messageId === messageId) {
+        this.diffReview = { messageId, title, focusPath, files, loading: false };
+      }
+    } catch {
+      if (this.diffReview?.messageId === messageId) {
+        this.diffReview = { messageId, title, focusPath, files: [], loading: false };
+      }
+    }
+  }
+
+  public closeDiffReview(): void {
+    this.diffReview = null;
+  }
+
+  public addInlineReviewComment(c: Omit<InlineReviewComment, 'id'>): void {
+    this.inlineReviewComments = [
+      ...this.inlineReviewComments,
+      { ...c, id: `rev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` }
+    ];
+  }
+
+  public removeInlineReviewComment(id: string): void {
+    this.inlineReviewComments = this.inlineReviewComments.filter((c) => c.id !== id);
+  }
+
+  public async sendInlineReviewComments(): Promise<void> {
+    if (this.inlineReviewComments.length === 0) return;
+    const lines = ['[Inline Code Review]'];
+    for (const c of this.inlineReviewComments) {
+      lines.push(`- ${c.path}:${c.lineNumber} (\`${c.lineText.trim().slice(0, 120)}\`): ${c.comment}`);
+    }
+    this.inlineReviewComments = [];
+    await this.sendMessage(lines.join('\n'));
   }
 
   public async askSideQuestion(rawInput: string): Promise<void> {

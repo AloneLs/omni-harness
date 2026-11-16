@@ -363,13 +363,12 @@ function handleSaveProvider(e: Event) {
     {/if}
   </div>
 
-  {#if showForm}
-    <div transition:slide={{ duration: 180 }}>
-      <form
-        onsubmit={handleSaveProvider}
-        class="p-5 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] space-y-4"
-        in:fade={{ duration: 150 }}
-      >
+{#snippet providerForm()}
+  <form
+    onsubmit={handleSaveProvider}
+    class="p-5 rounded-[6px] bg-[#1C1C1F] border border-white/[0.12] space-y-4"
+    in:fade={{ duration: 150 }}
+  >
         <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <label class="block space-y-1.5">
             <span class="text-xs text-[#A3A3AA]">Provider Name</span>
@@ -613,7 +612,14 @@ function handleSaveProvider(e: Event) {
           </div>
         {/if}
 
-        <div class="flex justify-end pt-1">
+        <div class="flex justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onclick={closeForm}
+            class="h-8 px-3 rounded-[6px] bg-[#121214] hover:bg-[#242428] border border-white/[0.08] text-xs text-[#A3A3AA] hover:text-white active:scale-[0.97] transition-all"
+          >
+            Cancel
+          </button>
           <button
             type="submit"
             disabled={pendingModels.length === 0}
@@ -623,6 +629,11 @@ function handleSaveProvider(e: Event) {
           </button>
         </div>
       </form>
+{/snippet}
+
+  {#if showForm && !editingId}
+    <div transition:slide={{ duration: 180 }}>
+      {@render providerForm()}
     </div>
   {:else if providersList.length === 0}
     <div
@@ -646,7 +657,12 @@ function handleSaveProvider(e: Event) {
   {#if providersList.length > 0}
     <div class="space-y-3">
       {#each providersList as prov (prov.id)}
-        <div class="p-4 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] space-y-3">
+        {#if showForm && editingId === prov.id}
+          <div transition:slide={{ duration: 180 }}>
+            {@render providerForm()}
+          </div>
+        {:else}
+        <div transition:slide={{ duration: 160 }} class="p-4 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] space-y-3">
           <div class="flex items-center justify-between gap-3">
             <div class="flex items-center gap-3 min-w-0">
               <span class="font-medium text-[#EDEDEF] truncate">{prov.name}</span>
@@ -756,6 +772,7 @@ function handleSaveProvider(e: Event) {
             </div>
           </div>
         </div>
+        {/if}
       {/each}
     </div>
   {/if}
