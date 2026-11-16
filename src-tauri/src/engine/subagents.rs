@@ -61,10 +61,19 @@ pub fn is_system_subagent_name(name: &str) -> bool {
 
 pub fn subagent_search_roots(workspace_root: &str) -> Vec<(std::path::PathBuf, &'static str)> {
     let mut roots = Vec::new();
-    let ws = Path::new(workspace_root);
-    roots.push((ws.join(".omni").join("agents"), "workspace"));
-    roots.push((ws.join(".agents").join("agents"), "workspace"));
-    roots.push((ws.join(".claude").join("agents"), "workspace"));
+    if !workspace_root.trim().is_empty() {
+        roots.push((
+            crate::state::AppState::resolve_project_data_dir(workspace_root).join("agents"),
+            "workspace",
+        ));
+        let ws = Path::new(workspace_root);
+        if ws.is_dir() {
+            roots.push((ws.join(".omni").join("agents"), "workspace"));
+            roots.push((ws.join(".agents").join("agents"), "workspace"));
+            roots.push((ws.join(".claude").join("agents"), "workspace"));
+        }
+    }
+    roots.push((crate::state::AppState::resolve_agents_dir(), "global"));
     if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
         let h = Path::new(&home);
         roots.push((h.join(".omni").join("agents"), "global"));
@@ -267,13 +276,10 @@ pub fn save_custom_subagent(
         "workspace"
     };
 
-    let target_dir = if effective_scope == "global" {
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .map_err(|_| "Cannot resolve user home directory for global subagent".to_string())?;
-        Path::new(&home).join(".omni").join("agents")
+    let target_dir = if effective_scope == "global" || workspace_root.trim().is_empty() {
+        crate::state::AppState::resolve_agents_dir()
     } else {
-        Path::new(workspace_root).join(".omni").join("agents")
+        crate::state::AppState::resolve_project_data_dir(workspace_root).join("agents")
     };
     std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
 

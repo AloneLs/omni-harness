@@ -48,7 +48,7 @@
 - Embedded SQLite (`rusqlite` bundled) storing conversation histories, session artifacts, key pools, and long-term memory entries across sessions.
 
 ### 8. Remote Telegram Bridge
-- Built-in bidirectional Telegram bot bridge (`@impact_hermes_bot`) supporting remote prompts, status updates, and chunked binary distribution.
+- Built-in bidirectional Telegram bot bridge supporting remote prompts, status updates, and chunked binary distribution.
 
 ---
 

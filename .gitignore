@@ -69,6 +69,9 @@ bootstrap.json
 *.pem
 *.key
 *.cert
+AGENTS.md
+CLAUDE.md
+.omniharness/rules.md
 
 # --- IDE & OS Metadata ---
 .vscode/*

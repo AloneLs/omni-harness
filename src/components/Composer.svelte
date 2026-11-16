@@ -1,7 +1,7 @@
 <script lang="ts">
 import { onMount, tick } from 'svelte';
 import { Spring } from 'svelte/motion';
-import { fly } from 'svelte/transition';
+import { fly, slide } from 'svelte/transition';
 import Icon from './Icon.svelte';
 import FileToolIcon from './FileToolIcon.svelte';
 import { chatStore, type ChatAttachment } from '../lib/stores/chat.svelte';
@@ -29,6 +29,49 @@ let paletteSelectedIndex = $state<number>(0);
 let planFeedbackOpen = $state<boolean>(false);
 let planFeedbackText = $state<string>('');
 let planExpanded = $state<boolean>(true);
+let sideQuestionMaxHeight = $state<number>(224);
+let isResizingSideQuestion = $state<boolean>(false);
+let loadedSkills = $state<{ name: string; command: string; desc: string }[]>([]);
+
+async function refreshLoadedSkills() {
+  try {
+    const res = await invoke<any[]>('list_skills');
+    if (Array.isArray(res)) {
+      loadedSkills = res
+        .map((r) => {
+          const meta = r.metadata || r;
+          const name = String(meta.name || '').trim();
+          const rawCmd = meta.command ? String(meta.command).trim() : '';
+          const cmd = rawCmd ? (rawCmd.startsWith('/') ? rawCmd : `/${rawCmd}`) : `/${name}`;
+          return {
+            name,
+            command: cmd,
+            desc: String(meta.description || '').trim()
+          };
+        })
+        .filter((s) => s.name && !s.name.startsWith('system:'));
+    }
+  } catch {}
+}
+
+function startSideQuestionResize(e: PointerEvent) {
+  e.preventDefault();
+  isResizingSideQuestion = true;
+  const startY = e.clientY;
+  const startH = sideQuestionMaxHeight;
+  const onMove = (mv: PointerEvent) => {
+    const delta = startY - mv.clientY;
+    const maxAllowed = typeof window !== 'undefined' ? Math.min(window.innerHeight * 0.68, 620) : 540;
+    sideQuestionMaxHeight = Math.max(110, Math.min(maxAllowed, startH + delta));
+  };
+  const onUp = () => {
+    isResizingSideQuestion = false;
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+  };
+  window.addEventListener('pointermove', onMove);
+  window.addEventListener('pointerup', onUp);
+}
 
 const REASONING_LEVELS: ReasoningLevel[] = ['OFF', 'LOW', 'MEDIUM', 'HIGH', 'MAX'];
 const REASONING_LABELS: Record<ReasoningLevel, string> = {
@@ -152,6 +195,7 @@ function handleHtmlDrop(e: DragEvent) {
 }
 
 onMount(() => {
+  refreshLoadedSkills();
   let unlisten: (() => void) | null = null;
   import('@tauri-apps/api/webview')
     .then(async ({ getCurrentWebview }) => {
@@ -301,9 +345,11 @@ const SLASH_COMMANDS = [
   { cmd: '/export', desc: 'Export session as Markdown' }
 ];
 
-const SKILL_ITEMS = [
-  { name: 'skill-creator', desc: 'Create and package new skills' }
-];
+let skillItems = $derived(
+  loadedSkills.length > 0
+    ? loadedSkills
+    : [{ name: 'skill-creator', command: '/skill-create', desc: 'Create and package new skills' }]
+);
 
 let enabledProviders = $derived(
   Object.values(settingsStore.data.providers).filter((p) => p.enabled)
@@ -331,9 +377,17 @@ let availableModels = $derived.by(() => {
   return prov.availableModels.map((m) => ({ providerId: prov.id, model: m }));
 });
 
+let allSlashCommands = $derived.by(() => {
+  const seen = new Set(SLASH_COMMANDS.map((c) => c.cmd.toLowerCase()));
+  const skillCmds = skillItems
+    .filter((s) => !seen.has(s.command.toLowerCase()))
+    .map((s) => ({ cmd: s.command, desc: `Skill: ${s.desc}` }));
+  return [...SLASH_COMMANDS, ...skillCmds];
+});
+
 let filteredSlash = $derived.by(() => {
   const q = paletteFilter.toLowerCase();
-  return SLASH_COMMANDS.filter((c) => c.cmd.toLowerCase().includes(q) || c.desc.toLowerCase().includes(q));
+  return allSlashCommands.filter((c) => c.cmd.toLowerCase().includes(q) || c.desc.toLowerCase().includes(q));
 });
 
 let filteredFiles = $derived.by(() => {
@@ -345,7 +399,9 @@ let filteredFiles = $derived.by(() => {
 
 let filteredSkills = $derived.by(() => {
   const q = paletteFilter.toLowerCase();
-  return SKILL_ITEMS.filter((s) => s.name.toLowerCase().includes(q) || s.desc.toLowerCase().includes(q));
+  return skillItems.filter(
+    (s) => s.name.toLowerCase().includes(q) || s.command.toLowerCase().includes(q) || s.desc.toLowerCase().includes(q)
+  );
 });
 
 let dynamicButtonState = $derived.by<'send' | 'stop' | 'queue' | 'continue'>(() => {
@@ -407,11 +463,13 @@ function checkPaletteTrigger() {
 
   if (maxTrigger === lastSlash) {
     activePalette = 'slash';
+    refreshLoadedSkills();
   } else if (maxTrigger === lastAt) {
     activePalette = 'at';
     workspaceStore.searchFiles(query);
   } else if (maxTrigger === lastDollar) {
     activePalette = 'dollar';
+    refreshLoadedSkills();
   }
 }
 
@@ -726,9 +784,16 @@ async function stopAndSendVoice() {
   {#if chatStore.sideQuestion && chatStore.sideQuestion.visible && chatStore.sideQuestion.chatId === chatStore.activeChatId}
     {@const sq = chatStore.sideQuestion}
     <div
-      transition:fly={{ y: 6, duration: 150 }}
+      transition:slide={{ duration: 180, axis: 'y' }}
       class="mb-2 rounded-[10px] bg-[#121214]/95 border border-white/[0.08] overflow-hidden shadow-xl"
     >
+      <div
+        role="separator"
+        aria-orientation="horizontal"
+        title="Drag to resize"
+        onpointerdown={startSideQuestionResize}
+        class="h-1.5 w-full cursor-ns-resize transition-colors {isResizingSideQuestion ? 'bg-[#8B5CF6]/50' : 'hover:bg-[#8B5CF6]/35'}"
+      ></div>
       <div class="px-3.5 py-2 border-b border-white/[0.06] flex items-center justify-between gap-2 bg-[#161619]">
         <div class="flex items-center gap-2 min-w-0">
           <svg class="w-3.5 h-3.5 text-[#A3A3AA] shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
@@ -766,7 +831,7 @@ async function stopAndSendVoice() {
           </button>
         </div>
       </div>
-      <div class="px-3.5 py-2.5 max-h-56 overflow-y-auto text-[12.5px] leading-relaxed select-text">
+      <div class="px-3.5 py-2.5 overflow-y-auto text-[12.5px] leading-relaxed select-text" style="max-height: {sideQuestionMaxHeight}px;">
         {#if sq.error}
           <div class="text-[#F87171] font-mono text-xs">{sq.error}</div>
         {:else if sq.streaming && !sq.answer}

@@ -11,7 +11,7 @@ pub mod workspace;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,10 +81,10 @@ impl ToolDispatcher {
         let pty_manager = process_pty::PtyManager::new();
         let cdp_controller = web_browser::CdpController::new(9222);
         let github_client = github::GithubClient::new(github_token).ok();
-        let projects_root = crate::state::AppState::resolve_projects_root_dir();
-        let _ = std::fs::create_dir_all(&projects_root);
-        if !allowed_roots.contains(&projects_root) {
-            allowed_roots.push(projects_root);
+        let data_root = crate::state::AppState::resolve_data_dir();
+        let _ = std::fs::create_dir_all(&data_root);
+        if !allowed_roots.contains(&data_root) {
+            allowed_roots.push(data_root);
         }
 
         Self {
@@ -96,6 +96,29 @@ impl ToolDispatcher {
             plan_mode: AtomicBool::new(false),
             db: std::sync::RwLock::new(None),
         }
+    }
+
+    pub fn for_workspace(&self, workspace_root: &Path, chat_id: &str) -> std::sync::Arc<Self> {
+        let mut roots = vec![workspace_root.to_path_buf()];
+        let chat_tmp = crate::state::AppState::resolve_chat_temp_dir(Some(chat_id));
+        let _ = std::fs::create_dir_all(&chat_tmp);
+        if !roots.contains(&chat_tmp) {
+            roots.push(chat_tmp);
+        }
+        let data_root = crate::state::AppState::resolve_data_dir();
+        let _ = std::fs::create_dir_all(&data_root);
+        if !roots.contains(&data_root) {
+            roots.push(data_root);
+        }
+        std::sync::Arc::new(Self {
+            pty_manager: self.pty_manager.clone(),
+            cdp_controller: self.cdp_controller.clone(),
+            github_client: self.github_client.clone(),
+            allowed_roots: roots,
+            read_guard: self.read_guard.clone(),
+            plan_mode: AtomicBool::new(self.plan_mode.load(Ordering::Relaxed)),
+            db: std::sync::RwLock::new(self.db.read().ok().and_then(|g| g.clone())),
+        })
     }
 
     pub fn set_db(&self, db: crate::db::Database) {

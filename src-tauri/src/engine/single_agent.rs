@@ -935,6 +935,20 @@ impl SingleAgentRunner {
 
             let prompt_lower = trimmed_prompt.to_lowercase();
             for sk in &all_skills {
+                if !sk.metadata.enabled || injected_names.contains(&sk.metadata.name) {
+                    continue;
+                }
+                let dollar_token = format!("${}", sk.metadata.name.to_ascii_lowercase());
+                let matched_dollar = prompt_lower.split_whitespace().any(|w| {
+                    let clean = w.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_' && c != ':');
+                    clean == dollar_token
+                });
+                if matched_dollar {
+                    injected_names.insert(sk.metadata.name.clone());
+                    injected_blocks.push(crate::skills::render_skill_activation(sk, Some(trimmed_prompt)));
+                }
+            }
+            for sk in &all_skills {
                 if !sk.metadata.enabled || sk.metadata.disable_model_invocation || injected_names.contains(&sk.metadata.name) {
                     continue;
                 }

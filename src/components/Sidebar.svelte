@@ -36,16 +36,32 @@ let visibleRecent = $derived.by(() => {
   return chatStore.recentSessions.slice(0, INITIAL_LIMIT);
 });
 
+function normProj(p?: string): string {
+  return (p || '').replace(/[\\/]+$/, '').toLowerCase();
+}
+
+let uniqueProjectPaths = $derived.by(() => {
+  const map = new Map<string, string>();
+  if (workspaceStore.currentPath) {
+    map.set(normProj(workspaceStore.currentPath), workspaceStore.currentPath);
+  }
+  for (const c of visibleRecent) {
+    if (c.projectPath) {
+      const k = normProj(c.projectPath);
+      if (!map.has(k)) map.set(k, c.projectPath);
+    }
+  }
+  return Array.from(map.values());
+});
+
+let standaloneChats = $derived(visibleRecent.filter((c) => !c.projectPath));
+
 let hasMoreSessions = $derived(
   !showAllSessions &&
   !chatStore.showArchived &&
   chatStore.filterSearchQuery.trim().length === 0 &&
   chatStore.recentSessions.length > INITIAL_LIMIT
 );
-
-let projectChats = $derived(visibleRecent.filter((c) => Boolean(c.projectPath)));
-let standaloneChats = $derived(visibleRecent.filter((c) => !c.projectPath));
-let orderedRecent = $derived([...projectChats, ...standaloneChats]);
 
 function handleDragMouseDown(e: MouseEvent) {
   if (e.buttons !== 1) return;
@@ -240,37 +256,134 @@ function formatRelativeAge(timestamp: number): string {
     {/if}
 
     <div>
-      {#if !chatStore.showArchived && workspaceStore.workspaceName}
-        <div class="px-2 py-1 text-[11px] font-sans text-[#66666D]">Projects</div>
-        <div class="group/proj flex items-center gap-1 mb-1 rounded-[4px] hover:bg-white/[0.04] transition-colors pr-1">
+
+
+      {#if !chatStore.showArchived && uniqueProjectPaths.length > 0}
+        <div class="px-2 py-1 flex items-center justify-between">
+          <span class="text-[11px] font-sans text-[#66666D]">Projects</span>
           <button
             type="button"
-            class="flex-1 min-w-0 px-2 py-1.5 flex items-center gap-2.5 text-left text-[#C4C4CA] hover:text-white transition-colors"
+            class="text-[11px] text-[#73737A] hover:text-[#E5E5E8] transition-colors"
             onclick={() => workspaceStore.openDirectoryPicker()}
-            title={workspaceStore.currentPath}
+            title="Open another project folder"
           >
-            <Icon name="folder" class="w-3.5 h-3.5 text-[#73737A] shrink-0" strokeWidth={1.6} />
-            <span class="font-mono text-[12px] truncate">{workspaceStore.workspaceName}</span>
-          </button>
-          <button
-            type="button"
-            class="w-6 h-6 rounded-[4px] flex items-center justify-center text-[#73737A] hover:text-[#EDEDEF] hover:bg-white/[0.08] transition-colors shrink-0"
-            onclick={() => chatStore.createSession('New task', workspaceStore.currentPath)}
-            title="New task in {workspaceStore.workspaceName}"
-            use:attachPressScale
-          >
-            <Icon name="plus" class="w-3.5 h-3.5" strokeWidth={1.8} />
+            + Folder
           </button>
         </div>
+        {#each uniqueProjectPaths as projPath (normProj(projPath))}
+          {@const projName = projPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || projPath}
+          {@const thisProjChats = visibleRecent.filter((c) => normProj(c.projectPath) === normProj(projPath))}
+          <div class="mb-2">
+            <div class="group/proj flex items-center gap-1 mb-0.5 rounded-[4px] hover:bg-white/[0.04] transition-colors pr-1">
+              <button
+                type="button"
+                class="flex-1 min-w-0 px-2 py-1.5 flex items-center gap-2 text-left {normProj(workspaceStore.currentPath) === normProj(projPath) ? 'text-[#EDEDEF]' : 'text-[#A3A3AA] hover:text-white'} transition-colors"
+                onclick={() => workspaceStore.setWorkspaceDir(projPath)}
+                title={projPath}
+              >
+                <Icon name="folder" class="w-3.5 h-3.5 text-[#73737A] shrink-0" strokeWidth={1.6} />
+                <span class="font-mono text-[12px] truncate">{projName}</span>
+              </button>
+              <button
+                type="button"
+                class="w-6 h-6 rounded-[4px] flex items-center justify-center text-[#73737A] hover:text-[#EDEDEF] hover:bg-white/[0.08] transition-colors shrink-0"
+                onclick={() => chatStore.createSession('New task', projPath)}
+                title="New task in {projName}"
+                use:attachPressScale
+              >
+                <Icon name="plus" class="w-3.5 h-3.5" strokeWidth={1.8} />
+              </button>
+            </div>
+            <div class="pl-2 space-y-0.5">
+              {#each thisProjChats as chat (chat.id)}
+                <div
+                  animate:flip={{ duration: 170 }}
+                  in:pinReceive={{ key: chat.id }}
+                  out:pinSend={{ key: chat.id }}
+                  class="group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[6px] cursor-pointer transition-colors duration-150 {chatStore.activeChatId === chat.id ? 'bg-white/[0.08] text-[#F5F5F7]' : 'text-[#B3B3BA] hover:bg-white/[0.04] hover:text-[#E5E5E8]'}"
+                  onclick={() => chatStore.selectSession(chat.id)}
+                  role="button"
+                  tabindex="0"
+                  onkeydown={(e) => { if (e.key === 'Enter') chatStore.selectSession(chat.id); }}
+                >
+                  <div class="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
+                    {#if chatStore.isChatStreaming(chat.id)}
+                      <span class="w-1.5 h-1.5 rounded-full shrink-0 bg-[#EDEDEF] animate-pulse"></span>
+                    {:else if chat.hasError || chat.hasUnreadCompletion}
+                      <span class="w-1.5 h-1.5 rounded-full shrink-0 {chat.hasError ? 'bg-[#EF4444]' : 'bg-[#22C55E]'}"></span>
+                    {/if}
+                    {#if editingChatId === chat.id}
+                      <input
+                        bind:value={editTitleText}
+                        type="text"
+                        class="bg-[#101012] border border-white/[0.2] rounded-[4px] px-1.5 py-0.5 text-[12px] text-[#E5E5E8] w-full outline-none"
+                        onclick={(e) => e.stopPropagation()}
+                        onkeydown={(e) => {
+                          if (e.key === 'Enter') handleSaveRename(chat.id);
+                          if (e.key === 'Escape') handleCancelRename();
+                        }}
+                        onblur={() => handleSaveRename(chat.id)}
+                      />
+                    {:else}
+                      <span class="truncate text-[12.5px] font-sans leading-snug transition-all duration-150">{chat.title}</span>
+                    {/if}
+                  </div>
+                  <div class="shrink-0 relative flex items-center justify-end min-w-[68px]">
+                    <span class="font-mono text-[11px] text-[#606068] opacity-100 group-hover:opacity-0 transition-opacity duration-150 pointer-events-none">
+                      {formatRelativeAge(chat.updatedAt)}
+                    </span>
+                    <div class="absolute right-0 flex items-center gap-0.5 opacity-0 scale-95 group-hover:opacity-100 group-hover:scale-100 transition-all duration-150 pointer-events-none group-hover:pointer-events-auto">
+                      <button
+                        type="button"
+                        class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#EDEDEF] hover:bg-white/[0.08]"
+                        title="Pin"
+                        onclick={(e) => { e.stopPropagation(); chatStore.togglePinSession(chat.id); }}
+                      >
+                        <Icon name="pin" class="w-3 h-3" strokeWidth={1.6} />
+                      </button>
+                      <button
+                        type="button"
+                        class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#E5E5E8] hover:bg-white/[0.08]"
+                        title="Rename"
+                        onclick={(e) => { e.stopPropagation(); handleStartRename(chat.id, chat.title); }}
+                      >
+                        <Icon name="edit" class="w-3 h-3" strokeWidth={1.6} />
+                      </button>
+                      <button
+                        type="button"
+                        class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#E5E5E8] hover:bg-white/[0.08]"
+                        title="Archive"
+                        onclick={(e) => { e.stopPropagation(); chatStore.toggleArchiveSession(chat.id); }}
+                      >
+                        <Icon name="archive" class="w-3 h-3" strokeWidth={1.6} />
+                      </button>
+                      <button
+                        type="button"
+                        class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#EF4444] hover:bg-white/[0.08]"
+                        title="Delete"
+                        onclick={(e) => { e.stopPropagation(); chatStore.deleteSession(chat.id); }}
+                      >
+                        <Icon name="trash" class="w-3 h-3" strokeWidth={1.6} />
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          </div>
+        {/each}
       {/if}
 
+      {#if uniqueProjectPaths.length > 0 && standaloneChats.length > 0 && !chatStore.showArchived}
+        <div class="my-2 border-t border-white/[0.07]"></div>
+      {/if}
       <div class="space-y-0.5">
-        {#each orderedRecent as chat, chatIdx (chat.id)}
+        {#each (chatStore.showArchived ? visibleRecent : standaloneChats) as chat (chat.id)}
           <div
             animate:flip={{ duration: 170 }}
             in:pinReceive={{ key: chat.id }}
             out:pinSend={{ key: chat.id }}
-            class="group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[6px] cursor-pointer transition-colors duration-150 {chatStore.activeChatId === chat.id ? 'bg-white/[0.08] text-[#F5F5F7]' : 'text-[#B3B3BA] hover:bg-white/[0.04] hover:text-[#E5E5E8]'} {projectChats.length > 0 && standaloneChats.length > 0 && chatIdx === projectChats.length ? 'border-t border-white/[0.07] pt-2 mt-2' : ''}"
+            class="group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[6px] cursor-pointer transition-colors duration-150 {chatStore.activeChatId === chat.id ? 'bg-white/[0.08] text-[#F5F5F7]' : 'text-[#B3B3BA] hover:bg-white/[0.04] hover:text-[#E5E5E8]'}"
             onclick={() => chatStore.selectSession(chat.id)}
             role="button"
             tabindex="0"

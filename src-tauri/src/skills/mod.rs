@@ -263,8 +263,8 @@ pub fn load_skill_from_directory(dir_path: &Path) -> Result<SkillPackage, String
 }
 
 pub fn load_all_skills(skills_dir: &Path) -> Result<Vec<SkillPackage>, String> {
-    if !skills_dir.exists() {
-        fs::create_dir_all(skills_dir).map_err(|e| e.to_string())?;
+    if !skills_dir.is_dir() {
+        return Ok(Vec::new());
     }
 
     let mut skills = Vec::new();
@@ -286,10 +286,13 @@ pub fn load_all_skills(skills_dir: &Path) -> Result<Vec<SkillPackage>, String> {
 
 pub fn skill_search_roots(workspace_root: &str) -> Vec<std::path::PathBuf> {
     let mut roots = Vec::new();
+    roots.push(crate::state::AppState::resolve_skills_dir());
     let ws = Path::new(workspace_root);
-    roots.push(ws.join(".omni").join("skills"));
-    roots.push(ws.join(".agents").join("skills"));
-    roots.push(ws.join(".claude").join("skills"));
+    if !workspace_root.trim().is_empty() && ws.is_dir() {
+        roots.push(ws.join(".omni").join("skills"));
+        roots.push(ws.join(".agents").join("skills"));
+        roots.push(ws.join(".claude").join("skills"));
+    }
     if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
         let h = Path::new(&home);
         roots.push(h.join(".omni").join("skills"));
@@ -304,13 +307,13 @@ fn builtin_system_skills() -> Vec<SkillPackage> {
 Load when you need full knowledge of the OmniHarness runtime environment, directories, persistence, tools, checkpoints, or error recovery.
 
 ## Environment Layout
-- App Data & SQLite DB: %LOCALAPPDATA%\OmniHarness\omniharness.db (WAL mode: chats, messages, memory_entries, checkpoints, events, plan_states, session_artifacts, compaction_events, token_cache)
+- App Data & SQLite DB: %LOCALAPPDATA%\.omni-harness\omniharness.db (WAL mode: chats, messages, memory_entries, checkpoints, events, plan_states, session_artifacts, compaction_events, token_cache)
 - Workspace Root: active project directory. All file tools (read_file, edit_file, patch_file, write_file, glob, grep) are strictly sandboxed to allowed workspace roots after canonicalize() — UNC paths and Windows reserved device names (CON, NUL, PRN, AUX, COM1-9, LPT1-9) are blocked.
-- %LOCALAPPDATA%\OmniHarness\projects\<hash>\objects\: content-addressed checkpoint blobs (never created inside project directory).
-- %LOCALAPPDATA%\OmniHarness\projects\<hash>\tmp\tool_<id>.log: spilled large tool outputs (>300 lines or >24KB), readable via read_file/grep by absolute path.
-- %LOCALAPPDATA%\OmniHarness\projects\<hash>\tg_uploads\: incoming files sent via Telegram bot, readable via read_file by absolute path.
-- %LOCALAPPDATA%\OmniHarness\projects\<hash>\PROJECT_SUMMARY.md: Markdown project summary (managed via project_summary tool, never inside project dir).
-- skills/: User skills (.omni/skills, .agents/skills, .claude/skills).
+- %LOCALAPPDATA%\.omni-harness\projects\<hash>\objects\: content-addressed checkpoint blobs (never created inside project directory).
+- %LOCALAPPDATA%\.omni-harness\projects\<hash>\tmp\tool_<id>.log: spilled large tool outputs (>300 lines or >24KB), readable via read_file/grep by absolute path.
+- %LOCALAPPDATA%\.omni-harness\projects\<hash>\tg_uploads\: incoming files sent via Telegram bot, readable via read_file by absolute path.
+- %LOCALAPPDATA%\.omni-harness\projects\<hash>\PROJECT_SUMMARY.md: Markdown project summary (managed via project_summary tool, never inside project dir).
+- skills/: User skills (%LOCALAPPDATA%\.omni-harness\skills).
 
 ## Tool Contracts & Safety
 - Always pass valid JSON matching each tool's schema (exact parameter names, no XML tags or raw wrappers).
@@ -444,12 +447,24 @@ pub fn build_skills_catalog_for_workspace(workspace_root: &str) -> String {
     let mut out = String::from("<available_skills>\n");
     let max_chars = 15_000usize;
     for sk in visible {
-        let loc = Path::new(&sk.root_dir).join("SKILL.md");
+        let cmd_line = sk
+            .metadata
+            .command
+            .as_deref()
+            .filter(|c| !c.trim().is_empty())
+            .map(|c| format!("\n    <command>{}</command>", c.trim()))
+            .unwrap_or_default();
+        let loc_line = if sk.root_dir.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n    <location>{}</location>", Path::new(&sk.root_dir).join("SKILL.md").to_string_lossy())
+        };
         let entry = format!(
-            "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n    <location>{}</location>\n  </skill>\n",
+            "  <skill>\n    <name>{}</name>\n    <description>{}</description>{}{}\n  </skill>\n",
             sk.metadata.name,
             sk.metadata.description.trim(),
-            loc.to_string_lossy()
+            cmd_line,
+            loc_line
         );
         if out.len() + entry.len() > max_chars {
             break;

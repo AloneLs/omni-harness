@@ -996,21 +996,17 @@ async fn start_chat_stream(
     let session = state.stream_mgr.create_session(&chat_id).await;
     let session_id = chat_id.clone();
 
-    let bootstrap_cfg = state.app_state.get_bootstrap_config().await;
     let workspace_path = match workspace_dir.as_deref() {
         Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-        _ => match &bootstrap_cfg.workspace_dir {
-            Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-            _ => {
-                let chat_ws = state::AppState::resolve_install_workspace().join(&chat_id);
-                let _ = std::fs::create_dir_all(&chat_ws);
-                chat_ws
-            }
+        _ => {
+            let chat_ws = state::AppState::resolve_install_workspace().join(&chat_id);
+            let _ = std::fs::create_dir_all(&chat_ws);
+            chat_ws
         }
     };
     let workspace_str = workspace_path.to_string_lossy().to_string();
 
-    let tools = state.tool_dispatcher.clone();
+    let tools = state.tool_dispatcher.for_workspace(&workspace_path, &chat_id);
     let combined_plan = plan_mode.unwrap_or(false) || prompt.split_whitespace().any(|t| t.eq_ignore_ascii_case("/plan"));
     tools.set_plan_mode(combined_plan);
     let key_pool = (*state.key_pool).clone();
@@ -2271,8 +2267,8 @@ async fn delete_skill(
 
 #[tauri::command]
 async fn import_skill_zip(state: State<'_, AppManagedState>, path: String) -> Result<(), String> {
-    let ws = state.app_state.get_workspace_dir().await;
-    let skills_dir = ws.join(".omni").join("skills");
+    let _ = &state;
+    let skills_dir = state::AppState::resolve_skills_dir();
     let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
     skills::import_skill_zip(&bytes, &skills_dir).map(|_| ())
 }
@@ -2283,8 +2279,8 @@ async fn export_skill_zip(
     skill_name: String,
     destination: String,
 ) -> Result<(), String> {
-    let ws = state.app_state.get_workspace_dir().await;
-    let skills_dir = ws.join(".omni").join("skills");
+    let _ = &state;
+    let skills_dir = state::AppState::resolve_skills_dir();
     let bytes = skills::export_skill_zip(&skill_name, &skills_dir)?;
     std::fs::write(&destination, bytes).map_err(|e| e.to_string())
 }

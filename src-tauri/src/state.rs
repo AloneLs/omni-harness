@@ -42,12 +42,24 @@ impl AppState {
         Self::resolve_data_dir().join("workspace")
     }
 
+    pub fn resolve_chats_root_dir() -> PathBuf {
+        Self::resolve_data_dir().join("chats")
+    }
+
     pub fn resolve_chat_temp_dir(chat_id: Option<&str>) -> PathBuf {
-        let base = Self::resolve_data_dir().join("chat_temp");
+        let base = Self::resolve_chats_root_dir();
         match chat_id {
-            Some(cid) if !cid.trim().is_empty() => base.join(cid),
-            _ => base,
+            Some(cid) if !cid.trim().is_empty() => base.join(cid.trim()).join("tmp"),
+            _ => base.join("_shared").join("tmp"),
         }
+    }
+
+    pub fn resolve_skills_dir() -> PathBuf {
+        Self::resolve_data_dir().join("skills")
+    }
+
+    pub fn resolve_agents_dir() -> PathBuf {
+        Self::resolve_data_dir().join("agents")
     }
 
     pub fn resolve_projects_root_dir() -> PathBuf {
@@ -72,6 +84,11 @@ impl AppState {
     pub fn new() -> Result<Self, AppError> {
         let data_dir = Self::resolve_data_dir();
         std::fs::create_dir_all(&data_dir)?;
+        let _ = std::fs::create_dir_all(Self::resolve_install_workspace());
+        let _ = std::fs::create_dir_all(Self::resolve_chats_root_dir());
+        let _ = std::fs::create_dir_all(Self::resolve_projects_root_dir());
+        let _ = std::fs::create_dir_all(Self::resolve_agents_dir());
+        let _ = crate::skills::deploy_builtin_skills(&Self::resolve_skills_dir());
 
         let bootstrap_path = data_dir.join("bootstrap.json");
         let bootstrap_config = if bootstrap_path.exists() {
@@ -126,11 +143,20 @@ impl AppState {
         let marker_in_cur = Path::new("portable.marker");
 
         if marker_in_exe.exists() || marker_in_cur.exists() {
-            exe_dir.join("data")
+            let new_dir = exe_dir.join(".omni-harness");
+            let legacy_dir = exe_dir.join("data");
+            if !new_dir.exists() && legacy_dir.exists() {
+                let _ = std::fs::rename(&legacy_dir, &new_dir);
+            }
+            new_dir
         } else {
-            dirs::data_local_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("OmniHarness")
+            let local = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+            let new_dir = local.join(".omni-harness");
+            let legacy_dir = local.join("OmniHarness");
+            if !new_dir.exists() && legacy_dir.exists() {
+                let _ = std::fs::rename(&legacy_dir, &new_dir);
+            }
+            new_dir
         }
     }
 

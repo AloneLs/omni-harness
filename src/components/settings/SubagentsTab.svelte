@@ -224,8 +224,8 @@ async function createSubagentWithAgent() {
 
       <div class="grid grid-cols-2 gap-2.5">
         <div>
-          <label class="block text-[11px] text-[#8E8E95] mb-1">Name</label>
-          <input
+          <label for="subagent-name" class="block text-[11px] text-[#8E8E95] mb-1">Name</label>
+          <input id="subagent-name"
             type="text"
             bind:value={formName}
             disabled={editingExisting}
@@ -234,8 +234,8 @@ async function createSubagentWithAgent() {
           />
         </div>
         <div>
-          <label class="block text-[11px] text-[#8E8E95] mb-1">Scope</label>
-          <select
+          <label for="subagent-scope" class="block text-[11px] text-[#8E8E95] mb-1">Scope</label>
+          <select id="subagent-scope"
             bind:value={formScope}
             disabled={editingExisting}
             class="w-full h-8 px-2.5 rounded-[6px] bg-[#18181B] border border-white/[0.08] text-xs text-[#E5E5E8] outline-none disabled:opacity-60"
@@ -247,8 +247,8 @@ async function createSubagentWithAgent() {
       </div>
 
       <div>
-        <label class="block text-[11px] text-[#8E8E95] mb-1">Description (when main agent should invoke it)</label>
-        <input
+        <label for="subagent-desc" class="block text-[11px] text-[#8E8E95] mb-1">Description (when main agent should invoke it)</label>
+        <input id="subagent-desc"
           type="text"
           bind:value={formDescription}
           placeholder="Reviews diffs and code paths for security regressions and memory leaks."
@@ -258,8 +258,8 @@ async function createSubagentWithAgent() {
 
       <div class="grid grid-cols-2 gap-2.5">
         <div>
-          <label class="block text-[11px] text-[#8E8E95] mb-1">Model (optional, default inherit)</label>
-          <input
+          <label for="subagent-model" class="block text-[11px] text-[#8E8E95] mb-1">Model (optional, default inherit)</label>
+          <input id="subagent-model"
             type="text"
             bind:value={formModel}
             placeholder="inherit"
@@ -267,8 +267,8 @@ async function createSubagentWithAgent() {
           />
         </div>
         <div>
-          <label class="block text-[11px] text-[#8E8E95] mb-1">Max Turns (1-80)</label>
-          <input
+          <label for="subagent-turns" class="block text-[11px] text-[#8E8E95] mb-1">Max Turns (1-80)</label>
+          <input id="subagent-turns"
             type="number"
             min="1"
             max="80"
@@ -279,7 +279,7 @@ async function createSubagentWithAgent() {
       </div>
 
       <div>
-        <label class="block text-[11px] text-[#8E8E95] mb-1.5">Allowed Tools</label>
+        <div class="block text-[11px] text-[#8E8E95] mb-1.5">Allowed Tools</div>
         <div class="flex flex-wrap gap-1.5">
           {#each AVAILABLE_TOOLS as tool}
             <button
@@ -294,8 +294,8 @@ async function createSubagentWithAgent() {
       </div>
 
       <div>
-        <label class="block text-[11px] text-[#8E8E95] mb-1">System Prompt</label>
-        <textarea
+        <label for="subagent-prompt" class="block text-[11px] text-[#8E8E95] mb-1">System Prompt</label>
+        <textarea id="subagent-prompt"
           rows="5"
           bind:value={formSystemPrompt}
           placeholder="Define exact role, constraints, and output format..."

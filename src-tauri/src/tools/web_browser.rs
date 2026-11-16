@@ -50,6 +50,15 @@ pub struct CdpController {
     req_counter: AtomicU64,
 }
 
+impl Clone for CdpController {
+    fn clone(&self) -> Self {
+        Self {
+            debug_port: self.debug_port,
+            req_counter: AtomicU64::new(self.req_counter.load(Ordering::Relaxed)),
+        }
+    }
+}
+
 pub fn duckduckgo_search(query: &str, max_results: usize) -> Result<Vec<SearchResult>, String> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(12))

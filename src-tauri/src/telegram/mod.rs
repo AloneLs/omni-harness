@@ -2542,6 +2542,13 @@ async fn run_telegram_agent_turn(
     };
     let _ = ctx.app_state.db.create_message(&user_msg);
     emit_chat_updated(&ctx, &chat_id).await;
+    let stream_app_handle = ctx.app_handle.read().await.clone();
+    if let Some(ref app) = stream_app_handle {
+        let _ = app.emit(
+            "telegram-chat-stream",
+            json!({ "chatId": chat_id, "type": "start", "userText": full_prompt }),
+        );
+    }
 
     let key_pool = (*ctx.key_pool).clone();
     if !provider.api_key.trim().is_empty() {
@@ -2599,6 +2606,8 @@ async fn run_telegram_agent_turn(
     );
     tool_stream.start().await;
 
+    let stream_chat_id = chat_id.clone();
+    let stream_app_ev = stream_app_handle.clone();
     let event_task = tokio::spawn(async move {
         let mut final_text = String::new();
         let mut reasoning_text = String::new();
@@ -2607,9 +2616,21 @@ async fn run_telegram_agent_turn(
         while let Some(evt) = rx.recv().await {
             match evt {
                 crate::llm::StreamEvent::ContentDelta { delta } => {
+                    if let Some(ref app) = stream_app_ev {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({ "chatId": stream_chat_id, "type": "content", "delta": delta }),
+                        );
+                    }
                     final_text.push_str(&delta);
                 }
                 crate::llm::StreamEvent::ReasoningDelta { delta } => {
+                    if let Some(ref app) = stream_app_ev {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({ "chatId": stream_chat_id, "type": "thinking", "delta": delta }),
+                        );
+                    }
                     reasoning_text.push_str(&delta);
                 }
                 crate::llm::StreamEvent::ToolCallComplete {
@@ -2618,6 +2639,12 @@ async fn run_telegram_agent_turn(
                     arguments,
                     ..
                 } => {
+                    if let Some(ref app) = stream_app_ev {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({ "chatId": stream_chat_id, "type": "tool_start", "id": id, "name": name, "arguments": arguments }),
+                        );
+                    }
                     tool_stream.on_tool_start(&id, &name, &arguments);
                     tool_stream.maybe_flush(false).await;
                 }
@@ -2627,12 +2654,24 @@ async fn run_telegram_agent_turn(
                     elapsed_ms,
                     ..
                 } => {
+                    if let Some(ref app) = stream_app_ev {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({ "chatId": stream_chat_id, "type": "tool_end", "id": id, "success": success, "elapsedMs": elapsed_ms }),
+                        );
+                    }
                     tool_stream.on_tool_end(&id, success, elapsed_ms);
                     tool_stream.maybe_flush(false).await;
                 }
                 crate::llm::StreamEvent::RetryNotice {
                     attempt, reason, ..
                 } => {
+                    if let Some(ref app) = stream_app_ev {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({ "chatId": stream_chat_id, "type": "retry", "attempt": attempt, "reason": reason }),
+                        );
+                    }
                     tool_stream.on_retry(attempt, &reason);
                     tool_stream.maybe_flush(false).await;
                 }
@@ -2668,10 +2707,22 @@ async fn run_telegram_agent_turn(
                     }
                 }
                 crate::llm::StreamEvent::Error { error } => {
+                    if let Some(ref app) = stream_app_ev {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({ "chatId": stream_chat_id, "type": "error", "error": error }),
+                        );
+                    }
                     error_text = Some(error);
                 }
                 _ => {}
             }
+        }
+        if let Some(ref app) = stream_app_ev {
+            let _ = app.emit(
+                "telegram-chat-stream",
+                json!({ "chatId": stream_chat_id, "type": "done" }),
+            );
         }
         tool_stream.finish_and_cleanup().await;
         (final_text, reasoning_text, error_text)
@@ -2815,7 +2866,7 @@ async fn run_telegram_agent_turn(
                 &chat_id,
                 &cur_prompt,
                 &workspace_str,
-                ctx.tool_dispatcher.clone(),
+                ctx.tool_dispatcher.for_workspace(std::path::Path::new(&workspace_str), &chat_id),
                 &key_pool,
                 &caps_reg,
                 &provider.name,

@@ -2,6 +2,7 @@ import { invoke, Channel } from '@tauri-apps/api/core';
 import type { ToolExecutionRecord } from '../toolMapper';
 import { formatToolExecution } from '../toolMapper';
 import { settingsStore, type ReasoningLevel } from './settings.svelte';
+import { workspaceStore } from './workspace.svelte';
 
 export interface ChatAttachment {
   id: string;
@@ -537,6 +538,22 @@ class ChatStore {
         listen<{ chatId?: string }>('telegram-chat-updated', (ev) => {
           this.pullBackendChats(ev.payload?.chatId);
         });
+        listen<{
+          chatId?: string;
+          type?: string;
+          userText?: string;
+          delta?: string;
+          id?: string;
+          name?: string;
+          arguments?: string;
+          success?: boolean;
+          elapsedMs?: number;
+          attempt?: number;
+          reason?: string;
+          error?: string;
+        }>('telegram-chat-stream', (ev) => {
+          this.handleTelegramStreamEvent(ev.payload);
+        });
       })
       .catch(() => {});
   }
@@ -558,6 +575,135 @@ class ChatStore {
         projectPath: sess.projectPath || null,
         modelId: settingsStore.data.activeModel || null
       }).catch(() => {});
+    }
+  }
+
+  private handleTelegramStreamEvent(payload: {
+    chatId?: string;
+    type?: string;
+    userText?: string;
+    delta?: string;
+    id?: string;
+    name?: string;
+    arguments?: string;
+    success?: boolean;
+    elapsedMs?: number;
+    attempt?: number;
+    reason?: string;
+    error?: string;
+  } | undefined): void {
+    const chatId = payload?.chatId;
+    const evtType = payload?.type;
+    if (!chatId || !evtType) return;
+
+    const sess = this.sessions.find((s) => s.id === chatId);
+    if (evtType === 'start') {
+      if (sess) {
+        sess.hasError = false;
+        sess.isPaused = false;
+        sess.hasUnreadCompletion = false;
+        sess.updatedAt = Date.now();
+      }
+      this.streamingChats[chatId] = true;
+      const list = this.messagesByChat[chatId] || [];
+      const userText = (payload?.userText || '').trim();
+      const lastMsg = list[list.length - 1];
+      if (userText && (!lastMsg || lastMsg.role !== 'user' || lastMsg.content !== userText)) {
+        list.push({
+          id: `tg-u-${Date.now()}`,
+          chatId,
+          role: 'user',
+          content: userText,
+          createdAt: Date.now()
+        });
+      }
+      const tail = list[list.length - 1];
+      if (!tail || tail.role !== 'assistant' || !tail.streaming) {
+        list.push({
+          id: `tg-a-${Date.now()}`,
+          chatId,
+          role: 'assistant',
+          content: '',
+          reasoningContent: '',
+          toolCalls: [],
+          steps: [],
+          startedAt: Date.now(),
+          createdAt: Date.now(),
+          streaming: true
+        });
+      } else {
+        tail.error = undefined;
+      }
+      this.messagesByChat[chatId] = [...list];
+      this.saveSessions(chatId);
+      return;
+    }
+
+    const list = this.messagesByChat[chatId];
+    if (!list || list.length === 0) return;
+    const msg = list[list.length - 1];
+    if (!msg || msg.role !== 'assistant') return;
+
+    if (evtType === 'thinking' && payload?.delta) {
+      this.applyReasoningChunk(chatId, msg, payload.delta);
+      return;
+    }
+    if (evtType === 'content' && payload?.delta) {
+      this.applyContentChunk(chatId, msg, payload.delta);
+      return;
+    }
+    if (evtType === 'tool_start' && payload?.id && payload?.name) {
+      if (!msg.toolCalls) msg.toolCalls = [];
+      if (!msg.steps) msg.steps = [];
+      const rec = formatToolExecution({
+        id: payload.id,
+        name: payload.name,
+        arguments: payload.arguments || '',
+        status: 'running',
+        startedAt: Date.now()
+      });
+      msg.toolCalls.push(rec);
+      msg.steps.push({ kind: 'tool', record: rec });
+      this.messagesByChat[chatId] = [...list];
+      return;
+    }
+    if (evtType === 'tool_end' && payload?.id) {
+      const rec = msg.toolCalls?.find((t) => t.toolCallId === payload.id);
+      if (rec) {
+        rec.status = payload.success ? 'success' : 'error';
+        rec.finishedAt = Date.now();
+        rec.elapsedMs = payload.elapsedMs;
+        this.messagesByChat[chatId] = [...list];
+      }
+      return;
+    }
+    if (evtType === 'retry') {
+      msg.statusText = `Reconnecting (attempt ${payload?.attempt || 1})...`;
+      msg.retryReason = payload?.reason;
+      this.messagesByChat[chatId] = [...list];
+      return;
+    }
+    if (evtType === 'error') {
+      msg.error = payload?.error || 'Telegram execution failed';
+      msg.streaming = false;
+      msg.finishedAt = Date.now();
+      this.streamingChats[chatId] = false;
+      if (sess) sess.hasError = true;
+      this.messagesByChat[chatId] = [...list];
+      this.saveSessions(chatId);
+      return;
+    }
+    if (evtType === 'done') {
+      msg.streaming = false;
+      msg.statusText = undefined;
+      msg.finishedAt = Date.now();
+      this.streamingChats[chatId] = false;
+      if (sess && this.activeChatId !== chatId && !msg.error) {
+        sess.hasUnreadCompletion = true;
+      }
+      this.messagesByChat[chatId] = [...list];
+      this.saveChatMessagesToStorage(chatId, list);
+      this.saveSessions(chatId);
     }
   }
 
@@ -1084,6 +1230,9 @@ class ChatStore {
   public async selectSession(id: string): Promise<void> {
     this.activeChatId = id;
     const session = this.sessions.find((s) => s.id === id);
+    if (session?.projectPath && workspaceStore.currentPath !== session.projectPath) {
+      workspaceStore.setWorkspaceDir(session.projectPath).catch(() => {});
+    }
     if (session?.providerId && session?.modelId) {
       settingsStore.setActiveModel(session.providerId, session.modelId);
     }
