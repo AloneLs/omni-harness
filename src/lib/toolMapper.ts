@@ -292,7 +292,7 @@ export function formatToolExecution(raw: {
   }
 
   let diff: ToolDiff | undefined;
-  if (toolName === 'edit_file' || toolName === 'write_file' || toolName === 'rollback_snapshot') {
+  if (toolName === 'edit_file' || toolName === 'write_file' || toolName === 'patch_file' || toolName === 'rollback_snapshot') {
     const filePath = parsedArgs.path || parsedArgs.Path || 'file';
     if (parsedArgs.before !== undefined || parsedArgs.after !== undefined) {
       diff = parseDiff(filePath, parsedArgs.before, parsedArgs.after);

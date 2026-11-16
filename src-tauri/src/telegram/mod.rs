@@ -8,6 +8,199 @@ pub use media_split::*;
 pub use ui_menu::*;
 
 use client::TelegramClient;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadJobInfo {
+    pub upload_id: String,
+    pub chat_id: String,
+    pub path: String,
+    pub kind: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+struct UploadJobRuntime {
+    info: UploadJobInfo,
+    cancelled: Arc<AtomicBool>,
+    cancel_notify: Arc<tokio::sync::Notify>,
+}
+
+struct UploadManagerState {
+    active_targets: RwLock<HashMap<String, (TelegramClient, i64)>>,
+    jobs: RwLock<HashMap<String, Arc<tokio::sync::Mutex<UploadJobRuntime>>>>,
+    chat_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+static TG_UPLOAD_MGR: std::sync::OnceLock<UploadManagerState> = std::sync::OnceLock::new();
+
+fn upload_mgr() -> &'static UploadManagerState {
+    TG_UPLOAD_MGR.get_or_init(|| UploadManagerState {
+        active_targets: RwLock::new(HashMap::new()),
+        jobs: RwLock::new(HashMap::new()),
+        chat_locks: RwLock::new(HashMap::new()),
+    })
+}
+
+async fn get_chat_lock(chat_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    {
+        let r = upload_mgr().chat_locks.read().await;
+        if let Some(l) = r.get(chat_id) {
+            return l.clone();
+        }
+    }
+    let mut w = upload_mgr().chat_locks.write().await;
+    w.entry(chat_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+pub struct TelegramUploadManager;
+
+impl TelegramUploadManager {
+    pub async fn register_active_chat(chat_id: &str, client: TelegramClient, tg_chat_id: i64) {
+        let mut w = upload_mgr().active_targets.write().await;
+        w.insert(chat_id.to_string(), (client, tg_chat_id));
+    }
+
+    pub async fn enqueue_upload(
+        chat_id: &str,
+        path: &str,
+        kind: &str,
+        caption: Option<String>,
+    ) -> Result<UploadJobInfo, String> {
+        let (client, tg_chat_id) = {
+            let r = upload_mgr().active_targets.read().await;
+            r.get(chat_id)
+                .cloned()
+                .ok_or_else(|| "No active Telegram target for this chat session.".to_string())?
+        };
+        Ok(Self::enqueue_with_client(client, tg_chat_id, chat_id, path, kind, caption).await)
+    }
+
+    pub async fn enqueue_with_client(
+        client: TelegramClient,
+        tg_chat_id: i64,
+        chat_id: &str,
+        path: &str,
+        kind: &str,
+        caption: Option<String>,
+    ) -> UploadJobInfo {
+        let upload_id = uuid::Uuid::new_v4().to_string();
+        let resolved_kind = if kind.trim().is_empty() || kind.eq_ignore_ascii_case("auto") {
+            let lower = path.to_ascii_lowercase();
+            if [".png", ".jpg", ".jpeg", ".webp", ".gif"].iter().any(|e| lower.ends_with(e)) {
+                "photo"
+            } else if [".mp3", ".wav", ".ogg", ".m4a", ".opus", ".flac"].iter().any(|e| lower.ends_with(e)) {
+                "audio"
+            } else if [".mp4", ".webm", ".mov", ".mkv"].iter().any(|e| lower.ends_with(e)) {
+                "video"
+            } else {
+                "document"
+            }
+        } else {
+            kind
+        };
+
+        let info = UploadJobInfo {
+            upload_id: upload_id.clone(),
+            chat_id: chat_id.to_string(),
+            path: path.to_string(),
+            kind: resolved_kind.to_string(),
+            status: "queued".to_string(),
+            error: None,
+        };
+        let runtime = Arc::new(tokio::sync::Mutex::new(UploadJobRuntime {
+            info: info.clone(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_notify: Arc::new(tokio::sync::Notify::new()),
+        }));
+        {
+            let mut w = upload_mgr().jobs.write().await;
+            w.insert(upload_id.clone(), runtime.clone());
+        }
+
+        let path_owned = path.to_string();
+        let kind_owned = resolved_kind.to_string();
+        tokio::spawn(async move {
+            let (cancelled, cancel_notify) = {
+                let mut g = runtime.lock().await;
+                if g.cancelled.load(Ordering::SeqCst) {
+                    g.info.status = "cancelled".to_string();
+                    return;
+                }
+                g.info.status = "uploading".to_string();
+                (g.cancelled.clone(), g.cancel_notify.clone())
+            };
+
+            let send_fut = async {
+                match kind_owned.as_str() {
+                    "photo" => client.send_photo(tg_chat_id, &path_owned).await,
+                    "audio" => client.send_audio(tg_chat_id, &path_owned).await,
+                    "video" => client.send_video(tg_chat_id, &path_owned).await,
+                    _ => client.send_document(tg_chat_id, &path_owned, caption.as_deref()).await,
+                }
+            };
+
+            let outcome = tokio::select! {
+                biased;
+                _ = cancel_notify.notified() => Err("Cancelled by agent".to_string()),
+                res = send_fut => res,
+            };
+
+            let mut g = runtime.lock().await;
+            if cancelled.load(Ordering::SeqCst) {
+                g.info.status = "cancelled".to_string();
+            } else {
+                match outcome {
+                    Ok(()) => {
+                        g.info.status = "sent".to_string();
+                    }
+                    Err(e) => {
+                        g.info.status = "failed".to_string();
+                        g.info.error = Some(e);
+                    }
+                }
+            }
+        });
+
+        info
+    }
+
+    pub async fn get_status(chat_id: &str, upload_id: Option<&str>) -> Vec<UploadJobInfo> {
+        let jobs_snap: Vec<Arc<tokio::sync::Mutex<UploadJobRuntime>>> = {
+            let r = upload_mgr().jobs.read().await;
+            if let Some(uid) = upload_id {
+                r.get(uid).cloned().into_iter().collect()
+            } else {
+                r.values().cloned().collect()
+            }
+        };
+        let mut out = Vec::new();
+        for j in jobs_snap {
+            let g = j.lock().await;
+            if g.info.chat_id == chat_id {
+                out.push(g.info.clone());
+            }
+        }
+        out
+    }
+
+    pub async fn cancel_upload(upload_id: &str) -> Result<UploadJobInfo, String> {
+        let job = {
+            let r = upload_mgr().jobs.read().await;
+            r.get(upload_id)
+                .cloned()
+                .ok_or_else(|| format!("Upload job '{}' not found", upload_id))?
+        };
+        let mut g = job.lock().await;
+        g.cancelled.store(true, Ordering::SeqCst);
+        g.cancel_notify.notify_waiters();
+        g.info.status = "cancelled".to_string();
+        Ok(g.info.clone())
+    }
+}
 use formatting::{compact_text, escape_html, format_user_error, markdown_to_telegram_html};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -136,6 +329,8 @@ pub struct TelegramConfigFile {
     #[serde(default)]
     pub auto_start: bool,
     #[serde(default)]
+    pub proxy_url: String,
+    #[serde(default)]
     pub offset: i64,
     #[serde(default)]
     pub chat_sessions: HashMap<i64, String>,
@@ -158,6 +353,7 @@ impl Default for TelegramConfigFile {
             notify_on_approval: true,
             notify_on_error: true,
             auto_start: false,
+            proxy_url: String::new(),
             offset: 0,
             chat_sessions: HashMap::new(),
             chat_providers: HashMap::new(),
@@ -1407,7 +1603,7 @@ async fn extract_and_download_attachments(
     tg_client: &TelegramClient,
     _tg_chat_id: i64,
     msg: &Value,
-    omni_chat_id: &str,
+    workspace_root: &str,
 ) -> Result<Vec<String>, String> {
     if msg.get("sticker").is_some() {
         return Err("Стикеры не поддерживаются.".to_string());
@@ -1443,7 +1639,7 @@ async fn extract_and_download_attachments(
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    let dest_dir = crate::state::AppState::resolve_chat_temp_dir(Some(omni_chat_id)).join("tg_uploads");
+    let dest_dir = PathBuf::from(workspace_root).join(".harness").join("tg_uploads");
     let mut paths = Vec::new();
     for (idx, (fid, fname)) in items.into_iter().enumerate() {
         let target_name = format!("{}_{}", idx + 1, fname);
@@ -1713,6 +1909,32 @@ async fn handle_authorized_message(
                 let _ = tg_client.send_html(tg_chat_id, "Нет активной сессии.", None).await;
             }
         }
+        "/btw" => {
+            if arg.is_empty() {
+                let _ = tg_client
+                    .send_html(tg_chat_id, "Использование: <code>/btw &lt;быстрый вопрос&gt;</code>", None)
+                    .await;
+                return;
+            }
+            let user_msg_id = msg["message_id"].as_i64().unwrap_or(0);
+            let question = arg.to_string();
+            let tg_client_owned = tg_client.clone();
+            let ctx_owned = ctx.clone();
+            let snap_owned = providers_snap.clone();
+            let sessions_owned = sessions.clone();
+            tokio::spawn(async move {
+                run_telegram_btw(
+                    tg_client_owned,
+                    tg_chat_id,
+                    user_msg_id,
+                    question,
+                    ctx_owned,
+                    snap_owned,
+                    sessions_owned,
+                )
+                .await;
+            });
+        }
         _ if cmd.starts_with('/') => {
             let _ = tg_client
                 .send_html(tg_chat_id, "Неизвестная команда. Откройте /menu или /help.", None)
@@ -1771,6 +1993,16 @@ async fn handle_callback_query(
         return;
     }
     tg_client.answer_callback(cb_id, None).await;
+
+    if let Some(rest) = cb_data.strip_prefix("btw_del:") {
+        tg_client.delete_message(tg_chat_id, msg_id).await;
+        if let Ok(user_mid) = rest.trim().parse::<i64>() {
+            if user_mid > 0 {
+                tg_client.delete_message(tg_chat_id, user_mid).await;
+            }
+        }
+        return;
+    }
 
     match cb_data {
         "tg:cmd:menu" => {
@@ -2223,7 +2455,28 @@ async fn run_telegram_agent_turn(
         }
     };
 
-    let attached_paths = match extract_and_download_attachments(&tg_client, tg_chat_id, &msg, &chat_id).await {
+    let chat_proj = ctx
+        .app_state
+        .db
+        .get_chat(&chat_id)
+        .ok()
+        .and_then(|c| c.project_id)
+        .filter(|s| !s.trim().is_empty());
+    let bootstrap_cfg = ctx.app_state.get_bootstrap_config().await;
+    let workspace_path = match chat_proj {
+        Some(dir) => PathBuf::from(dir),
+        None => match &bootstrap_cfg.workspace_dir {
+            Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+            _ => {
+                let chat_ws = crate::state::AppState::resolve_install_workspace().join(&chat_id);
+                let _ = std::fs::create_dir_all(&chat_ws);
+                chat_ws
+            }
+        },
+    };
+    let workspace_str = workspace_path.to_string_lossy().to_string();
+
+    let attached_paths = match extract_and_download_attachments(&tg_client, tg_chat_id, &msg, &workspace_str).await {
         Ok(paths) => paths,
         Err(e) => {
             let _ = tg_client.send_html(tg_chat_id, &escape_html(&e), None).await;
@@ -2272,6 +2525,10 @@ async fn run_telegram_agent_turn(
         return;
     }
 
+    let chat_lock = get_chat_lock(&chat_id).await;
+    let _chat_turn_guard = chat_lock.lock().await;
+    TelegramUploadManager::register_active_chat(&chat_id, tg_client.clone(), tg_chat_id).await;
+
     persist_session_snapshot(&config_arc, &config_path_arc, &sessions, None).await;
 
     let existing_msgs = ctx.app_state.db.list_messages(&chat_id).unwrap_or_default();
@@ -2289,27 +2546,6 @@ async fn run_telegram_agent_turn(
     };
     let _ = ctx.app_state.db.create_message(&user_msg);
     emit_chat_updated(&ctx, &chat_id).await;
-
-    let chat_proj = ctx
-        .app_state
-        .db
-        .get_chat(&chat_id)
-        .ok()
-        .and_then(|c| c.project_id)
-        .filter(|s| !s.trim().is_empty());
-    let bootstrap_cfg = ctx.app_state.get_bootstrap_config().await;
-    let workspace_path = match chat_proj {
-        Some(dir) => PathBuf::from(dir),
-        None => match &bootstrap_cfg.workspace_dir {
-            Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-            _ => {
-                let chat_ws = crate::state::AppState::resolve_install_workspace().join(&chat_id);
-                let _ = std::fs::create_dir_all(&chat_ws);
-                chat_ws
-            }
-        },
-    };
-    let workspace_str = workspace_path.to_string_lossy().to_string();
 
     let key_pool = (*ctx.key_pool).clone();
     if !provider.api_key.trim().is_empty() {
@@ -2446,13 +2682,36 @@ async fn run_telegram_agent_turn(
     });
 
     let mut contract_lock = contract_mutex.lock().await;
+    let tg_ctx_key = format!("tg_ctx:{}", chat_id);
     let mut history: Vec<crate::llm::request_compat::ChatMessage> = ctx
         .app_state
         .db
-        .load_checkpoint(&chat_id)
+        .load_checkpoint(&tg_ctx_key)
         .ok()
         .flatten()
+        .or_else(|| ctx.app_state.db.load_checkpoint(&chat_id).ok().flatten())
         .and_then(|j| serde_json::from_str(&j).ok())
+        .map(|mut h: Vec<crate::llm::request_compat::ChatMessage>| {
+            let known_texts: std::collections::HashSet<String> = h
+                .iter()
+                .filter(|m| m.role == "user" || m.role == "assistant")
+                .map(|m| format!("{}:{}", m.role, m.content.as_text_lossy()))
+                .collect();
+            for m in &existing_msgs {
+                if m.content.trim().is_empty() {
+                    continue;
+                }
+                let sig = format!("{}:{}", m.role, m.content);
+                if !known_texts.contains(&sig) {
+                    if m.role == "assistant" {
+                        h.push(crate::llm::request_compat::ChatMessage::assistant(m.content.clone()));
+                    } else if m.role == "user" {
+                        h.push(crate::llm::request_compat::ChatMessage::user(m.content.clone()));
+                    }
+                }
+            }
+            h
+        })
         .unwrap_or_else(|| {
             let mut h = Vec::new();
             if !existing_msgs.is_empty() {
@@ -2676,6 +2935,12 @@ async fn run_telegram_agent_turn(
         ),
     };
 
+    if !history.is_empty() {
+        if let Ok(hist_json) = serde_json::to_string(&history) {
+            let _ = ctx.app_state.db.save_checkpoint(&tg_ctx_key, &hist_json);
+        }
+    }
+
     if !final_text.trim().is_empty() {
         let asst_msg = crate::db::chats::Message {
             id: uuid::Uuid::new_v4().to_string(),
@@ -2697,12 +2962,214 @@ async fn run_telegram_agent_turn(
 
         let html = markdown_to_telegram_html(&final_text);
         let _ = tg_client.send_html(tg_chat_id, &html, None).await;
+        for (kind, src) in extract_media_attachments(&final_text) {
+            let _ = TelegramUploadManager::enqueue_with_client(
+                tg_client.clone(),
+                tg_chat_id,
+                &chat_id,
+                &src,
+                &kind,
+                None,
+            )
+            .await;
+        }
     } else {
         let err_msg = error_text
             .or_else(|| run_res.err())
-            .unwrap_or_else(|| "Финальный ответ отсутствует.".to_string());
+            .unwrap_or_else(|| "Задача завершена без текстового ответа.".to_string());
+        let asst_msg = crate::db::chats::Message {
+            id: uuid::Uuid::new_v4().to_string(),
+            chat_id: chat_id.clone(),
+            role: "assistant".to_string(),
+            content: format!("[Telegram] {}", err_msg),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            sequence_num: seq + 1,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let _ = ctx.app_state.db.create_message(&asst_msg);
+        emit_chat_updated(&ctx, &chat_id).await;
         let _ = tg_client
             .send_html(tg_chat_id, &escape_html(&format_user_error(&err_msg)), None)
             .await;
     }
+}
+
+async fn run_telegram_btw(
+    tg_client: TelegramClient,
+    tg_chat_id: i64,
+    user_msg_id: i64,
+    question: String,
+    ctx: TelegramRuntimeContext,
+    providers_snap: Arc<RwLock<ProvidersSnapshotFile>>,
+    sessions: Arc<RwLock<HashMap<i64, TelegramChatSession>>>,
+) {
+    let (provider, model) =
+        match resolve_provider_and_model(&ctx, &providers_snap, &sessions, tg_chat_id).await {
+            Ok(res) => res,
+            Err(e) => {
+                let _ = tg_client
+                    .send_html(tg_chat_id, &escape_html(&format_user_error(&e)), None)
+                    .await;
+                return;
+            }
+        };
+
+    let active_cid = sessions
+        .read()
+        .await
+        .get(&tg_chat_id)
+        .and_then(|s| s.active_chat_id.clone());
+
+    let mut msgs: Vec<crate::llm::request_compat::ChatMessage> = Vec::new();
+    msgs.push(crate::llm::request_compat::ChatMessage::system(
+        "Answer the user side question (/btw) concisely and accurately using context. Do not invoke tools.".to_string(),
+    ));
+    if let Some(ref cid) = active_cid {
+        let tg_ctx_key = format!("tg_ctx:{}", cid);
+        if let Some(raw) = ctx.app_state.db.load_checkpoint(&tg_ctx_key).ok().flatten() {
+            if let Ok(hist) = serde_json::from_str::<Vec<crate::llm::request_compat::ChatMessage>>(&raw) {
+                for m in hist.into_iter().filter(|m| m.role == "user" || m.role == "assistant").rev().take(12).collect::<Vec<_>>().into_iter().rev() {
+                    msgs.push(crate::llm::request_compat::ChatMessage {
+                        role: m.role,
+                        content: m.content,
+                        name: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
+                }
+            }
+        }
+    }
+    msgs.push(crate::llm::request_compat::ChatMessage::user(question));
+
+    let key_pool = (*ctx.key_pool).clone();
+    if !provider.api_key.trim().is_empty() {
+        key_pool.set_keys(&provider.name, vec![provider.api_key.trim().to_string()]);
+    }
+    let caps_reg = (*ctx.caps_registry).clone();
+    let req = crate::llm::request_compat::ChatRequest {
+        model: model.id.clone(),
+        messages: msgs,
+        temperature: Some(0.3),
+        top_p: None,
+        max_tokens: Some(1500),
+        max_completion_tokens: Some(1500),
+        reasoning_effort: None,
+        thinking_budget: None,
+        tools: None,
+        tool_choice: None,
+        response_format: None,
+        stream: true,
+        prompt_cache_key: None,
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let client = ctx.http_client.clone();
+    let pname = provider.name.clone();
+    let burl = provider.base_url.clone();
+    let proto = provider.api_protocol.clone();
+    tokio::spawn(async move {
+        let _ = crate::llm::dispatch_stream_with_protocol(
+            &client,
+            &pname,
+            &burl,
+            proto.as_deref(),
+            &key_pool,
+            &caps_reg,
+            req,
+            tx,
+        )
+        .await;
+    });
+
+    let mut answer = String::new();
+    while let Some(ev) = rx.recv().await {
+        if let crate::llm::StreamEvent::ContentDelta { delta } = ev {
+            answer.push_str(&delta);
+        }
+    }
+    if answer.trim().is_empty() {
+        answer = "Не удалось получить ответ на /btw.".to_string();
+    }
+
+    let kb = json!({
+        "inline_keyboard": [[{
+            "text": "🗑 Удалить",
+            "callback_data": format!("btw_del:{}", user_msg_id)
+        }]]
+    });
+    let html = format!("<b>/btw</b>
+
+{}", markdown_to_telegram_html(&answer));
+    let _ = tg_client.send_html(tg_chat_id, &html, Some(&kb)).await;
+}
+
+
+fn extract_media_attachments(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push_unique = |kind: &str, src: String| {
+        let s = src.trim().to_string();
+        if s.is_empty() || s.starts_with("data:") {
+            return;
+        }
+        if !out.iter().any(|(_, existing)| existing == &s) && out.len() < 10 {
+            out.push((kind.to_string(), s));
+        }
+    };
+
+    if let Ok(re_img_tag) = regex::Regex::new(r#"(?i)<img[^>]*src=["']([^"']+)["'][^>]*>"#) {
+        for cap in re_img_tag.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                push_unique("photo", m.as_str().to_string());
+            }
+        }
+    }
+    if let Ok(re_aud_tag) = regex::Regex::new(r#"(?i)<audio[^>]*src=["']([^"']+)["'][^>]*>"#) {
+        for cap in re_aud_tag.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                push_unique("audio", m.as_str().to_string());
+            }
+        }
+    }
+    if let Ok(re_vid_tag) = regex::Regex::new(r#"(?i)<video[^>]*src=["']([^"']+)["'][^>]*>"#) {
+        for cap in re_vid_tag.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                push_unique("video", m.as_str().to_string());
+            }
+        }
+    }
+    if let Ok(re_md_img) = regex::Regex::new(r#"!\[[^\]]*\]\(([^)\s]+)\)"#) {
+        for cap in re_md_img.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                let url = m.as_str();
+                let lower = url.to_ascii_lowercase();
+                if [".mp3", ".wav", ".ogg", ".m4a", ".opus", ".flac"].iter().any(|ext| lower.contains(ext)) {
+                    push_unique("audio", url.to_string());
+                } else if [".mp4", ".webm", ".mov", ".mkv"].iter().any(|ext| lower.contains(ext)) {
+                    push_unique("video", url.to_string());
+                } else {
+                    push_unique("photo", url.to_string());
+                }
+            }
+        }
+    }
+    if let Ok(re_md_link) = regex::Regex::new(r#"(?:^|[^!])\[[^\]]*\]\(([^)\s]+)\)"#) {
+        for cap in re_md_link.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                let url = m.as_str();
+                let lower = url.to_ascii_lowercase();
+                if [".mp3", ".wav", ".ogg", ".m4a", ".opus", ".flac"].iter().any(|ext| lower.ends_with(ext)) {
+                    push_unique("audio", url.to_string());
+                } else if [".mp4", ".webm", ".mov", ".mkv"].iter().any(|ext| lower.ends_with(ext)) {
+                    push_unique("video", url.to_string());
+                } else if [".png", ".jpg", ".jpeg", ".webp", ".gif"].iter().any(|ext| lower.ends_with(ext)) {
+                    push_unique("photo", url.to_string());
+                }
+            }
+        }
+    }
+    out
 }

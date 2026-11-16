@@ -36,8 +36,30 @@ pub struct ReadFileResult {
     pub truncated: bool,
 }
 
+pub const MAX_PATCH_DIFF_LINES: i64 = 5000;
+
+fn is_reserved_windows_name(path: &Path) -> bool {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL"
+            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+    )
+}
+
 pub fn validate_path(path_str: &str, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
+    if path_str.starts_with("\\\\") || path_str.starts_with("//") {
+        return Err(format!("Access denied: UNC network path '{}' is not allowed.", path_str));
+    }
     let raw = Path::new(path_str);
+    if is_reserved_windows_name(raw) {
+        return Err(format!("Invalid path: '{}' uses a reserved Windows device name.", path_str));
+    }
     let p = if raw.is_absolute() {
         raw.to_path_buf()
     } else if let Some(base) = allowed_roots.first() {
@@ -46,18 +68,65 @@ pub fn validate_path(path_str: &str, allowed_roots: &[PathBuf]) -> Result<PathBu
         raw.to_path_buf()
     };
 
-    if p.exists() {
-        p.canonicalize().map_err(|e| e.to_string())
+    let resolved = if p.exists() {
+        p.canonicalize().map_err(|e| e.to_string())?
     } else {
-        let parent = p.parent().unwrap_or_else(|| Path::new("."));
-        let can_parent = if parent.exists() {
-            parent.canonicalize().map_err(|e| e.to_string())?
+        let mut ancestor = p.parent();
+        let mut tail_parts: Vec<std::ffi::OsString> = Vec::new();
+        if let Some(fname) = p.file_name() {
+            tail_parts.push(fname.to_os_string());
         } else {
-            parent.to_path_buf()
-        };
-        let file_name = p.file_name().ok_or_else(|| "Invalid file path".to_string())?;
-        Ok(can_parent.join(file_name))
+            return Err("Invalid file path".to_string());
+        }
+        while let Some(anc) = ancestor {
+            if anc.exists() {
+                let mut can = anc.canonicalize().map_err(|e| e.to_string())?;
+                for part in tail_parts.iter().rev() {
+                    can.push(part);
+                }
+                ancestor = None;
+                let _ = ancestor;
+                return ensure_within_roots(can, path_str, allowed_roots);
+            }
+            if let Some(name) = anc.file_name() {
+                tail_parts.push(name.to_os_string());
+            }
+            ancestor = anc.parent();
+        }
+        p
+    };
+
+    ensure_within_roots(resolved, path_str, allowed_roots)
+}
+
+pub fn normalize_windows_path(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    let stripped = if s.starts_with(r"\\?\UNC\") {
+        format!(r"\\{}", &s[8..])
+    } else if s.starts_with(r"\\?\") {
+        s[4..].to_string()
+    } else {
+        s.to_string()
+    };
+    PathBuf::from(stripped.replace('/', "\\"))
+}
+
+fn ensure_within_roots(resolved: PathBuf, raw_str: &str, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
+    let norm_resolved = normalize_windows_path(&resolved);
+    if allowed_roots.is_empty() {
+        return Ok(norm_resolved);
     }
+    let res_lower = norm_resolved.to_string_lossy().to_lowercase();
+    for root in allowed_roots {
+        let can_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+        let norm_root = normalize_windows_path(&can_root);
+        let root_lower = norm_root.to_string_lossy().to_lowercase();
+        let root_prefix = root_lower.trim_end_matches('\\');
+        if res_lower == root_prefix || res_lower.starts_with(&format!("{}\\", root_prefix)) || res_lower.starts_with(&format!("{}/", root_prefix)) {
+            return Ok(norm_resolved);
+        }
+    }
+    Err(format!("Access denied: path '{}' resolves outside allowed workspace root.", raw_str))
 }
 
 pub fn record_file_snapshot(
@@ -718,17 +787,41 @@ fn check_bracket_balance(content: &str) -> Option<String> {
 }
 
 pub fn atomic_write_bytes(target: &Path, bytes: &[u8]) -> Result<(), String> {
-    if let Some(parent) = target.parent() {
+    let write_target = if fs::symlink_metadata(target)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        fs::canonicalize(target).map_err(|e| format!("Failed to resolve symlink target: {}", e))?
+    } else {
+        target.to_path_buf()
+    };
+
+    if let Some(parent) = write_target.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
+
+    let existing_perms = fs::metadata(&write_target).ok().map(|m| m.permissions());
+
     let tmp_name = format!(
         ".{}.tmp.{}",
-        target.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
+        write_target.file_name().and_then(|n| n.to_str()).unwrap_or("file"),
         Uuid::new_v4()
     );
-    let tmp_path = target.with_file_name(tmp_name);
-    fs::write(&tmp_path, bytes).map_err(|e| e.to_string())?;
-    fs::rename(&tmp_path, target).map_err(|e| {
+    let tmp_path = write_target.with_file_name(tmp_name);
+
+    {
+        let mut f = File::create(&tmp_path).map_err(|e| e.to_string())?;
+        if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e.to_string());
+        }
+    }
+
+    if let Some(perms) = existing_perms {
+        let _ = fs::set_permissions(&tmp_path, perms);
+    }
+
+    fs::rename(&tmp_path, &write_target).map_err(|e| {
         let _ = fs::remove_file(&tmp_path);
         e.to_string()
     })
@@ -773,23 +866,51 @@ pub fn read_file_smart(
     let start = offset.unwrap_or(0);
     let count = limit.unwrap_or(350).min(400);
 
-    let selected: Vec<String> = all_lines
-        .into_iter()
-        .skip(start)
-        .take(count)
-        .enumerate()
-        .map(|(i, line)| format!("L{}: {}", start + i + 1, line))
-        .collect();
+    if total_lines > 0 && start >= total_lines {
+        return Ok(serde_json::json!({
+            "kind": "text",
+            "path": target.to_string_lossy(),
+            "totalLines": total_lines,
+            "returnedLines": 0,
+            "truncated": false,
+            "content": format!("[Offset {} is past EOF (totalLines={}).]", start, total_lines),
+        }));
+    }
+
+    let mut selected: Vec<String> = Vec::new();
+    let mut line_chars_truncated = false;
+    let mut total_chars = 0usize;
+    let max_body_chars = 20_000usize;
+    let max_line_chars = 8_000usize;
+
+    for (i, line) in all_lines.into_iter().skip(start).take(count).enumerate() {
+        let char_cnt = line.chars().count();
+        let line_text = if char_cnt > max_line_chars {
+            line_chars_truncated = true;
+            let end_idx = line.char_indices().nth(max_line_chars).map(|(p, _)| p).unwrap_or(line.len());
+            format!("{}... [line truncated at {} of {} chars]", &line[..end_idx], max_line_chars, char_cnt)
+        } else {
+            line.to_string()
+        };
+        let formatted = format!("L{}: {}", start + i + 1, line_text);
+        if total_chars + formatted.len() > max_body_chars && !selected.is_empty() {
+            line_chars_truncated = true;
+            break;
+        }
+        total_chars += formatted.len() + 1;
+        selected.push(formatted);
+    }
 
     let returned = selected.len();
-    let truncated = (start + returned) < total_lines;
+    let truncated = line_chars_truncated || ((start + returned) < total_lines);
     let mut body = selected.join("\n");
-    if truncated {
+    if truncated && returned > 0 {
         body.push_str(&format!(
-            "\n[Showing lines L{}-L{} of {}. Use offset/limit to read further.]",
+            "\n[Showing lines L{}-L{} of {} (truncated={}). Use offset/limit to read further.]",
             start + 1,
             start + returned,
-            total_lines
+            total_lines,
+            truncated
         ));
     }
 
@@ -808,30 +929,59 @@ fn apply_single_edit_cascade(source: &str, old_text: &str, new_text: &str, repla
         return Err("old_text cannot be empty".to_string());
     }
     if source.contains(old_text) {
-        let count = if replace_all {
-            source.matches(old_text).count()
-        } else {
-            1
-        };
+        let match_count = source.matches(old_text).count();
+        if !replace_all && match_count > 1 {
+            return Err(format!(
+                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
+                match_count
+            ));
+        }
         let out = if replace_all {
             source.replace(old_text, new_text)
         } else {
             source.replacen(old_text, new_text, 1)
         };
-        return Ok((out, count));
+        return Ok((out, match_count));
     }
 
+    let is_crlf = source.contains("\r\n");
     let norm_src = source.replace("\r\n", "\n");
     let norm_old = old_text.replace("\r\n", "\n");
     let norm_new = new_text.replace("\r\n", "\n");
     if norm_src.contains(&norm_old) {
-        let count = if replace_all { norm_src.matches(&norm_old).count() } else { 1 };
+        let match_count = norm_src.matches(&norm_old).count();
+        if !replace_all && match_count > 1 {
+            return Err(format!(
+                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
+                match_count
+            ));
+        }
         let out = if replace_all {
             norm_src.replace(&norm_old, &norm_new)
         } else {
             norm_src.replacen(&norm_old, &norm_new, 1)
         };
-        return Ok((out, count));
+        let restored = if is_crlf { out.replace('\n', "\r\n") } else { out };
+        return Ok((restored, match_count));
+    }
+
+    let clean_s = norm_src.replace('\u{FEFF}', "").replace('\u{00A0}', " ").replace('\u{200B}', "");
+    let clean_o = norm_old.replace('\u{FEFF}', "").replace('\u{00A0}', " ").replace('\u{200B}', "");
+    if clean_s.contains(&clean_o) {
+        let match_count = clean_s.matches(&clean_o).count();
+        if !replace_all && match_count > 1 {
+            return Err(format!(
+                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
+                match_count
+            ));
+        }
+        let out = if replace_all {
+            clean_s.replace(&clean_o, &norm_new)
+        } else {
+            clean_s.replacen(&clean_o, &norm_new, 1)
+        };
+        let restored = if is_crlf { out.replace('\n', "\r\n") } else { out };
+        return Ok((restored, match_count));
     }
 
     let trim_lines = |s: &str| -> Vec<String> {
@@ -840,13 +990,20 @@ fn apply_single_edit_cascade(source: &str, old_text: &str, new_text: &str, repla
     let src_lines = trim_lines(&norm_src);
     let old_lines = trim_lines(&norm_old);
     if !old_lines.is_empty() && src_lines.len() >= old_lines.len() {
+        let mut hits = Vec::new();
         for i in 0..=src_lines.len() - old_lines.len() {
             if src_lines[i..i + old_lines.len()] == old_lines[..] {
-                let mut out_lines: Vec<String> = norm_src.lines().map(|l| l.to_string()).collect();
-                let new_lines: Vec<String> = norm_new.lines().map(|l| l.to_string()).collect();
-                out_lines.splice(i..i + old_lines.len(), new_lines);
-                return Ok((out_lines.join("\n"), 1));
+                hits.push(i);
             }
+        }
+        if hits.len() > 1 && !replace_all {
+            return Err(format!("Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.", hits.len()));
+        }
+        if let Some(&i) = hits.first() {
+            let mut out_lines: Vec<String> = norm_src.lines().map(|l| l.to_string()).collect();
+            let new_lines: Vec<String> = norm_new.lines().map(|l| l.to_string()).collect();
+            out_lines.splice(i..i + old_lines.len(), new_lines);
+            return Ok((out_lines.join("\n"), 1));
         }
     }
 
@@ -963,7 +1120,19 @@ pub fn edit_file_cascade(
     }
 
     let (added, removed) = compute_line_diff(&before_str, &current);
+    if added + removed > MAX_PATCH_DIFF_LINES {
+        return Err(format!(
+            "Patch diff exceeds safety limit ({} > {} lines). Split into smaller edits or use write_file.",
+            added + removed,
+            MAX_PATCH_DIFF_LINES
+        ));
+    }
+
+    let before_hash = crate::tools::safety::FileReadGuard::hash_bytes(&before_bytes);
     let after_bytes = current.as_bytes();
+    let after_hash = crate::tools::safety::FileReadGuard::hash_bytes(after_bytes);
+    let truncated_or_unsaved = (after_bytes.len() as u64) > crate::tools::blob_store::MAX_BLOB_BYTES;
+
     atomic_write_bytes(&target, after_bytes)?;
     guard.record_read(&target, after_bytes);
 
@@ -972,8 +1141,8 @@ pub fn edit_file_cascade(
         chat_id,
         &target.to_string_lossy(),
         true,
-        Some(before_bytes),
-        Some(after_bytes.to_vec()),
+        if truncated_or_unsaved { None } else { Some(before_bytes) },
+        if truncated_or_unsaved { None } else { Some(after_bytes.to_vec()) },
         added,
         removed,
     )?;
@@ -991,7 +1160,126 @@ pub fn edit_file_cascade(
         "editsApplied": applied,
         "addedLines": added,
         "removedLines": removed,
+        "beforeHash": before_hash,
+        "afterHash": after_hash,
+        "truncatedOrUnsaved": truncated_or_unsaved,
         "syntaxWarning": syntax_warning,
+    }))
+}
+
+pub fn apply_unified_diff_safe(
+    conn: Option<&Connection>,
+    chat_id: Option<&str>,
+    path_str: &str,
+    patch_text: &str,
+    allowed_roots: &[PathBuf],
+    guard: &crate::tools::safety::FileReadGuard,
+) -> Result<serde_json::Value, String> {
+    let target = validate_path(path_str, allowed_roots)?;
+    crate::tools::safety::SecretShield::check_path(&target)?;
+    if !target.exists() {
+        return Err(format!("File not found for patch: {}", path_str));
+    }
+    guard.verify_before_write(&target)?;
+
+    let before_bytes = fs::read(&target).map_err(|e| e.to_string())?;
+    let before_str = String::from_utf8(before_bytes.clone())
+        .map_err(|_| "File is not valid UTF-8".to_string())?;
+    let before_hash = crate::tools::safety::FileReadGuard::hash_bytes(&before_bytes);
+
+    let old_lines: Vec<&str> = before_str.lines().collect();
+    let mut new_lines: Vec<String> = old_lines.iter().map(|l| (*l).to_string()).collect();
+    let mut line_offset: isize = 0;
+
+    let patch_lines: Vec<&str> = patch_text.lines().collect();
+    let mut idx = 0usize;
+    while idx < patch_lines.len() {
+        let line = patch_lines[idx];
+        if line.starts_with("--- ") || line.starts_with("+++ ") || line.starts_with("diff ") || line.starts_with("index ") {
+            idx += 1;
+            continue;
+        }
+        if line.starts_with("@@") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            let old_start = parts
+                .get(1)
+                .and_then(|p| p.strip_prefix('-'))
+                .and_then(|p| p.split(',').next())
+                .and_then(|n| n.parse::<usize>().ok())
+                .ok_or_else(|| format!("Invalid hunk header: {}", line))?;
+
+            let mut cursor = (old_start.saturating_sub(1) as isize + line_offset).max(0) as usize;
+            idx += 1;
+            while idx < patch_lines.len() && !patch_lines[idx].starts_with("@@") {
+                let hline = patch_lines[idx];
+                if let Some(rest) = hline.strip_prefix(' ') {
+                    if cursor >= new_lines.len() || new_lines[cursor] != rest {
+                        return Err(format!("Patch context mismatch at line {}", cursor + 1));
+                    }
+                    cursor += 1;
+                } else if let Some(rest) = hline.strip_prefix('-') {
+                    if cursor >= new_lines.len() || new_lines[cursor] != rest {
+                        return Err(format!("Patch removal mismatch at line {}", cursor + 1));
+                    }
+                    new_lines.remove(cursor);
+                    line_offset -= 1;
+                } else if let Some(rest) = hline.strip_prefix('+') {
+                    if cursor <= new_lines.len() {
+                        new_lines.insert(cursor, rest.to_string());
+                        cursor += 1;
+                        line_offset += 1;
+                    }
+                } else if hline.starts_with("\\ No newline") {
+                } else if !hline.is_empty() {
+                    return Err(format!("Invalid patch line: {}", hline));
+                }
+                idx += 1;
+            }
+            continue;
+        }
+        idx += 1;
+    }
+
+    let mut current = new_lines.join("\n");
+    if before_str.ends_with('\n') && !current.ends_with('\n') {
+        current.push('\n');
+    }
+
+    let (added, removed) = compute_line_diff(&before_str, &current);
+    if added + removed > MAX_PATCH_DIFF_LINES {
+        return Err(format!(
+            "Patch diff exceeds safety limit ({} > {} lines).",
+            added + removed,
+            MAX_PATCH_DIFF_LINES
+        ));
+    }
+
+    let after_bytes = current.as_bytes();
+    let after_hash = crate::tools::safety::FileReadGuard::hash_bytes(after_bytes);
+    let truncated_or_unsaved = (after_bytes.len() as u64) > crate::tools::blob_store::MAX_BLOB_BYTES;
+
+    atomic_write_bytes(&target, after_bytes)?;
+    guard.record_read(&target, after_bytes);
+
+    let snapshot_id = record_file_snapshot(
+        conn,
+        chat_id,
+        &target.to_string_lossy(),
+        true,
+        if truncated_or_unsaved { None } else { Some(before_bytes) },
+        if truncated_or_unsaved { None } else { Some(after_bytes.to_vec()) },
+        added,
+        removed,
+    )?;
+
+    Ok(serde_json::json!({
+        "path": target.to_string_lossy(),
+        "snapshotId": snapshot_id,
+        "addedLines": added,
+        "removedLines": removed,
+        "beforeHash": before_hash,
+        "afterHash": after_hash,
+        "truncatedOrUnsaved": truncated_or_unsaved,
     }))
 }
 
@@ -1022,6 +1310,8 @@ pub fn write_file_atomic(
     let (added_lines, removed_lines) = compute_line_diff(&old_text, new_content);
 
     let after_bytes = new_content.as_bytes();
+    let too_large = (after_bytes.len() as u64) > crate::tools::blob_store::MAX_BLOB_BYTES
+        || before_blob.as_ref().map(|b| (b.len() as u64) > crate::tools::blob_store::MAX_BLOB_BYTES).unwrap_or(false);
     atomic_write_bytes(&target, after_bytes)?;
     guard.record_read(&target, after_bytes);
 
@@ -1030,8 +1320,8 @@ pub fn write_file_atomic(
         chat_id,
         &target.to_string_lossy(),
         existed_before,
-        before_blob,
-        Some(after_bytes.to_vec()),
+        if too_large { None } else { before_blob },
+        if too_large { None } else { Some(after_bytes.to_vec()) },
         added_lines,
         removed_lines,
     )?;
@@ -1102,11 +1392,24 @@ pub fn glob_sorted_by_mtime(
     limit: Option<usize>,
     allowed_roots: &[PathBuf],
 ) -> Result<Vec<String>, String> {
-    let root = match root_opt {
+    let raw_root = match root_opt {
         Some(r) if !r.trim().is_empty() => validate_path(r, allowed_roots)?,
         _ => allowed_roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
     };
-    let pat_norm = pattern.replace('\\', "/");
+    let root = raw_root.canonicalize().unwrap_or(raw_root);
+    let root_norm = root
+        .to_string_lossy()
+        .replace('\\', "/")
+        .trim_start_matches("//?/")
+        .trim_end_matches('/')
+        .to_lowercase();
+
+    let mut pat_norm = pattern.replace('\\', "/");
+    while pat_norm.starts_with("./") {
+        pat_norm = pat_norm[2..].to_string();
+    }
+    pat_norm = pat_norm.trim_start_matches('/').to_string();
+
     let regex_str = format!(
         "^{}$",
         regex::escape(&pat_norm)
@@ -1129,11 +1432,24 @@ pub fn glob_sorted_by_mtime(
 
     for entry in walker.flatten() {
         if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
-            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let full_norm = entry
+                .path()
+                .to_string_lossy()
+                .replace('\\', "/");
+            let full_clean = full_norm.trim_start_matches("//?/");
+            let rel_str = if full_clean.to_lowercase().starts_with(&root_norm) {
+                full_clean[root_norm.len()..].trim_start_matches('/').to_string()
+            } else {
+                entry
+                    .path()
+                    .strip_prefix(&root)
+                    .unwrap_or(entry.path())
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            };
             if re.is_match(&rel_str) {
                 let mtime = crate::tools::safety::FileReadGuard::file_mtime_nanos(entry.path());
-                matches.push((mtime, entry.path().to_string_lossy().to_string()));
+                matches.push((mtime, full_clean.to_string()));
             }
         }
     }

@@ -280,6 +280,8 @@ pub async fn stream_google_gemini(
                         completion_tokens: ct,
                         total_tokens: tt,
                         cached_tokens: cached,
+                        cache_read_input_tokens: cached,
+                        cache_creation_input_tokens: 0,
                     });
                 }
 

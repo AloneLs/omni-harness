@@ -1,7 +1,7 @@
 use crate::engine::compaction::ContextCompactor;
 use crate::engine::context_engine::{
-    cleanup_old_tmp_logs, compute_prompt_cache_key, estimate_messages_tokens,
-    spill_tool_output_if_needed, CompactionCursor, ContextBuilder,
+    cleanup_old_tmp_logs, compute_prompt_cache_key, count_context_tokens,
+    safe_slice_head, spill_tool_output_if_needed, spill_tool_output_with_path, CompactionCursor, ContextBuilder,
 };
 use crate::engine::prompt_builder::PromptBuilder;
 use crate::engine::role_permissions::{AgentRole, RolePermissionEngine};
@@ -12,7 +12,7 @@ use crate::engine::task_contract::{
 use crate::llm::capabilities::{CapabilityRegistry, ModelFamily};
 use crate::llm::key_pool::KeyPool;
 use crate::llm::request_compat::{ChatMessage, ChatRequest, ContentPart, FunctionSpec, ImageUrlDetail, MessageContent, ToolCall, ToolDefinition};
-use crate::llm::{dispatch_stream, StreamEvent, TokenUsage};
+use crate::llm::{dispatch_stream, StreamEvent, TokenCountRouter, TokenUsage};
 use crate::tools::ToolDispatcher;
 use serde_json::Value;
 use std::sync::Arc;
@@ -21,6 +21,47 @@ use tokio::sync::mpsc;
 pub struct SingleAgentRunner;
 
 impl SingleAgentRunner {
+    fn load_plan_tuple(db: Option<&crate::db::Database>, chat_id: &str) -> Option<(bool, String)> {
+        db.and_then(|d| d.load_plan_state(chat_id).ok().flatten())
+    }
+
+    fn collect_restored_files(
+        db: Option<&crate::db::Database>,
+        workspace_root: &str,
+        chat_id: &str,
+    ) -> Vec<(String, String)> {
+        let Some(d) = db else {
+            return Vec::new();
+        };
+        let Ok(paths) = d.list_recent_artifacts(chat_id, "file", 5) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut total_chars: usize = 0;
+        let max_total_chars: usize = 175_000;
+        for raw_p in paths {
+            let candidate = std::path::Path::new(&raw_p);
+            let full = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                std::path::Path::new(workspace_root).join(candidate)
+            };
+            if let Ok(content) = std::fs::read_to_string(&full) {
+                let capped = if content.chars().count() > 40_000 {
+                    format!("{}... [truncated]", safe_slice_head(&content, 40_000))
+                } else {
+                    content
+                };
+                if total_chars + capped.len() > max_total_chars {
+                    break;
+                }
+                total_chars += capped.len();
+                out.push((raw_p, capped));
+            }
+        }
+        out
+    }
+
 
 
     async fn run_live_terminal_exec(
@@ -32,6 +73,14 @@ impl SingleAgentRunner {
         call_id: &str,
         event_sender: &mpsc::Sender<StreamEvent>,
     ) -> (bool, String, Option<String>) {
+        if let Some(obj) = args.as_object() {
+            let allowed = ["command", "description", "cwd", "timeout_secs", "background"];
+            let unknown: Vec<&str> = obj.keys().map(|k| k.as_str()).filter(|k| !allowed.contains(k)).collect();
+            if !unknown.is_empty() {
+                let err_msg = format!("Invalid argument: unknown parameter(s): {}", unknown.join(", "));
+                return (false, serde_json::json!({ "error": err_msg }).to_string(), Some(err_msg));
+            }
+        }
         let command = match args.get("command").and_then(|v| v.as_str()) {
             Some(c) if !c.trim().is_empty() => c,
             _ => return (false, serde_json::json!({ "error": "Missing command" }).to_string(), Some("Missing command".to_string())),
@@ -40,15 +89,44 @@ impl SingleAgentRunner {
             return (false, serde_json::json!({ "error": e }).to_string(), Some(e));
         }
 
-        let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(workspace_root);
+        let timeout_secs = match args.get("timeout_secs") {
+            Some(v) => match v.as_u64() {
+                Some(n) if (5..=600).contains(&n) => n,
+                _ => {
+                    let err_msg = "Invalid argument: timeout_secs must be an integer between 5 and 600".to_string();
+                    return (false, serde_json::json!({ "error": err_msg }).to_string(), Some(err_msg));
+                }
+            },
+            None => 120,
+        };
+
+        let cwd_raw = match args.get("cwd") {
+            Some(v) => match v.as_str() {
+                Some(s) if !s.trim().is_empty() => s,
+                _ => {
+                    let err_msg = "Invalid argument: cwd must be a non-empty string".to_string();
+                    return (false, serde_json::json!({ "error": err_msg }).to_string(), Some(err_msg));
+                }
+            },
+            None => workspace_root,
+        };
+        if !std::path::Path::new(cwd_raw).is_dir() {
+            let err_msg = format!("Invalid cwd: directory '{}' does not exist", cwd_raw);
+            return (false, serde_json::json!({ "error": err_msg }).to_string(), Some(err_msg));
+        }
+        let cwd_validated = match crate::tools::workspace::validate_path(cwd_raw, &tools.allowed_roots) {
+            Ok(p) => p,
+            Err(e) => return (false, serde_json::json!({ "error": e }).to_string(), Some(e)),
+        };
+        let cwd_str = cwd_validated.to_string_lossy().to_string();
+        let cwd = cwd_str.as_str();
         let background = args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
-        let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64()).unwrap_or(120).clamp(5, 600);
+        let started = std::time::Instant::now();
 
         let encoded_ps = if cfg!(target_os = "windows") {
             use base64::Engine;
             let full_script = format!(
-                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::InputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8;
-{}",
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::InputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8;\n{}",
                 command
             );
             let utf16_bytes: Vec<u8> = full_script
@@ -59,6 +137,241 @@ impl SingleAgentRunner {
         } else {
             String::new()
         };
+
+        if !background {
+            use tokio::io::AsyncReadExt;
+            let mut cmd = if cfg!(target_os = "windows") {
+                let mut c = tokio::process::Command::new("powershell.exe");
+                c.args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded_ps]);
+                c
+            } else {
+                let mut c = tokio::process::Command::new("sh");
+                c.args(["-c", command]);
+                c
+            };
+            cmd.current_dir(cwd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            #[cfg(windows)]
+            {
+                cmd.creation_flags(0x08000000);
+            }
+
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => return (false, serde_json::json!({ "error": e.to_string() }).to_string(), Some(e.to_string())),
+            };
+            let child_pid = child.id();
+
+            #[cfg(windows)]
+            struct WinJobGuard(Option<windows::Win32::Foundation::HANDLE>);
+            #[cfg(windows)]
+            impl WinJobGuard {
+                fn attach(raw_handle: Option<std::os::windows::io::RawHandle>) -> Self {
+                    use windows::Win32::Foundation::HANDLE;
+                    use windows::Win32::System::JobObjects::{
+                        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    };
+                    unsafe {
+                        let Ok(job) = CreateJobObjectW(None, None) else {
+                            return Self(None);
+                        };
+                        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                        let _ = SetInformationJobObject(
+                            job,
+                            JobObjectExtendedLimitInformation,
+                            &info as *const _ as *const std::ffi::c_void,
+                            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                        );
+                        if let Some(rh) = raw_handle {
+                            let _ = AssignProcessToJobObject(job, HANDLE(rh));
+                        }
+                        Self(Some(job))
+                    }
+                }
+                fn terminate(&mut self) {
+                    use windows::Win32::Foundation::CloseHandle;
+                    use windows::Win32::System::JobObjects::TerminateJobObject;
+                    if let Some(job) = self.0.take() {
+                        unsafe {
+                            let _ = TerminateJobObject(job, 1);
+                            let _ = CloseHandle(job);
+                        }
+                    }
+                }
+            }
+            #[cfg(windows)]
+            impl Drop for WinJobGuard {
+                fn drop(&mut self) {
+                    use windows::Win32::Foundation::CloseHandle;
+                    if let Some(job) = self.0.take() {
+                        unsafe {
+                            let _ = CloseHandle(job);
+                        }
+                    }
+                }
+            }
+            #[cfg(windows)]
+            unsafe impl Send for WinJobGuard {}
+            #[cfg(windows)]
+            unsafe impl Sync for WinJobGuard {}
+            #[cfg(windows)]
+            let mut job_guard = WinJobGuard::attach(child.raw_handle());
+
+            let mut stdout_pipe = child.stdout.take();
+            let mut stderr_pipe = child.stderr.take();
+            let tx_out = event_sender.clone();
+            let tx_err = event_sender.clone();
+            let cid_out = call_id.to_string();
+            let cid_err = call_id.to_string();
+
+            let out_task = tokio::spawn(async move {
+                let mut acc = Vec::new();
+                if let Some(ref mut r) = stdout_pipe {
+                    let mut buf = [0u8; 8192];
+                    while let Ok(n) = r.read(&mut buf).await {
+                        if n == 0 { break; }
+                        acc.extend_from_slice(&buf[..n]);
+                        let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                        if !chunk.is_empty() {
+                            let _ = tx_out.send(StreamEvent::ToolOutputDelta { id: cid_out.clone(), chunk }).await;
+                        }
+                    }
+                }
+                acc
+            });
+
+            let err_task = tokio::spawn(async move {
+                let mut acc = Vec::new();
+                if let Some(ref mut r) = stderr_pipe {
+                    let mut buf = [0u8; 8192];
+                    while let Ok(n) = r.read(&mut buf).await {
+                        if n == 0 { break; }
+                        acc.extend_from_slice(&buf[..n]);
+                        let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                        if !chunk.is_empty() {
+                            let _ = tx_err.send(StreamEvent::ToolOutputDelta { id: cid_err.clone(), chunk }).await;
+                        }
+                    }
+                }
+                acc
+            });
+
+            let kill_tree = |pid_opt: Option<u32>| {
+                #[cfg(windows)]
+                if let Some(pid) = pid_opt {
+                    use std::os::windows::process::CommandExt;
+                    let mut tk = std::process::Command::new("taskkill");
+                    tk.args(["/F", "/T", "/PID", &pid.to_string()]).creation_flags(0x08000000);
+                    let _ = tk.output();
+                }
+                let _ = pid_opt;
+            };
+
+            let mut timed_out = false;
+            let mut canceled = false;
+            let mut status_opt = None;
+
+            tokio::select! {
+                _ = session.cancel_notify.notified() => {
+                    canceled = true;
+                    #[cfg(windows)]
+                    job_guard.terminate();
+                    kill_tree(child_pid);
+                    let _ = child.kill().await;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+                    timed_out = true;
+                    #[cfg(windows)]
+                    job_guard.terminate();
+                    kill_tree(child_pid);
+                    let _ = child.kill().await;
+                }
+                res = child.wait() => {
+                    if let Ok(st) = res {
+                        status_opt = Some(st);
+                    }
+                }
+            }
+
+            if canceled {
+                let _ = out_task.await;
+                let _ = err_task.await;
+                return (false, serde_json::json!({ "error": "User canceled execution", "duration_ms": started.elapsed().as_millis() as u64 }).to_string(), Some("User canceled execution".to_string()));
+            }
+
+            let out_bytes = out_task.await.unwrap_or_default();
+            let err_bytes = err_task.await.unwrap_or_default();
+            let stdout_raw = crate::tools::process_pty::strip_ansi(&String::from_utf8_lossy(&out_bytes).replace("\r\n", "\n"));
+            let stderr_raw = crate::tools::process_pty::strip_ansi(&String::from_utf8_lossy(&err_bytes).replace("\r\n", "\n"));
+            let duration_ms = started.elapsed().as_millis() as u64;
+
+            let mut combined = String::new();
+            if !stdout_raw.is_empty() {
+                combined.push_str(&stdout_raw);
+            }
+            if !stderr_raw.is_empty() {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str(&stderr_raw);
+            }
+
+            let (bounded_out, spill_file) = spill_tool_output_with_path(workspace_root, call_id, &combined);
+            let (bounded_stdout, _) = spill_tool_output_with_path(workspace_root, &format!("{}_out", call_id), &stdout_raw);
+            let (bounded_stderr, _) = spill_tool_output_with_path(workspace_root, &format!("{}_err", call_id), &stderr_raw);
+
+            if timed_out {
+                let err_msg = format!("Command timed out after {}s and was terminated", timeout_secs);
+                let out_json = serde_json::json!({
+                    "stdout": bounded_stdout,
+                    "stderr": bounded_stderr,
+                    "output": bounded_out,
+                    "exit_code": serde_json::Value::Null,
+                    "duration_ms": duration_ms,
+                    "running": false,
+                    "timed_out": true,
+                    "spill_file": spill_file,
+                    "error": err_msg,
+                });
+                return (false, out_json.to_string(), Some(err_msg));
+            }
+
+            let exit_code = status_opt.and_then(|s| s.code()).unwrap_or(-1);
+            if exit_code != 0 {
+                let err_msg = format!("Command exited with non-zero code {}", exit_code);
+                let out_json = serde_json::json!({
+                    "stdout": bounded_stdout,
+                    "stderr": bounded_stderr,
+                    "output": bounded_out,
+                    "exit_code": exit_code,
+                    "duration_ms": duration_ms,
+                    "running": false,
+                    "timed_out": false,
+                    "spill_file": spill_file,
+                    "error": err_msg,
+                });
+                return (false, out_json.to_string(), Some(err_msg));
+            }
+
+            let out_json = serde_json::json!({
+                "stdout": bounded_stdout,
+                "stderr": bounded_stderr,
+                "output": bounded_out,
+                "exit_code": 0,
+                "duration_ms": duration_ms,
+                "running": false,
+                "timed_out": false,
+                "spill_file": spill_file,
+            });
+            return (true, out_json.to_string(), None);
+        }
+
         let (shell_bin, shell_args): (&str, Vec<&str>) = if cfg!(target_os = "windows") {
             ("powershell.exe", vec!["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded_ps])
         } else {
@@ -72,88 +385,7 @@ impl SingleAgentRunner {
 
         let mut collected = String::new();
         let mut pending_utf8: Vec<u8> = Vec::new();
-        let started = std::time::Instant::now();
-        let max_dur = if background {
-            std::time::Duration::from_millis(1200)
-        } else {
-            std::time::Duration::from_secs(timeout_secs)
-        };
-
-        enum AnsiState {
-            Normal,
-            Esc,
-            Csi,
-            Osc,
-            OscEsc,
-            StrSeq,
-            StrEsc,
-            Charset,
-        }
-        struct AnsiStreamStripper {
-            state: AnsiState,
-        }
-        impl AnsiStreamStripper {
-            fn new() -> Self {
-                Self { state: AnsiState::Normal }
-            }
-            fn push(&mut self, s: &str) -> String {
-                let mut out = String::with_capacity(s.len());
-                for c in s.chars() {
-                    match self.state {
-                        AnsiState::Normal => {
-                            if c == '\x1b' {
-                                self.state = AnsiState::Esc;
-                            } else if c != '\r' && c != '\x07' {
-                                out.push(c);
-                            }
-                        }
-                        AnsiState::Esc => match c {
-                            '[' => self.state = AnsiState::Csi,
-                            ']' => self.state = AnsiState::Osc,
-                            'P' | 'X' | '^' | '_' => self.state = AnsiState::StrSeq,
-                            '(' | ')' | '*' | '+' => self.state = AnsiState::Charset,
-                            _ => self.state = AnsiState::Normal,
-                        },
-                        AnsiState::Csi => {
-                            if ('@'..='~').contains(&c) {
-                                self.state = AnsiState::Normal;
-                            }
-                        }
-                        AnsiState::Osc => {
-                            if c == '\x07' {
-                                self.state = AnsiState::Normal;
-                            } else if c == '\x1b' {
-                                self.state = AnsiState::OscEsc;
-                            }
-                        }
-                        AnsiState::OscEsc => {
-                            if c == '\\' {
-                                self.state = AnsiState::Normal;
-                            } else if c != '\x1b' {
-                                self.state = AnsiState::Osc;
-                            }
-                        }
-                        AnsiState::StrSeq => {
-                            if c == '\x1b' {
-                                self.state = AnsiState::StrEsc;
-                            }
-                        }
-                        AnsiState::StrEsc => {
-                            if c == '\\' {
-                                self.state = AnsiState::Normal;
-                            } else if c != '\x1b' {
-                                self.state = AnsiState::StrSeq;
-                            }
-                        }
-                        AnsiState::Charset => {
-                            self.state = AnsiState::Normal;
-                        }
-                    }
-                }
-                out
-            }
-        }
-        let mut ansi_stripper = AnsiStreamStripper::new();
+        let max_dur = std::time::Duration::from_millis(1200);
 
         let decode_utf8_stream = |buf: &mut Vec<u8>, incoming: &[u8], flush_all: bool| -> String {
             buf.extend_from_slice(incoming);
@@ -172,12 +404,10 @@ impl SingleAgentRunner {
                     let valid_up_to = e.valid_up_to();
                     let out = String::from_utf8_lossy(&buf[..valid_up_to]).to_string();
                     if e.error_len().is_none() {
-                        let tail = buf[valid_up_to..].to_vec();
-                        *buf = tail;
+                        *buf = buf[valid_up_to..].to_vec();
                     } else {
                         let skip = valid_up_to + e.error_len().unwrap_or(1);
-                        let tail = buf[skip..].to_vec();
-                        *buf = tail;
+                        *buf = buf[skip..].to_vec();
                     }
                     out
                 }
@@ -189,10 +419,9 @@ impl SingleAgentRunner {
                 let _ = tools.pty_manager.kill_pty(&sid);
                 return (false, serde_json::json!({ "error": "User canceled execution" }).to_string(), Some("User canceled execution".to_string()));
             }
-
             if let Ok(chunk_bytes) = tools.pty_manager.read_pty(&sid, 65536) {
                 if !chunk_bytes.is_empty() {
-                    let text = ansi_stripper.push(&decode_utf8_stream(&mut pending_utf8, &chunk_bytes, false));
+                    let text = decode_utf8_stream(&mut pending_utf8, &chunk_bytes, false).replace("\r\n", "\n");
                     if !text.is_empty() {
                         collected.push_str(&text);
                         let _ = event_sender
@@ -204,7 +433,6 @@ impl SingleAgentRunner {
                     }
                 }
             }
-
             let alive = tools.pty_manager.is_session_alive(&sid);
             if !alive || started.elapsed() >= max_dur {
                 if !alive {
@@ -223,36 +451,39 @@ impl SingleAgentRunner {
 
         let tail_bytes = tools.pty_manager.read_pty(&sid, 65536).unwrap_or_default();
         if !tail_bytes.is_empty() || !pending_utf8.is_empty() {
-            let text = ansi_stripper.push(&decode_utf8_stream(&mut pending_utf8, &tail_bytes, true));
+            let text = decode_utf8_stream(&mut pending_utf8, &tail_bytes, true).replace("\r\n", "\n");
             if !text.is_empty() {
                 collected.push_str(&text);
-                let _ = event_sender
-                    .send(StreamEvent::ToolOutputDelta {
-                        id: call_id.to_string(),
-                        chunk: text,
-                    })
-                    .await;
             }
         }
 
         let still_running = tools.pty_manager.is_session_alive(&sid);
-        let bounded = spill_tool_output_if_needed(chat_id, call_id, &collected);
-        if !background && still_running {
-            let _ = tools.pty_manager.kill_pty(&sid);
-            let err_msg = format!("Command timed out after {}s and was terminated", timeout_secs);
+        let exit_code = if still_running { None } else { tools.pty_manager.get_exit_code(&sid) };
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let (bounded, spill_file) = spill_tool_output_with_path(workspace_root, call_id, &collected);
+
+        if !still_running && exit_code.unwrap_or(0) != 0 {
+            let code = exit_code.unwrap_or(-1);
+            let err_msg = format!("Command exited with non-zero code {}", code);
             let out_json = serde_json::json!({
                 "session_id": sid,
                 "running": false,
-                "timed_out": true,
+                "exit_code": code,
+                "duration_ms": duration_ms,
                 "output": bounded,
+                "spill_file": spill_file,
                 "error": err_msg,
             });
             return (false, out_json.to_string(), Some(err_msg));
         }
+
         let out_json = serde_json::json!({
             "session_id": sid,
             "running": still_running,
+            "exit_code": exit_code,
+            "duration_ms": duration_ms,
             "output": bounded,
+            "spill_file": spill_file,
         });
         (true, out_json.to_string(), None)
     }
@@ -547,15 +778,28 @@ impl SingleAgentRunner {
             history.push(ChatMessage::system(sys_prompt));
         }
 
-        let cid_gc = chat_id.to_string();
+        let ws_gc = workspace_root.to_string();
         tokio::spawn(async move {
-            cleanup_old_tmp_logs(&cid_gc, 24);
+            cleanup_old_tmp_logs(&ws_gc, 24);
         });
 
         let caps = caps_registry.get(model_name);
         let cache_key = compute_prompt_cache_key(workspace_root, chat_id);
         let preserve_past_reasoning = caps.family == ModelFamily::Anthropic;
         let mut compaction_cursor = CompactionCursor::default();
+
+        if let Some(d) = db {
+            if tools.is_plan_mode() {
+                let prev_md = Self::load_plan_tuple(db, chat_id).map(|(_, m)| m).unwrap_or_default();
+                let _ = d.save_plan_state(chat_id, true, &prev_md);
+            } else if resume {
+                if let Some((pm, _)) = Self::load_plan_tuple(db, chat_id) {
+                    if pm {
+                        tools.set_plan_mode(true);
+                    }
+                }
+            }
+        }
 
         let tool_decls = tools.get_all_tool_declarations();
         let mut available_tools = Vec::new();
@@ -576,7 +820,7 @@ impl SingleAgentRunner {
         let trimmed_prompt = user_prompt.trim();
         if trimmed_prompt.starts_with("/compact") {
             let custom_instr = trimmed_prompt.strip_prefix("/compact").map(|s| s.trim());
-            let before_tokens = estimate_messages_tokens(history);
+            let before_tokens = count_context_tokens(model_name, caps.family, history, &available_tools, db);
             let client = reqwest::Client::new();
             let (proj, _) = ContextBuilder::build_projection(
                 history,
@@ -609,14 +853,24 @@ impl SingleAgentRunner {
                     .map(|m| m.content.as_text_lossy())
                     .unwrap_or_else(|| "Context compacted.".to_string())
             });
+            if let Some(d) = db {
+                let _ = d.save_session_memory(chat_id, &summary, history.len());
+            }
+            let plan_state = Self::load_plan_tuple(db, chat_id);
+            let restored_files = Self::collect_restored_files(db, workspace_root, chat_id);
             let rehydrated = ContextBuilder::rehydrate_after_compaction(
                 history,
                 &summary,
                 workspace_root,
                 contract.as_ref(),
                 4,
+                plan_state,
+                restored_files,
             );
-            let after_tokens = estimate_messages_tokens(&rehydrated);
+            let after_tokens = count_context_tokens(model_name, caps.family, &rehydrated, &available_tools, db);
+            if let Some(d) = db {
+                let _ = d.record_compaction_event(chat_id, "tier4_manual", before_tokens, after_tokens, "Manual /compact");
+            }
             *history = rehydrated;
             let _ = event_sender
                 .send(StreamEvent::ContextCompacted {
@@ -699,10 +953,13 @@ impl SingleAgentRunner {
         let mut same_err_streak: u32 = 0;
         let mut consecutive_compact_failures: u32 = 0;
         let mut reactive_compact_count: u32 = 0;
+        let mut turn_seq: i64 = 0;
 
         let _ = state.transition(TaskStateEnum::Executing);
 
         while session.is_active() {
+            turn_seq += 1;
+            let mut turn_checkpoint_created = false;
 
             if let Some(intervention) = session.check_intervention().await {
                 history.push(ChatMessage::user(format!("<user_steering>{}</user_steering>", intervention)));
@@ -720,6 +977,11 @@ impl SingleAgentRunner {
             );
             let ext_changed = tools.read_guard.scan_external_changes();
             if !ext_changed.is_empty() {
+                if let Some(d) = db {
+                    for p in &ext_changed {
+                        d.emit_event(chat_id, "dirty_external", serde_json::json!({ "path": p }));
+                    }
+                }
                 projection.push(ChatMessage {
                     role: "user".to_string(),
                     content: MessageContent::Text(format!(
@@ -733,54 +995,115 @@ impl SingleAgentRunner {
                 });
             }
 
-            if consecutive_compact_failures < 3
-                && ContextBuilder::needs_auto_compaction(
+            let mut est_used = count_context_tokens(model_name, caps.family, &projection, &available_tools, db);
+            if ContextBuilder::needs_tier1_masking(est_used, caps.context_window, caps.max_output_tokens) {
+                let t1_changed = ContextBuilder::micro_prune(history, 20_000, 6).is_some();
+                let t2_changed = ContextBuilder::tier2_dedup_and_clean(history);
+                if t1_changed || t2_changed {
+                    let (reproj, _) = ContextBuilder::build_projection(
+                        history,
+                        workspace_root,
+                        contract.as_ref(),
+                        caps.context_window,
+                        last_request_ts,
+                        preserve_past_reasoning,
+                        &mut compaction_cursor,
+                        true,
+                    );
+                    projection = reproj;
+                    let after_t12 = count_context_tokens(model_name, caps.family, &projection, &available_tools, db);
+                    if let Some(d) = db {
+                        let tier_label = if t2_changed { "tier2_dedup" } else { "tier1_masking" };
+                        let _ = d.record_compaction_event(chat_id, tier_label, est_used, after_t12, "Zero-LLM pruning");
+                    }
+                    est_used = after_t12;
+                }
+            }
+
+            if let Ok(peek_key) = key_pool.next_key(provider_name) {
+                let gz = TokenCountRouter::count_with_gray_zone(
+                    http_client,
+                    base_url,
+                    &peek_key,
+                    model_name,
+                    caps.family,
+                    caps.context_window,
                     &projection,
+                    &available_tools,
+                    db,
+                )
+                .await;
+                est_used = gz.total;
+            }
+
+            if consecutive_compact_failures < 3
+                && ContextBuilder::needs_auto_compaction_exact(
+                    est_used,
                     caps.context_window,
                     caps.max_output_tokens,
                 )
             {
-                let before_tokens = estimate_messages_tokens(&projection);
-                let summary = Self::run_cache_safe_compaction(
-                    http_client,
-                    provider_name,
-                    base_url,
-                    key_pool,
-                    caps_registry,
-                    model_name,
-                    &cache_key,
-                    &available_tools,
-                    &projection,
-                    None,
-                )
-                .await;
-                let summary = match summary {
-                    Ok(s) => {
-                        consecutive_compact_failures = 0;
-                        s
-                    }
-                    Err(_) => {
-                        consecutive_compact_failures += 1;
-                        let (compacted, _) = ContextCompactor::compact_history(projection.clone(), 4);
-                        compacted
-                            .iter()
-                            .find(|m| m.name.as_deref() == Some("context_compact_summary"))
-                            .map(|m| m.content.as_text_lossy())
-                            .unwrap_or_else(|| "Context compacted.".to_string())
-                    }
+                let before_tokens = est_used;
+                let cached_mem = db
+                    .and_then(|d| d.load_session_memory(chat_id).ok().flatten())
+                    .filter(|(m, cnt)| !m.trim().is_empty() && cnt.saturating_add(8) >= history.len());
+
+                let (tier_name, summary) = if let Some((mem_md, _)) = cached_mem {
+                    ("tier3_session_memory", mem_md)
+                } else {
+                    let res = Self::run_cache_safe_compaction(
+                        http_client,
+                        provider_name,
+                        base_url,
+                        key_pool,
+                        caps_registry,
+                        model_name,
+                        &cache_key,
+                        &available_tools,
+                        &projection,
+                        None,
+                    )
+                    .await;
+                    let s = match res {
+                        Ok(s) => {
+                            consecutive_compact_failures = 0;
+                            if let Some(d) = db {
+                                let _ = d.save_session_memory(chat_id, &s, history.len());
+                            }
+                            s
+                        }
+                        Err(_) => {
+                            consecutive_compact_failures += 1;
+                            let (compacted, _) = ContextCompactor::compact_history(projection.clone(), 4);
+                            compacted
+                                .iter()
+                                .find(|m| m.name.as_deref() == Some("context_compact_summary"))
+                                .map(|m| m.content.as_text_lossy())
+                                .unwrap_or_else(|| "Context compacted.".to_string())
+                        }
+                    };
+                    ("tier4_full", s)
                 };
 
+                let plan_state = Self::load_plan_tuple(db, chat_id);
+                let restored_files = Self::collect_restored_files(db, workspace_root, chat_id);
                 let rehydrated = ContextBuilder::rehydrate_after_compaction(
                     history,
                     &summary,
                     workspace_root,
                     contract.as_ref(),
                     4,
+                    plan_state,
+                    restored_files,
                 );
-                let after_tokens = estimate_messages_tokens(&rehydrated);
+                let after_tokens = count_context_tokens(model_name, caps.family, &rehydrated, &available_tools, db);
+                if let Some(d) = db {
+                    let _ = d.record_compaction_event(chat_id, tier_name, before_tokens, after_tokens, "Auto escalation compaction");
+                }
                 *history = rehydrated;
                 compaction_cursor = CompactionCursor::default();
                 projection = history.clone();
+                est_used = after_tokens;
 
                 let _ = event_sender
                     .send(StreamEvent::ContextCompacted {
@@ -790,8 +1113,6 @@ impl SingleAgentRunner {
                     })
                     .await;
             }
-
-            let est_used = estimate_messages_tokens(&projection);
 
             let (eff_opt, budget_opt) = match reasoning_effort_level.trim().to_uppercase().as_str() {
                 "LOW" => (Some("low".to_string()), Some(2048)),
@@ -916,8 +1237,9 @@ impl SingleAgentRunner {
                             || lower.contains("413");
                         if is_ctx_overflow && reactive_compact_count < 2 {
                             reactive_compact_count += 1;
-                            let before_tokens = estimate_messages_tokens(history);
+                            let before_tokens = count_context_tokens(model_name, caps.family, history, &available_tools, db);
                             ContextBuilder::micro_prune(history, 12_000, 4);
+                            ContextBuilder::tier2_dedup_and_clean(history);
                             let summary = Self::run_cache_safe_compaction(
                                 http_client,
                                 provider_name,
@@ -939,14 +1261,21 @@ impl SingleAgentRunner {
                                     .map(|m| m.content.as_text_lossy())
                                     .unwrap_or_else(|| "Emergency reactive compaction.".to_string())
                             });
+                            let plan_state = Self::load_plan_tuple(db, chat_id);
+                            let restored_files = Self::collect_restored_files(db, workspace_root, chat_id);
                             let rehydrated = ContextBuilder::rehydrate_after_compaction(
                                 history,
                                 &summary,
                                 workspace_root,
                                 contract.as_ref(),
                                 4,
+                                plan_state,
+                                restored_files,
                             );
-                            let after_tokens = estimate_messages_tokens(&rehydrated);
+                            let after_tokens = count_context_tokens(model_name, caps.family, &rehydrated, &available_tools, db);
+                            if let Some(d) = db {
+                                let _ = d.record_compaction_event(chat_id, "tier4_reactive", before_tokens, after_tokens, "Reactive overflow compaction");
+                            }
                             *history = rehydrated;
                             compaction_cursor = CompactionCursor::default();
                             let _ = event_sender
@@ -1152,7 +1481,7 @@ impl SingleAgentRunner {
             let all_concurrent_safe = active_tool_calls.len() > 1
                 && active_tool_calls
                     .iter()
-                    .all(|tc| Self::is_concurrency_safe_tool(&tc.function.name));
+                    .all(|tc| Self::is_concurrency_safe_tool(&tc.function.name) || tc.function.name == "terminal_exec");
 
             if all_concurrent_safe {
                 let mut join_set = tokio::task::JoinSet::new();
@@ -1164,11 +1493,37 @@ impl SingleAgentRunner {
                     let cid = chat_id.to_string();
                     let tc_id = tc.id.clone();
                     let tc_name = tc.function.name.clone();
+                    let sess = session.clone();
+                    let ev_tx = event_sender.clone();
                     join_set.spawn(async move {
                         let started = std::time::Instant::now();
-                        let res = td.dispatch_tool(&tc_name, &parsed_args, None, Some(&cid)).await;
-                        let elapsed_ms = started.elapsed().as_millis() as u64;
-                        (idx, tc_id, tc_name, elapsed_ms, res, ws)
+                        if tc_name == "terminal_exec" {
+                            let (ok, out_str, err_opt) = Self::run_live_terminal_exec(
+                                &parsed_args,
+                                &td,
+                                &ws,
+                                &cid,
+                                &sess,
+                                &tc_id,
+                                &ev_tx,
+                            )
+                            .await;
+                            let elapsed_ms = started.elapsed().as_millis() as u64;
+                            (idx, tc_id, tc_name, elapsed_ms, ok, out_str, err_opt, ws)
+                        } else {
+                            let exec_result = td.dispatch_tool(&tc_name, &parsed_args, None, Some(&cid)).await;
+                            let elapsed_ms = started.elapsed().as_millis() as u64;
+                            let raw_output = if exec_result.success {
+                                serde_json::to_string(&exec_result.output).unwrap_or_else(|_| "{}".to_string())
+                            } else {
+                                serde_json::json!({
+                                    "error": exec_result.error.clone().unwrap_or_else(|| "Tool failed".to_string())
+                                })
+                                .to_string()
+                            };
+                            let bounded_output = spill_tool_output_if_needed(&ws, &tc_id, &raw_output);
+                            (idx, tc_id, tc_name, elapsed_ms, exec_result.success, bounded_output, exec_result.error, ws)
+                        }
                     });
                 }
 
@@ -1180,22 +1535,13 @@ impl SingleAgentRunner {
                 }
                 batch_res.sort_by_key(|r| r.0);
 
-                for (_idx, tc_id, tc_name, elapsed_ms, exec_result, ws) in batch_res {
-                    let raw_output = if exec_result.success {
-                        serde_json::to_string(&exec_result.output).unwrap_or_else(|_| "{}".to_string())
-                    } else {
-                        serde_json::json!({
-                            "error": exec_result.error.clone().unwrap_or_else(|| "Tool failed".to_string())
-                        })
-                        .to_string()
-                    };
-                    let bounded_output = spill_tool_output_if_needed(&ws, &tc_id, &raw_output);
+                for (_idx, tc_id, tc_name, elapsed_ms, ok, bounded_output, err_opt, _ws) in batch_res {
                     let _ = event_sender
                         .send(StreamEvent::ToolExecEnd {
                             id: tc_id.clone(),
-                            success: exec_result.success,
+                            success: ok,
                             output: bounded_output.clone(),
-                            error: exec_result.error.clone(),
+                            error: err_opt,
                             elapsed_ms,
                         })
                         .await;
@@ -1213,32 +1559,7 @@ impl SingleAgentRunner {
                 continue;
             }
 
-            let mut bash_batch_failed_cmd: Option<String> = None;
             for tc in active_tool_calls {
-                if let Some(ref failed_cmd) = bash_batch_failed_cmd {
-                    if tc.function.name == "terminal_exec" {
-                        let msg = format!("Cancelled: parallel terminal_exec({}) errored", failed_cmd);
-                        let err_out = serde_json::json!({ "error": msg }).to_string();
-                        let _ = event_sender
-                            .send(StreamEvent::ToolExecEnd {
-                                id: tc.id.clone(),
-                                success: false,
-                                output: err_out.clone(),
-                                error: Some(msg),
-                                elapsed_ms: 0,
-                            })
-                            .await;
-                        history.push(ChatMessage {
-                            role: "tool".to_string(),
-                            content: MessageContent::Text(err_out),
-                            name: Some(tc.function.name),
-                            tool_calls: None,
-                            tool_call_id: Some(tc.id),
-                            reasoning_content: None,
-                        });
-                        continue;
-                    }
-                }
                 if !session.is_active() {
                     let _ = tools.pty_manager.kill_all_for_chat(chat_id);
                     Self::save_checkpoint(db, chat_id, history);
@@ -1252,6 +1573,8 @@ impl SingleAgentRunner {
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
 
                 if tool_name == "terminal_exec" {
+                    let exec_cp_id = uuid::Uuid::new_v4().to_string();
+                    let pre_exec_manifest = crate::tools::blob_store::capture_workspace_manifest(workspace_root, &exec_cp_id, "pre_exec", false).ok();
                     let tool_started = std::time::Instant::now();
                     let (ok, out_str, err_opt) = Self::run_live_terminal_exec(
                         &parsed_args,
@@ -1264,6 +1587,32 @@ impl SingleAgentRunner {
                     )
                     .await;
                     let elapsed_ms = tool_started.elapsed().as_millis() as u64;
+
+                if let Some(pre_m) = pre_exec_manifest {
+                    if let Ok(post_m) = crate::tools::blob_store::capture_workspace_manifest(workspace_root, &pre_m.checkpoint_id, "post_exec", false) {
+                        let pre_map: std::collections::HashMap<String, String> = pre_m.entries.into_iter().map(|e| (e.path, e.blob_hash)).collect();
+                        if let Some(d) = db {
+                            for post_e in post_m.entries {
+                                let prev_h = pre_map.get(&post_e.path).cloned().unwrap_or_default();
+                                if prev_h != post_e.blob_hash {
+                                    let _ = d.record_session_artifact(chat_id, "file", &post_e.path);
+                                    d.emit_event(
+                                        chat_id,
+                                        "file_patched",
+                                        serde_json::json!({
+                                            "path": post_e.path,
+                                            "beforeHash": prev_h,
+                                            "afterHash": post_e.blob_hash,
+                                            "toolCallId": tc.id,
+                                            "source": "exec",
+                                            "truncatedOrUnsaved": post_e.skipped_large
+                                        }),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
                     let _ = event_sender
                         .send(StreamEvent::ToolExecEnd {
                             id: tc.id.clone(),
@@ -1278,19 +1627,10 @@ impl SingleAgentRunner {
                         content: MessageContent::Text(out_str),
                         name: Some(tool_name.clone()),
                         tool_calls: None,
-                        tool_call_id: Some(tc.id),
+                        tool_call_id: Some(tc.id.clone()),
                         reasoning_content: None,
                     });
-                    if !ok {
-                        let short_cmd: String = parsed_args
-                            .get("command")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .chars()
-                            .take(40)
-                            .collect();
-                        bash_batch_failed_cmd = Some(short_cmd);
-                    }
+
                     Self::save_checkpoint(db, chat_id, history);
                     if !session.is_active() {
                         let _ = tools.pty_manager.kill_all_for_chat(chat_id);
@@ -1324,7 +1664,7 @@ impl SingleAgentRunner {
                         content: MessageContent::Text(out_str),
                         name: Some(tool_name.clone()),
                         tool_calls: None,
-                        tool_call_id: Some(tc.id),
+                        tool_call_id: Some(tc.id.clone()),
                         reasoning_content: None,
                     });
                     continue;
@@ -1390,7 +1730,7 @@ impl SingleAgentRunner {
                         content: MessageContent::Text(out_str),
                         name: Some(tool_name.clone()),
                         tool_calls: None,
-                        tool_call_id: Some(tc.id),
+                        tool_call_id: Some(tc.id.clone()),
                         reasoning_content: None,
                     });
                     continue;
@@ -1416,7 +1756,7 @@ impl SingleAgentRunner {
                         content: MessageContent::Text(err_output),
                         name: Some(tool_name.clone()),
                         tool_calls: None,
-                        tool_call_id: Some(tc.id),
+                        tool_call_id: Some(tc.id.clone()),
                         reasoning_content: None,
                     };
                     history.push(tool_msg);
@@ -1437,6 +1777,40 @@ impl SingleAgentRunner {
                     let msg = format!("Anti-Loop Circuit Breaker: '{}' called {} times identically. Pausing.", tool_name, streak_limit);
                     let _ = event_sender.send(StreamEvent::Error { error: msg.clone() }).await;
                     return Err(msg);
+                }
+
+                if matches!(tool_name.as_str(), "write_file" | "edit_file" | "patch_file" | "fs_ops") && !turn_checkpoint_created {
+                    turn_checkpoint_created = true;
+                    let cp_id = uuid::Uuid::new_v4().to_string();
+                    if let Ok(manifest) = crate::tools::blob_store::capture_workspace_manifest(workspace_root, &cp_id, "pre_write", true) {
+                        if let Some(d) = db {
+                            if let Ok(m_json) = serde_json::to_string(&manifest) {
+                                let msg_seq = d.max_message_seq(chat_id);
+                                let _ = d.save_checkpoint_record(
+                                    chat_id,
+                                    &cp_id,
+                                    turn_seq,
+                                    "pre_write",
+                                    msg_seq,
+                                    &m_json,
+                                    crate::tools::blob_store::MAX_CHECKPOINTS_PER_SESSION,
+                                );
+                                let refs = d.list_all_referenced_blob_hashes();
+                                crate::tools::blob_store::enforce_lru_disk_limit(workspace_root, &refs);
+                                d.emit_event(
+                                    chat_id,
+                                    "checkpoint_created",
+                                    serde_json::json!({
+                                        "checkpointId": cp_id,
+                                        "kind": "pre_write",
+                                        "turnSeq": turn_seq,
+                                        "fileCount": manifest.entries.len(),
+                                        "skippedLargeFiles": manifest.skipped_large_files
+                                    }),
+                                );
+                            }
+                        }
+                    }
                 }
 
                 let tool_started = std::time::Instant::now();
@@ -1494,11 +1868,13 @@ impl SingleAgentRunner {
                 }
 
                 let mut vision_data_url: Option<String> = None;
+                let mut ui_output_override: Option<String> = None;
                 let raw_output = if exec_result.success {
                     if tool_name == "computer_use" {
                         if let Some(obj) = exec_result.output.as_object() {
                             if let Some(du) = obj.get("dataUrl").and_then(|v| v.as_str()) {
                                 vision_data_url = Some(du.to_string());
+                                ui_output_override = serde_json::to_string(&exec_result.output).ok();
                                 let mut compact = obj.clone();
                                 compact.remove("dataUrl");
                                 serde_json::to_string(&Value::Object(compact)).unwrap_or_else(|_| "{}".to_string())
@@ -1519,13 +1895,14 @@ impl SingleAgentRunner {
                     .to_string()
                 };
 
-                let bounded_output = spill_tool_output_if_needed(chat_id, &tc.id, &raw_output);
+                let bounded_output = spill_tool_output_if_needed(workspace_root, &tc.id, &raw_output);
+                let ui_output = ui_output_override.unwrap_or_else(|| bounded_output.clone());
 
                 let _ = event_sender
                     .send(StreamEvent::ToolExecEnd {
                         id: tc.id.clone(),
                         success: exec_result.success,
-                        output: bounded_output.clone(),
+                        output: ui_output,
                         error: exec_result.error.clone(),
                         elapsed_ms,
                     })
@@ -1536,10 +1913,55 @@ impl SingleAgentRunner {
                     content: MessageContent::Text(bounded_output),
                     name: Some(tool_name.clone()),
                     tool_calls: None,
-                    tool_call_id: Some(tc.id),
+                    tool_call_id: Some(tc.id.clone()),
                     reasoning_content: None,
                 };
                 history.push(tool_msg);
+                if exec_result.success {
+                    if let Some(d) = db {
+                        match tool_name.as_str() {
+                            "read_file" | "write_file" | "edit_file" | "patch_file" => {
+                                if let Some(fp) = parsed_args.get("path").and_then(|v| v.as_str()) {
+                                    if !fp.trim().is_empty() {
+                                        let _ = d.record_session_artifact(chat_id, "file", fp.trim());
+                                    }
+                                }
+                                if tool_name != "read_file" {
+                                    let out_obj = exec_result.output.as_object();
+                                    let path_val = out_obj.and_then(|o| o.get("path")).and_then(|v| v.as_str()).unwrap_or("");
+                                    let before_h = out_obj.and_then(|o| o.get("beforeHash")).and_then(|v| v.as_str()).unwrap_or("");
+                                    let after_h = out_obj.and_then(|o| o.get("afterHash")).and_then(|v| v.as_str()).unwrap_or("");
+                                    let unsaved = out_obj.and_then(|o| o.get("truncatedOrUnsaved")).and_then(|v| v.as_bool()).unwrap_or(false);
+                                    d.emit_event(
+                                        chat_id,
+                                        "file_patched",
+                                        serde_json::json!({
+                                            "path": path_val,
+                                            "beforeHash": before_h,
+                                            "afterHash": after_h,
+                                            "toolCallId": tc.id,
+                                            "source": tool_name,
+                                            "truncatedOrUnsaved": unsaved
+                                        }),
+                                    );
+                                }
+                            }
+                            "run_command" | "terminal_io" | "execute_command" => {
+                                if let Some(cmd) = parsed_args.get("command").and_then(|v| v.as_str()) {
+                                    let short_cmd: String = cmd.trim().chars().take(120).collect();
+                                    if !short_cmd.is_empty() {
+                                        let _ = d.record_session_artifact(chat_id, "command", &short_cmd);
+                                    }
+                                }
+                            }
+                            "enter_plan_mode" => {
+                                let prev_md = Self::load_plan_tuple(db, chat_id).map(|(_, m)| m).unwrap_or_default();
+                                let _ = d.save_plan_state(chat_id, true, &prev_md);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 if tool_name == "exit_plan_mode" && exec_result.success {
                     let plan_sum = exec_result
                         .output
@@ -1547,6 +1969,9 @@ impl SingleAgentRunner {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    if let Some(d) = db {
+                        let _ = d.save_plan_state(chat_id, false, &plan_sum);
+                    }
                     Self::save_checkpoint(db, chat_id, history);
                     let _ = event_sender
                         .send(StreamEvent::PlanApprovalRequired {

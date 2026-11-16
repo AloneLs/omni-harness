@@ -423,7 +423,10 @@ function getBadgeColor(status: CriterionStatus): string {
     {:else if activeTab === 'files'}
       <div class="space-y-3">
         <div class="p-3 bg-[#131416] rounded-xl border border-[#1A1D24] flex items-center justify-between">
-          <span class="text-neutral-400 font-medium">Session File Diff</span>
+          <div>
+            <span class="text-neutral-400 font-medium">Session File Diff</span>
+            <span class="ml-2 text-[10px] text-neutral-500">Local Snapshots (not git)</span>
+          </div>
           <div class="flex items-center gap-2">
             <span class="text-emerald-400 font-mono">+{totalAdded}</span>
             <span class="text-neutral-500">/</span>

@@ -39,19 +39,11 @@ pub struct AppState {
 
 impl AppState {
     pub fn resolve_install_workspace() -> PathBuf {
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-        exe_dir.join("Workspace")
+        Self::resolve_data_dir().join("workspace")
     }
 
     pub fn resolve_chat_temp_dir(chat_id: Option<&str>) -> PathBuf {
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| PathBuf::from("."));
-        let base = exe_dir.join("ChatTemp");
+        let base = Self::resolve_data_dir().join("chat_temp");
         match chat_id {
             Some(cid) if !cid.trim().is_empty() => base.join(cid),
             _ => base,
@@ -188,18 +180,17 @@ impl AppState {
             Err(_) => false,
         };
 
-        let mut lock = self.credentials_fallback.write().await;
-        lock.insert(key_name.to_string(), secret.to_string());
-        let creds_file = self.data_dir.join("credentials.json");
-        if let Ok(raw) = serde_json::to_string_pretty(&*lock) {
-            let _ = std::fs::write(creds_file, raw);
+        if !keyring_saved {
+            let mut lock = self.credentials_fallback.write().await;
+            lock.insert(key_name.to_string(), secret.to_string());
+            let creds_file = self.data_dir.join("credentials.json");
+            if let Ok(raw) = serde_json::to_string_pretty(&*lock) {
+                let _ = std::fs::write(creds_file, raw);
+            }
+            return Ok(());
         }
 
-        if keyring_saved || lock.contains_key(key_name) {
-            Ok(())
-        } else {
-            Err(AppError::Keyring("Failed to store credential".to_string()))
-        }
+        Ok(())
     }
 
     pub async fn get_credential(&self, key_name: &str) -> Result<String, AppError> {

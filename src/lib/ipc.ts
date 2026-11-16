@@ -88,6 +88,29 @@ export function rollbackFileSnapshot(snapshotId: string): Promise<FileSnapshot> 
   return invoke("rollback_file_snapshot", { snapshotId });
 }
 
+export function getEventsSince(sessionId: string, lastSeq: number): Promise<any[]> {
+  return invoke("get_events_since", { sessionId, lastSeq });
+}
+
+export function listSessionCheckpoints(chatId: string): Promise<any[]> {
+  return invoke("list_session_checkpoints", { chatId });
+}
+
+export function rewindCheckpoint(
+  chatId: string,
+  checkpointId: string,
+  mode: "code" | "conversation" | "both"
+): Promise<{
+  checkpointId: string;
+  mode: string;
+  restoredFiles: string[];
+  deletedFiles: string[];
+  skippedLargeFiles: string[];
+  dirtyExternalFiles: string[];
+}> {
+  return invoke("rewind_checkpoint", { chatId, checkpointId, mode });
+}
+
 export function recordUsageStat(stat: ModelUsageStat): Promise<void> {
   return invoke("record_usage_stat", { stat });
 }

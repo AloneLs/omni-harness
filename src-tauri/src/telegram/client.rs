@@ -32,15 +32,24 @@ pub struct TelegramClient {
 
 impl TelegramClient {
     pub fn new(token: impl Into<String>) -> Result<Self, String> {
+        Self::new_with_proxy(token, None)
+    }
+
+    pub fn new_with_proxy(token: impl Into<String>, proxy_url: Option<&str>) -> Result<Self, String> {
         let clean = token.into().trim().to_string();
         if clean.is_empty() {
             return Err("Telegram bot token is required".to_string());
         }
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(12))
-            .timeout(Duration::from_secs(45))
-            .build()
-            .map_err(|e| e.to_string())?;
+            .timeout(Duration::from_secs(45));
+        if let Some(pu) = proxy_url.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let proxy = reqwest::Proxy::all(pu).map_err(|e| format!("Invalid proxy URL: {}", e))?;
+            builder = builder.proxy(proxy);
+        } else {
+            builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        }
+        let http = builder.build().map_err(|e| e.to_string())?;
         Ok(Self {
             base_url: format!("https://api.telegram.org/bot{}", clean),
             file_base_url: format!("https://api.telegram.org/file/bot{}", clean),
@@ -129,10 +138,16 @@ impl TelegramClient {
                     return Err(err);
                 }
                 Err(e) => {
+                    let mut detail = e.to_string();
+                    let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+                    while let Some(s) = src {
+                        detail.push_str(&format!(" -> {}", s));
+                        src = s.source();
+                    }
                     let err = TelegramApiError {
                         method: method.to_string(),
                         status_code: 0,
-                        message: e.to_string(),
+                        message: detail,
                         retryable: true,
                     };
                     if !replay_safe || attempt + 1 >= limit {
@@ -349,6 +364,97 @@ impl TelegramClient {
         }
         std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
         Ok(dest)
+    }
+
+    pub async fn send_media_with_caption(
+        &self,
+        chat_id: i64,
+        method: &str,
+        field: &str,
+        source: &str,
+        caption: Option<&str>,
+    ) -> Result<(), String> {
+        let trimmed = source.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            let mut payload = json!({ "chat_id": chat_id });
+            payload[field] = json!(trimmed);
+            if let Some(cap) = caption.filter(|c| !c.trim().is_empty()) {
+                payload["caption"] = json!(cap);
+            }
+            return self.request(method, payload, 2).await.map(|_| ()).map_err(|e| e.to_string());
+        }
+        let local_str = if let Some(rest) = trimmed.strip_prefix("file:///") {
+            rest.replace('/', "\\")
+        } else if let Some(rest) = trimmed.strip_prefix("file://") {
+            rest.to_string()
+        } else {
+            trimmed.to_string()
+        };
+        let path = PathBuf::from(&local_str);
+        if !path.is_file() {
+            return Err(format!("Media file not found: {}", local_str));
+        }
+        let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let fname = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let part = reqwest::multipart::Part::bytes(bytes).file_name(fname);
+        let mut form = reqwest::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part(field.to_string(), part);
+        if let Some(cap) = caption.filter(|c| !c.trim().is_empty()) {
+            form = form.text("caption", cap.to_string());
+        }
+        let url = format!("{}/{}", self.base_url, method);
+        let resp = self
+            .http
+            .post(&url)
+            .multipart(form)
+            .timeout(Duration::from_secs(300))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            let txt = resp.text().await.unwrap_or_default();
+            return Err(format!("Telegram {} failed: {}", method, txt));
+        }
+        Ok(())
+    }
+
+    pub async fn send_media(
+        &self,
+        chat_id: i64,
+        method: &str,
+        field: &str,
+        source: &str,
+    ) -> Result<(), String> {
+        self.send_media_with_caption(chat_id, method, field, source, None).await
+    }
+
+    pub async fn send_document(&self, chat_id: i64, source: &str, caption: Option<&str>) -> Result<(), String> {
+        self.send_media_with_caption(chat_id, "sendDocument", "document", source, caption).await
+    }
+
+    pub async fn send_photo(&self, chat_id: i64, source: &str) -> Result<(), String> {
+        self.send_media_with_caption(chat_id, "sendPhoto", "photo", source, None).await
+    }
+
+    pub async fn send_audio(&self, chat_id: i64, source: &str) -> Result<(), String> {
+        let lower = source.to_ascii_lowercase();
+        if lower.ends_with(".ogg") || lower.ends_with(".opus") {
+            self.send_media_with_caption(chat_id, "sendVoice", "voice", source, None).await
+        } else {
+            self.send_media_with_caption(chat_id, "sendAudio", "audio", source, None).await
+        }
+    }
+
+    pub async fn send_video(&self, chat_id: i64, source: &str) -> Result<(), String> {
+        self.send_media_with_caption(chat_id, "sendVideo", "video", source, None).await
     }
 }
 

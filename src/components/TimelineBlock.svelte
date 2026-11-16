@@ -1,5 +1,6 @@
 <script lang="ts">
 import { slide } from 'svelte/transition';
+import { convertFileSrc } from '@tauri-apps/api/core';
 import Icon from './Icon.svelte';
 import FileToolIcon from './FileToolIcon.svelte';
 import type { ToolExecutionRecord } from '../lib/toolMapper';
@@ -205,6 +206,28 @@ function formatToolLabel(record: ToolExecutionRecord): { verb: string; target: s
   return { verb: record.actionName, target: record.previewArgs || '' };
 }
 
+function extractToolImagePreview(call: ToolExecutionRecord): string | null {
+  const raw = (call.output || '').trim();
+  if (raw.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.dataUrl === 'string' && parsed.dataUrl.startsWith('data:image/')) {
+        return parsed.dataUrl;
+      }
+      if (typeof parsed?.previewUrl === 'string' && parsed.previewUrl) {
+        return parsed.previewUrl;
+      }
+    } catch {}
+  }
+  const p = typeof call.args?.path === 'string' ? call.args.path.trim() : '';
+  if (p && /\.(png|jpg|jpeg|webp|gif|bmp)$/i.test(p)) {
+    try {
+      return convertFileSrc(p);
+    } catch {}
+  }
+  return null;
+}
+
 function formatToolOutputReadable(call: ToolExecutionRecord): string {
   const raw = (call.output || '').trim();
   if (!raw) return '';
@@ -251,14 +274,18 @@ function formatToolOutputReadable(call: ToolExecutionRecord): string {
       }
       if (typeof parsed?.error === 'string') return parsed.error;
       if (typeof parsed === 'object' && parsed !== null) {
-        const hiddenKeys = new Set(['action', 'url', 'snapshotId', 'session_id', 'policy', 'running']);
+        const hiddenKeys = new Set(['action', 'url', 'snapshotId', 'session_id', 'policy', 'running', 'dataUrl', 'base64', 'system_reminder']);
         const entries = Object.entries(parsed).filter(
           ([k, v]) => !hiddenKeys.has(k) && v !== null && v !== undefined && v !== ''
         );
+        if (entries.length === 0) return '';
         if (entries.length === 1) {
           const [, v] = entries[0];
           return typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v);
         }
+        return entries
+          .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`)
+          .join('\n');
         return entries
           .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`)
           .join('\n');

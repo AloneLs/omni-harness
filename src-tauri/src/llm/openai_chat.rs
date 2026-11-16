@@ -394,6 +394,8 @@ pub async fn stream_openai_chat(
                                     completion_tokens,
                                     total_tokens,
                                     cached_tokens,
+                                    cache_read_input_tokens: cached_tokens,
+                                    cache_creation_input_tokens: 0,
                                 });
                             }
                         }

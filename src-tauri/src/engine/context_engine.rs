@@ -1,5 +1,9 @@
+use crate::db::Database;
 use crate::engine::task_contract::TaskContract;
-use crate::llm::request_compat::{ChatMessage, MessageContent};
+use crate::llm::capabilities::ModelFamily;
+use crate::llm::request_compat::{ChatMessage, MessageContent, ToolDefinition};
+use crate::llm::token_counter::TokenCountRouter;
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -18,6 +22,16 @@ pub fn estimate_text_tokens(text: &str) -> u32 {
     }
     let est = (ascii_chars as f64 / 3.8) + (non_ascii_chars as f64 / 2.8);
     est.ceil() as u32
+}
+
+pub fn count_context_tokens(
+    model: &str,
+    family: ModelFamily,
+    messages: &[ChatMessage],
+    tools: &[ToolDefinition],
+    db: Option<&Database>,
+) -> u32 {
+    TokenCountRouter::count_sync(model, family, messages, tools, db).total
 }
 
 pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> u32 {
@@ -65,8 +79,17 @@ pub fn compute_prompt_cache_key(workspace_root: &str, chat_id: &str) -> String {
     format!("omni-{:016x}", hash)
 }
 
+pub fn resolve_spill_tmp_dir(workspace_root: &str) -> std::path::PathBuf {
+    let ws = Path::new(workspace_root);
+    if !workspace_root.trim().is_empty() && ws.is_dir() {
+        ws.join(".harness").join("tmp")
+    } else {
+        crate::state::AppState::resolve_chat_temp_dir(None).join("tmp")
+    }
+}
+
 pub fn cleanup_old_tmp_logs(workspace_root: &str, max_age_hours: u64) {
-    let tmp_dir = crate::state::AppState::resolve_chat_temp_dir(Some(workspace_root)).join("tmp");
+    let tmp_dir = resolve_spill_tmp_dir(workspace_root);
     if !tmp_dir.is_dir() {
         return;
     }
@@ -92,15 +115,15 @@ pub fn cleanup_old_tmp_logs(workspace_root: &str, max_age_hours: u64) {
     }
 }
 
-pub fn spill_tool_output_if_needed(
+pub fn spill_tool_output_with_path(
     workspace_root: &str,
     call_id: &str,
     raw_output: &str,
-) -> String {
+) -> (String, Option<String>) {
     let lines: Vec<&str> = raw_output.lines().collect();
     let total_lines = lines.len();
     if total_lines <= 300 && raw_output.len() <= 24_000 {
-        return raw_output.to_string();
+        return (raw_output.to_string(), None);
     }
 
     let safe_id: String = call_id
@@ -113,18 +136,24 @@ pub fn spill_tool_output_if_needed(
         format!("tool_{}.log", safe_id)
     };
 
-    let tmp_dir = crate::state::AppState::resolve_chat_temp_dir(Some(workspace_root)).join("tmp");
+    let tmp_dir = resolve_spill_tmp_dir(workspace_root);
     let _ = std::fs::create_dir_all(&tmp_dir);
     let log_path = tmp_dir.join(&file_name);
     let _ = std::fs::write(&log_path, raw_output);
+    let rel_display = if !workspace_root.trim().is_empty() && Path::new(workspace_root).is_dir() {
+        format!(".harness/tmp/{}", file_name)
+    } else {
+        log_path.to_string_lossy().to_string()
+    };
 
     if total_lines <= 10 && raw_output.len() > 24_000 {
         let head = safe_slice_head(raw_output, 2_000);
         let tail = safe_slice_tail(raw_output, 2_000);
-        return format!(
-            "{}\n\n... [Single-line output truncated ({} bytes). Full output saved to {} — use grep or read_file to inspect] ...\n\n{}",
-            head, raw_output.len(), file_name, tail
+        let msg = format!(
+            "{}\n\n... [Single-line output truncated ({} bytes). Full output saved to {} — use read_file(path=\"{}\") or grep(path=\"{}\") to inspect] ...\n\n{}",
+            head, raw_output.len(), rel_display, rel_display, rel_display, tail
         );
+        return (msg, Some(rel_display));
     }
 
     let head = lines
@@ -140,10 +169,19 @@ pub fn spill_tool_output_if_needed(
         .collect::<Vec<&str>>()
         .join("\n");
 
-    format!(
-        "{}\n\n... [Output truncated ({} lines, {} bytes). Full output saved to {} — use grep or read_file with offset/limit to inspect] ...\n\n{}",
-        head, total_lines, raw_output.len(), file_name, tail
-    )
+    let msg = format!(
+        "{}\n\n... [Output truncated ({} lines, {} bytes). Full output saved to {} — use read_file(path=\"{}\", offset, limit) or grep(path=\"{}\") to inspect] ...\n\n{}",
+        head, total_lines, raw_output.len(), rel_display, rel_display, rel_display, tail
+    );
+    (msg, Some(rel_display))
+}
+
+pub fn spill_tool_output_if_needed(
+    workspace_root: &str,
+    call_id: &str,
+    raw_output: &str,
+) -> String {
+    spill_tool_output_with_path(workspace_root, call_id, raw_output).0
 }
 
 pub fn read_project_memory_prefix(workspace_root: &str) -> String {
@@ -327,17 +365,146 @@ impl ContextBuilder {
         }
     }
 
+    pub fn tier2_dedup_and_clean(messages: &mut Vec<ChatMessage>) -> bool {
+        let mut read_key_to_call_ids: HashMap<String, Vec<String>> = HashMap::new();
+        let mut call_id_to_read_key: HashMap<String, String> = HashMap::new();
+        let mut tool_last_success_idx: HashMap<String, usize> = HashMap::new();
+
+        for (idx, msg) in messages.iter().enumerate() {
+            if msg.role == "assistant" {
+                if let Some(tcs) = &msg.tool_calls {
+                    for tc in tcs {
+                        if tc.function.name == "read_file" {
+                            if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
+                                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                if !path.is_empty() {
+                                    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    let key = format!("{}:{}:{}", path, offset, limit);
+                                    read_key_to_call_ids.entry(key.clone()).or_default().push(tc.id.clone());
+                                    call_id_to_read_key.insert(tc.id.clone(), key);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if msg.role == "tool" {
+                let txt = msg.content.as_text_lossy();
+                let is_err = txt.contains("\"error\":") || txt.starts_with("Error:") || txt.contains("failed:");
+                if !is_err {
+                    if let Some(name) = &msg.name {
+                        tool_last_success_idx.insert(name.clone(), idx);
+                    }
+                }
+            }
+        }
+
+        let mut superseded_ids: HashMap<String, String> = HashMap::new();
+        for (key, ids) in read_key_to_call_ids {
+            if ids.len() > 1 {
+                let path = key.split(':').next().unwrap_or(&key).to_string();
+                for id in &ids[..ids.len() - 1] {
+                    superseded_ids.insert(id.clone(), path.clone());
+                }
+            }
+        }
+
+        let mut changed = false;
+        let len = messages.len();
+        let protect_tail = len.saturating_sub(6);
+
+        for (idx, msg) in messages.iter_mut().enumerate() {
+            if idx >= protect_tail || msg.role != "tool" {
+                continue;
+            }
+            if let Some(cid) = &msg.tool_call_id {
+                if let Some(path) = superseded_ids.get(cid) {
+                    let cur = msg.content.as_text_lossy();
+                    if !cur.starts_with("[Superseded:") {
+                        msg.content = MessageContent::Text(format!(
+                            "[Superseded: earlier read_file of {} — newer read exists later in context]",
+                            path
+                        ));
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
+            if let Some(name) = &msg.name {
+                if let Some(&last_ok) = tool_last_success_idx.get(name) {
+                    if idx < last_ok {
+                        let cur = msg.content.as_text_lossy();
+                        let is_err = cur.contains("\"error\":") || cur.starts_with("Error:") || cur.contains("failed:");
+                        if is_err && cur.len() > 300 && !cur.starts_with("[Resolved error") {
+                            msg.content = MessageContent::Text(format!(
+                                "[Resolved error from {} ({} chars) — succeeded later]",
+                                name,
+                                cur.len()
+                            ));
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        changed
+    }
+
+    pub fn build_session_memory_prompt(existing_memory: Option<&str>) -> String {
+        let prev = existing_memory
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!("
+Existing session memory to update incrementally:
+{}
+", s))
+            .unwrap_or_default();
+
+        format!(
+            "Update the structured Anchored Session Memory in Markdown (max ~12,000 tokens). Preserve exact file paths, symbol names, commands, and requirements. Use these exact headings:
+# Session Title
+## Current State
+## Task Specification
+## Important Files
+## Commands & Tools
+## Errors & Fixes
+## Learnings
+## Key Results
+## Worklog{}",
+            prev
+        )
+    }
+
+    pub fn compaction_budget_threshold(context_window: u32, max_output_tokens: u32) -> u32 {
+        let reserved_output = max_output_tokens.min(32_000);
+        let available = context_window.saturating_sub(reserved_output);
+        ((available as u64 * 75) / 100).max(16_000) as u32
+    }
+
+    pub fn needs_tier1_masking(used_tokens: u32, context_window: u32, max_output_tokens: u32) -> bool {
+        let reserved_output = max_output_tokens.min(32_000);
+        let available = context_window.saturating_sub(reserved_output);
+        let tier1_cap = ((available as u64 * 60) / 100).max(12_000) as u32;
+        used_tokens >= tier1_cap
+    }
+
     pub fn needs_auto_compaction(
         messages: &[ChatMessage],
         context_window: u32,
         max_output_tokens: u32,
     ) -> bool {
         let current = estimate_messages_tokens(messages);
-        let reserve = max_output_tokens.min(32_000) + 16_000;
-        let hard_cap = context_window.saturating_sub(reserve);
-        let soft_cap = (context_window as u64 * 82 / 100) as u32;
-        let trigger = hard_cap.min(soft_cap).max(16_000);
+        let trigger = Self::compaction_budget_threshold(context_window, max_output_tokens);
         current >= trigger
+    }
+
+    pub fn needs_auto_compaction_exact(
+        used_tokens: u32,
+        context_window: u32,
+        max_output_tokens: u32,
+    ) -> bool {
+        let trigger = Self::compaction_budget_threshold(context_window, max_output_tokens);
+        used_tokens >= trigger
     }
 
     pub fn build_compaction_prompt(custom_instruction: Option<&str>) -> String {
@@ -368,6 +535,8 @@ impl ContextBuilder {
         workspace_root: &str,
         contract: Option<&TaskContract>,
         keep_recent_msgs: usize,
+        plan_state: Option<(bool, String)>,
+        restored_files: Vec<(String, String)>,
     ) -> Vec<ChatMessage> {
         let mut out = Vec::new();
         if let Some(first) = transcript.first() {
@@ -497,10 +666,31 @@ impl ContextBuilder {
             }
         }
 
+        let mut rehydration_blocks = Vec::new();
         if let Some(tail) = Self::build_dynamic_tail(workspace_root, contract) {
+            rehydration_blocks.push(tail);
+        }
+        if let Some((pm, p_md)) = plan_state {
+            if pm || !p_md.trim().is_empty() {
+                rehydration_blocks.push(format!(
+                    "<active_plan plan_mode=\"{}\">\n{}\n</active_plan>",
+                    pm,
+                    if p_md.trim().is_empty() { "(Plan Mode active, formulating plan)" } else { p_md.trim() }
+                ));
+            }
+        }
+        if !restored_files.is_empty() {
+            let mut files_buf = String::from("<restored_files_after_compaction>\n");
+            for (fpath, content) in restored_files {
+                files_buf.push_str(&format!("--- FILE: {} ---\n{}\n", fpath, content));
+            }
+            files_buf.push_str("</restored_files_after_compaction>");
+            rehydration_blocks.push(files_buf);
+        }
+        if !rehydration_blocks.is_empty() {
             out.push(ChatMessage {
                 role: "user".to_string(),
-                content: MessageContent::Text(format!("<system-reminder>\n{}\n</system-reminder>", tail)),
+                content: MessageContent::Text(format!("<system-reminder>\n{}\n</system-reminder>", rehydration_blocks.join("\n\n"))),
                 name: Some("post_compaction_rehydration".to_string()),
                 tool_calls: None,
                 tool_call_id: None,

@@ -13,6 +13,7 @@ import { SPRING_POPUP, SPRING_KEYCAP, SPRING_SLIDER, attachPressScale } from '..
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 
 let inputText = $state<string>('');
+let lastSyncedDraftChatId = $state<string | null | undefined>(undefined);
 let textareaEl = $state<HTMLTextAreaElement | null>(null);
 let mirrorEl = $state<HTMLDivElement | null>(null);
 let slashLeadMatch = $derived(inputText.match(/^(\/[a-zA-Z0-9_-]+)([\s\S]*)$/));
@@ -47,6 +48,23 @@ const modelMenuSpring = new Spring({ opacity: 0, y: 6, scale: 0.96 }, SPRING_POP
 const paletteSpring = new Spring({ opacity: 0, y: 6 }, SPRING_POPUP);
 const keycapSpring = new Spring({ scale: 1, y: 0 }, SPRING_KEYCAP);
 const sliderSpring = new Spring(0, SPRING_SLIDER);
+
+$effect(() => {
+  const cid = chatStore.activeChatId;
+  if (lastSyncedDraftChatId !== cid) {
+    lastSyncedDraftChatId = cid;
+    inputText = chatStore.getDraftText(cid);
+    attachments = chatStore.getDraftAttachments(cid);
+  }
+});
+
+$effect(() => {
+  const cid = chatStore.activeChatId;
+  if (lastSyncedDraftChatId === cid) {
+    chatStore.setDraftText(cid, inputText);
+    chatStore.setDraftAttachments(cid, attachments);
+  }
+});
 
 $effect(() => {
   sliderSpring.target = reasoningIndex;
@@ -1129,17 +1147,18 @@ async function stopAndSendVoice() {
 
                   {#if enabledProviders.length > 1}
                     <div
-                      class="relative h-7 bg-[#121214] rounded-[4px] border border-white/[0.06] p-0.5 grid items-center"
-                      style="grid-template-columns: repeat({enabledProviders.length}, minmax(0, 1fr));"
+                      class="h-7 bg-[#121214] rounded-[4px] border border-white/[0.06] p-0.5 flex items-center gap-0.5 overflow-x-auto [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden"
+                      onwheel={(e) => {
+                        if (e.currentTarget.scrollWidth > e.currentTarget.clientWidth) {
+                          e.preventDefault();
+                          e.currentTarget.scrollLeft += e.deltaY !== 0 ? e.deltaY : e.deltaX;
+                        }
+                      }}
                     >
-                      <div
-                        class="absolute top-0.5 bottom-0.5 left-0.5 rounded-[3px] bg-white/[0.12] border-t border-white/[0.18] pointer-events-none"
-                        style="width: calc((100% - 4px) / {enabledProviders.length}); transform: translateX(calc({providerTabSpring.current} * 100%));"
-                      ></div>
                       {#each enabledProviders as prov (prov.id)}
                         <button
                           type="button"
-                          class="relative z-10 h-full px-1.5 font-mono text-[10px] truncate text-center transition-colors {popupProviderId === prov.id ? 'text-[#EDEDEF] font-semibold' : 'text-[#73737A] hover:text-[#D4D4D8]'}"
+                          class="shrink-0 h-full px-2.5 rounded-[3px] font-mono text-[10px] whitespace-nowrap transition-colors {popupProviderId === prov.id ? 'bg-white/[0.12] border-t border-white/[0.18] text-[#EDEDEF] font-semibold' : 'text-[#73737A] hover:text-[#D4D4D8]'}"
                           onclick={() => settingsStore.setProvider(prov.id)}
                           title={prov.name}
                         >
@@ -1169,8 +1188,9 @@ async function stopAndSendVoice() {
                             type="button"
                             class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {settingsStore.data.activeModel === item.model && settingsStore.data.activeProvider === item.providerId ? 'bg-white/[0.09] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.04] hover:text-white'}"
                             onclick={() => {
-                              const prev = settingsStore.data.activeModel;
+                              const prev = chatStore.activeSession?.modelId || settingsStore.data.activeModel;
                               settingsStore.setActiveModel(item.providerId, item.model);
+                              chatStore.setSessionModel(item.providerId, item.model);
                               if (prev && prev !== item.model) {
                                 chatStore.recordModelChanged(item.model);
                               }

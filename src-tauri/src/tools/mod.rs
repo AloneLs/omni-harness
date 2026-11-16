@@ -1,3 +1,4 @@
+pub mod blob_store;
 pub mod desktop_uia;
 pub mod github;
 pub mod process_pty;
@@ -152,6 +153,29 @@ impl ToolDispatcher {
                 ("overwrite", "boolean", "Allow overwriting existing file (default true)"),
             ],
             &["path", "content"],
+        ));
+
+        declarations.push(make_decl(
+            "tg_send_file",
+            "Send a file asynchronously to the active Telegram chat (returns immediately with uploadId while uploading in background), check upload status, or cancel an active upload.",
+            &[
+                ("action", "string", "send | status | cancel"),
+                ("path", "string", "File path to send (for action=send)"),
+                ("kind", "string", "auto | document | photo | audio | video (default auto)"),
+                ("caption", "string", "Optional file caption"),
+                ("upload_id", "string", "Upload job ID (for action=status or cancel)"),
+            ],
+            &["action"],
+        ));
+
+        declarations.push(make_decl(
+            "patch_file",
+            "Apply a unified diff patch atomically (requires prior read_file). Validates context lines and diff size before writing.",
+            &[
+                ("path", "string", "Target file path"),
+                ("patch", "string", "Unified diff text with @@ hunk headers"),
+            ],
+            &["path", "patch"],
         ));
 
         declarations.push(make_decl(
@@ -389,8 +413,9 @@ impl ToolDispatcher {
                 .await
                 .map_err(|e| e.to_string())??;
                 if let Some(obj) = res.as_object_mut() {
-                    if let Some(content) = obj.get("content").and_then(|v| v.as_str()).map(|s| s.to_string()) {
-                        let empty_note = if content.trim().is_empty() {
+                    let total_lines_val = obj.get("totalLines").and_then(|v| v.as_u64()).unwrap_or(1);
+                    if obj.get("content").and_then(|v| v.as_str()).is_some() {
+                        let empty_note = if total_lines_val == 0 {
                             " File exists on disk but is currently empty."
                         } else {
                             ""
@@ -415,16 +440,16 @@ impl ToolDispatcher {
                 let mut edits: Vec<workspace::EditOp> = Vec::new();
                 if let Some(arr) = args.get("edits").and_then(|v| v.as_array()) {
                     for item in arr {
-                        let old_t = item.get("old_text").and_then(|v| v.as_str()).unwrap_or("");
-                        let new_t = item.get("new_text").and_then(|v| v.as_str()).unwrap_or("");
+                        let old_t = item.get("old_text").or_else(|| item.get("old_string")).and_then(|v| v.as_str()).unwrap_or("");
+                        let new_t = item.get("new_text").or_else(|| item.get("new_string")).and_then(|v| v.as_str()).unwrap_or("");
                         edits.push(workspace::EditOp {
                             old_text: old_t.to_string(),
                             new_text: new_t.to_string(),
                         });
                     }
                 } else if let (Some(old_t), Some(new_t)) = (
-                    args.get("old_text").and_then(|v| v.as_str()),
-                    args.get("new_text").and_then(|v| v.as_str()),
+                    args.get("old_text").or_else(|| args.get("old_string")).and_then(|v| v.as_str()),
+                    args.get("new_text").or_else(|| args.get("new_string")).and_then(|v| v.as_str()),
                 ) {
                     edits.push(workspace::EditOp {
                         old_text: old_t.to_string(),
@@ -434,7 +459,6 @@ impl ToolDispatcher {
                 if edits.is_empty() {
                     return Err("Missing edits array".to_string());
                 }
-                safety::record_shadow_checkpoint(&ws_root, &format!("before edit {}", path));
                 workspace::edit_file_cascade(
                     conn.and_then(|m| m.lock().ok()).as_deref(),
                     chat_id,
@@ -452,7 +476,6 @@ impl ToolDispatcher {
                 let path = args.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
                 let content = args.get("content").and_then(|v| v.as_str()).ok_or("Missing content")?;
                 let overwrite = args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(true);
-                safety::record_shadow_checkpoint(&ws_root, &format!("before write {}", path));
                 let res = workspace::write_file_atomic(
                     conn.and_then(|m| m.lock().ok()).as_deref(),
                     chat_id,
@@ -464,6 +487,56 @@ impl ToolDispatcher {
                 )?;
                 Ok(json!(res))
             }
+            "tg_send_file" => {
+                let cid = chat_id.unwrap_or("");
+                let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("send");
+                match action {
+                    "send" => {
+                        let path = args.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
+                        let resolved = workspace::validate_path(path, &self.allowed_roots)?;
+                        safety::SecretShield::check_path(&resolved)?;
+                        if !resolved.is_file() {
+                            return Err(format!("File not found: {}", path));
+                        }
+                        let kind = args.get("kind").and_then(|v| v.as_str()).unwrap_or("auto");
+                        let caption = args.get("caption").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let job = crate::telegram::TelegramUploadManager::enqueue_upload(
+                            cid,
+                            &resolved.to_string_lossy(),
+                            kind,
+                            caption,
+                        )
+                        .await?;
+                        Ok(json!(job))
+                    }
+                    "status" => {
+                        let uid = args.get("upload_id").and_then(|v| v.as_str());
+                        let jobs = crate::telegram::TelegramUploadManager::get_status(cid, uid).await;
+                        Ok(json!({ "uploads": jobs }))
+                    }
+                    "cancel" => {
+                        let uid = args.get("upload_id").and_then(|v| v.as_str()).ok_or("Missing upload_id")?;
+                        let job = crate::telegram::TelegramUploadManager::cancel_upload(uid).await?;
+                        Ok(json!(job))
+                    }
+                    other => Err(format!("Unsupported tg_send_file action: {}", other)),
+                }
+            }
+            "patch_file" => {
+                if plan_mode {
+                    return Err("Plan Mode: patch_file is disabled in read-only Plan mode.".to_string());
+                }
+                let path = args.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
+                let patch = args.get("patch").and_then(|v| v.as_str()).ok_or("Missing patch")?;
+                workspace::apply_unified_diff_safe(
+                    conn.and_then(|m| m.lock().ok()).as_deref(),
+                    chat_id,
+                    path,
+                    patch,
+                    &self.allowed_roots,
+                    &self.read_guard,
+                )
+            }
             "fs_ops" => {
                 if plan_mode {
                     return Err("Plan Mode: fs_ops is disabled in read-only Plan mode.".to_string());
@@ -471,7 +544,6 @@ impl ToolDispatcher {
                 let action = args.get("action").and_then(|v| v.as_str()).ok_or("Missing action")?;
                 let path = args.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
                 let dest = args.get("dest").and_then(|v| v.as_str());
-                safety::record_shadow_checkpoint(&ws_root, &format!("before fs_ops {} {}", action, path));
                 workspace::fs_ops_safe(action, path, dest, &self.allowed_roots)
             }
             "glob" | "find_files" => {

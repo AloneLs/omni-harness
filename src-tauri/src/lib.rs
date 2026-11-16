@@ -83,6 +83,13 @@ fn window_minimize(window: tauri::Window) {
 }
 
 #[tauri::command]
+fn window_toggle_fullscreen(window: tauri::Window) -> Result<bool, String> {
+    let is_fs = window.is_fullscreen().map_err(|e| e.to_string())?;
+    window.set_fullscreen(!is_fs).map_err(|e| e.to_string())?;
+    Ok(!is_fs)
+}
+
+#[tauri::command]
 fn window_toggle_maximize(window: tauri::Window) {
     if window.is_maximized().unwrap_or(false) {
         let _ = window.unmaximize();
@@ -317,6 +324,113 @@ async fn rollback_file_snapshot(
         .db
         .rollback_file_snapshot(&snapshot_id)
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_events_since(
+    state: State<'_, AppManagedState>,
+    session_id: String,
+    last_seq: i64,
+) -> Result<Vec<db::EventRecord>, String> {
+    state
+        .app_state
+        .db
+        .list_events_since(&session_id, last_seq)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_session_checkpoints(
+    state: State<'_, AppManagedState>,
+    chat_id: String,
+) -> Result<Vec<db::CheckpointRecord>, String> {
+    state
+        .app_state
+        .db
+        .list_checkpoints(&chat_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn rewind_checkpoint(
+    state: State<'_, AppManagedState>,
+    chat_id: String,
+    checkpoint_id: String,
+    mode: String,
+) -> Result<tools::blob_store::RewindResult, String> {
+    let cp = state
+        .app_state
+        .db
+        .get_checkpoint(&checkpoint_id)
+        .map_err(|e| e.to_string())?;
+
+    let norm_mode = mode.trim().to_lowercase();
+    let do_code = norm_mode == "code" || norm_mode == "both";
+    let do_conv = norm_mode == "conversation" || norm_mode == "both";
+    if !do_code && !do_conv {
+        return Err("Invalid rewind mode. Use code, conversation, or both.".to_string());
+    }
+
+    let mut result = tools::blob_store::RewindResult {
+        checkpoint_id: checkpoint_id.clone(),
+        mode: norm_mode.clone(),
+        restored_files: Vec::new(),
+        deleted_files: Vec::new(),
+        skipped_large_files: Vec::new(),
+        dirty_external_files: Vec::new(),
+    };
+
+    if do_code {
+        let manifest: tools::blob_store::CheckpointManifest =
+            serde_json::from_str(&cp.manifest_json).map_err(|e| e.to_string())?;
+        let mut expected_hashes: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Ok(evts) = state.app_state.db.list_events_since(&chat_id, 0) {
+            for ev in evts {
+                if ev.kind == "file_patched" {
+                    if let (Some(fp), Some(ah)) = (
+                        ev.payload.get("path").and_then(|v| v.as_str()),
+                        ev.payload.get("afterHash").and_then(|v| v.as_str()),
+                    ) {
+                        if !fp.is_empty() && !ah.is_empty() {
+                            let rel = std::path::Path::new(fp)
+                                .strip_prefix(&manifest.workspace_root)
+                                .map(|r| r.to_string_lossy().replace('\\', "/"))
+                                .unwrap_or_else(|_| fp.replace('\\', "/"));
+                            expected_hashes.insert(rel, ah.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let code_res = tools::blob_store::atomic_restore_batch(&manifest, Some(&expected_hashes))?;
+        result.restored_files = code_res.restored_files;
+        result.deleted_files = code_res.deleted_files;
+        result.skipped_large_files = code_res.skipped_large_files;
+        result.dirty_external_files = code_res.dirty_external_files;
+    }
+
+    if do_conv {
+        state
+            .app_state
+            .db
+            .truncate_messages_after_seq(&chat_id, cp.message_seq)
+            .map_err(|e| e.to_string())?;
+    }
+
+    state.app_state.db.emit_event(
+        &chat_id,
+        "rewind",
+        serde_json::json!({
+            "checkpointId": checkpoint_id,
+            "mode": norm_mode,
+            "restoredFiles": result.restored_files,
+            "skippedLargeFiles": result.skipped_large_files,
+            "dirtyExternalFiles": result.dirty_external_files
+        }),
+    );
+
+    Ok(result)
 }
 
 #[tauri::command]
@@ -2146,6 +2260,7 @@ async fn get_telegram_config(
         "notifyOnApproval": cfg.notify_on_approval,
         "notifyOnError": cfg.notify_on_error,
         "autoStart": cfg.auto_start,
+        "proxyUrl": cfg.proxy_url,
     }))
 }
 
@@ -2185,6 +2300,7 @@ async fn save_telegram_config(
     notify_on_approval: bool,
     notify_on_error: bool,
     auto_start: Option<bool>,
+    proxy_url: Option<String>,
 ) -> Result<(), String> {
     let prev = state.telegram_mgr.get_config_snapshot().await;
     let cfg = telegram::TelegramConfigFile {
@@ -2194,6 +2310,7 @@ async fn save_telegram_config(
         notify_on_approval,
         notify_on_error,
         auto_start: auto_start.unwrap_or(prev.auto_start),
+        proxy_url: proxy_url.map(|s| s.trim().to_string()).unwrap_or_else(|| prev.proxy_url.clone()),
         offset: prev.offset,
         chat_sessions: prev.chat_sessions,
         chat_providers: prev.chat_providers,
@@ -2346,6 +2463,7 @@ pub fn run() {
             window_show,
             window_minimize,
             window_toggle_maximize,
+            window_toggle_fullscreen,
             window_close,
             window_start_dragging,
             create_project,
@@ -2367,6 +2485,9 @@ pub fn run() {
             get_file_snapshot,
             list_snapshots_for_chat,
             rollback_file_snapshot,
+            get_events_since,
+            list_session_checkpoints,
+            rewind_checkpoint,
             record_usage_stat,
             list_usage_stats,
             create_provider,

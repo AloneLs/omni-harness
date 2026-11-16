@@ -7,6 +7,7 @@ pub mod models_dev;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod request_compat;
+pub mod token_counter;
 
 pub use anthropic::*;
 pub use capabilities::*;
@@ -17,6 +18,7 @@ pub use models_dev::*;
 pub use openai_chat::*;
 pub use openai_responses::*;
 pub use request_compat::*;
+pub use token_counter::*;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,6 +30,10 @@ pub struct TokenUsage {
     pub total_tokens: u32,
     #[serde(default)]
     pub cached_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

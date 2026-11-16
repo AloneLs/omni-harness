@@ -61,6 +61,8 @@ export interface ChatSession {
   archived?: boolean;
   isDraft?: boolean;
   projectPath?: string;
+  providerId?: string;
+  modelId?: string;
   hasError?: boolean;
   isPaused?: boolean;
   hasUnreadCompletion?: boolean;
@@ -103,6 +105,8 @@ class ChatStore {
   messagesByChat = $state<Record<string, ChatMessage[]>>({});
   streamingChats = $state<Record<string, boolean>>({});
   pendingQueueByChat = $state<Record<string, PendingQueueItem[]>>({});
+  draftTextByChat = $state<Record<string, string>>({});
+  draftAttachmentsByChat = $state<Record<string, ChatAttachment[]>>({});
   todosByChat = $state<Record<string, TodoBoardItem[]>>({});
   contextTelemetryByChat = $state<Record<string, ContextTelemetryData>>({});
   goalByChat = $state<Record<string, GoalStatusInfo | null>>({});
@@ -248,6 +252,17 @@ class ChatStore {
     this.init();
   }
 
+  public setSessionModel(providerId: string, modelId: string, targetChatId?: string): void {
+    const cid = targetChatId || this.activeChatId;
+    if (!cid) return;
+    const sess = this.sessions.find((s) => s.id === cid);
+    if (sess) {
+      sess.providerId = providerId;
+      sess.modelId = modelId;
+      this.saveSessions(cid);
+    }
+  }
+
   public recordModelChanged(newModelId: string): void {
     const cid = this.activeChatId;
     if (!cid || !newModelId) return;
@@ -358,7 +373,7 @@ class ChatStore {
     }
 
     this.sideQuestion = {
-      chatId,
+      chatId: chatId || '',
       question: q,
       answer: '',
       streaming: true,
@@ -458,8 +473,10 @@ class ChatStore {
 
   public syncAllSessionsToBackend(): void {
     for (const sess of this.sessions) {
-      if (sess.isDraft) continue;
-      const msgs = (this.messagesByChat[sess.id] || []).map((m) => ({
+      if (sess.isDraft || this.streamingChats[sess.id]) continue;
+      const rawMsgs = this.messagesByChat[sess.id] || [];
+      if (rawMsgs.length === 0) continue;
+      const msgs = rawMsgs.map((m) => ({
         role: m.role,
         content: m.content,
         createdAt: m.createdAt
@@ -511,7 +528,9 @@ class ChatStore {
             createdAt: Date.parse(bc.createdAt) || ts,
             updatedAt: ts,
             pinned: Boolean(bc.isPinned),
-            projectPath: bc.projectId || undefined
+            projectPath: bc.projectId || undefined,
+            messageCount: 0,
+            preview: ''
           };
           this.sessions = [newSess, ...this.sessions];
           sessionsChanged = true;
@@ -520,7 +539,7 @@ class ChatStore {
           sessionsChanged = true;
         }
 
-        if (!targetChatId || targetChatId === bc.id) {
+        if ((!targetChatId || targetChatId === bc.id) && !this.streamingChats[bc.id]) {
           const dbMsgs = await invoke<
             Array<{
               id: string;
@@ -533,7 +552,12 @@ class ChatStore {
           >('list_messages', { chatId: bc.id });
           if (Array.isArray(dbMsgs)) {
             const localMsgs = this.messagesByChat[bc.id] || [];
-            if (dbMsgs.length > localMsgs.length) {
+            const lastDb = dbMsgs[dbMsgs.length - 1];
+            const lastLocal = localMsgs[localMsgs.length - 1];
+            const changed =
+              dbMsgs.length !== localMsgs.length ||
+              (lastDb && lastLocal && (lastDb.content !== lastLocal.content || lastDb.id !== lastLocal.id));
+            if (changed && dbMsgs.length >= localMsgs.length) {
               const converted: ChatMessage[] = dbMsgs.map((m) => ({
                 id: m.id,
                 chatId: m.chatId,
@@ -544,6 +568,15 @@ class ChatStore {
               }));
               this.messagesByChat[bc.id] = converted;
               this.saveChatMessagesToStorage(bc.id, converted);
+              const sess = this.sessions.find((s) => s.id === bc.id);
+              if (sess) {
+                sess.messageCount = converted.length;
+                if (lastDb && lastDb.content) {
+                  sess.preview = lastDb.content.slice(0, 80);
+                }
+                sess.updatedAt = Date.parse(bc.updatedAt) || Date.now();
+                sessionsChanged = true;
+              }
             }
           }
         }
@@ -640,8 +673,87 @@ class ChatStore {
     this.safeSetStorage(`omni_chat_msgs_${chatId}`, compacted, chatId);
   }
 
+  private persistDrafts(): void {
+    this.safeSetStorage(
+      'omni_chat_drafts',
+      JSON.stringify({
+        texts: this.draftTextByChat,
+        attachments: this.draftAttachmentsByChat
+      })
+    );
+  }
+
+  private persistPendingQueues(): void {
+    this.safeSetStorage('omni_pending_queues', JSON.stringify(this.pendingQueueByChat));
+  }
+
+  public getDraftText(chatId: string | null): string {
+    const key = chatId || '__new__';
+    return this.draftTextByChat[key] || '';
+  }
+
+  public setDraftText(chatId: string | null, text: string): void {
+    const key = chatId || '__new__';
+    if ((this.draftTextByChat[key] || '') === text) return;
+    if (!text) {
+      delete this.draftTextByChat[key];
+    } else {
+      this.draftTextByChat[key] = text;
+    }
+    this.persistDrafts();
+  }
+
+  public getDraftAttachments(chatId: string | null): ChatAttachment[] {
+    const key = chatId || '__new__';
+    return this.draftAttachmentsByChat[key] ? [...this.draftAttachmentsByChat[key]] : [];
+  }
+
+  public setDraftAttachments(chatId: string | null, atts: ChatAttachment[]): void {
+    const key = chatId || '__new__';
+    const clean = atts.map((a) => ({
+      id: a.id,
+      name: a.name,
+      path: a.path,
+      size: a.size,
+      kind: a.kind,
+      previewUrl: a.previewUrl && a.previewUrl.startsWith('data:') ? undefined : a.previewUrl
+    }));
+    const prevJson = JSON.stringify(this.draftAttachmentsByChat[key] || []);
+    const nextJson = JSON.stringify(clean);
+    if (prevJson === nextJson) return;
+    if (clean.length === 0) {
+      delete this.draftAttachmentsByChat[key];
+    } else {
+      this.draftAttachmentsByChat[key] = clean;
+    }
+    this.persistDrafts();
+  }
+
   public async loadSessions(): Promise<void> {
     if (typeof localStorage !== 'undefined') {
+      try {
+        const rawDrafts = localStorage.getItem('omni_chat_drafts');
+        if (rawDrafts) {
+          const parsedDrafts = JSON.parse(rawDrafts);
+          if (parsedDrafts && typeof parsedDrafts === 'object') {
+            if (parsedDrafts.texts && typeof parsedDrafts.texts === 'object') {
+              this.draftTextByChat = parsedDrafts.texts;
+            }
+            if (parsedDrafts.attachments && typeof parsedDrafts.attachments === 'object') {
+              this.draftAttachmentsByChat = parsedDrafts.attachments;
+            }
+          }
+        }
+      } catch {}
+      try {
+        const rawQueues = localStorage.getItem('omni_pending_queues');
+        if (rawQueues) {
+          const parsedQueues = JSON.parse(rawQueues);
+          if (parsedQueues && typeof parsedQueues === 'object') {
+            this.pendingQueueByChat = parsedQueues;
+          }
+        }
+      } catch {}
       const saved = localStorage.getItem('omni_chat_sessions');
       if (saved) {
         try {
@@ -877,6 +989,8 @@ class ChatStore {
       pinned: false,
       archived: false,
       isDraft: true,
+      providerId: settingsStore.data.activeProvider || undefined,
+      modelId: settingsStore.data.activeModel || undefined,
       projectPath,
       hasError: false,
       hasUnreadCompletion: false,
@@ -900,6 +1014,9 @@ class ChatStore {
   public async selectSession(id: string): Promise<void> {
     this.activeChatId = id;
     const session = this.sessions.find((s) => s.id === id);
+    if (session?.providerId && session?.modelId) {
+      settingsStore.setActiveModel(session.providerId, session.modelId);
+    }
     if (session && session.hasUnreadCompletion) {
       session.hasUnreadCompletion = false;
       this.saveSessions(id);
@@ -947,6 +1064,10 @@ class ChatStore {
     delete this.messagesByChat[id];
     delete this.streamingChats[id];
     delete this.pendingQueueByChat[id];
+    delete this.draftTextByChat[id];
+    delete this.draftAttachmentsByChat[id];
+    this.persistPendingQueues();
+    this.persistDrafts();
     delete this.todosByChat[id];
     delete this.contextTelemetryByChat[id];
     delete this.reasoningElapsedByChat[id];
@@ -1235,7 +1356,7 @@ class ChatStore {
 
   public async continueAssistantMessage(messageId?: string): Promise<void> {
     const chatId = this.activeChatId;
-    if (!chatId || this.streamingChats[chatId]) return;
+    if (!chatId) return;
     const list = this.messagesByChat[chatId] || [];
     let targetIdx = -1;
     if (messageId) {
@@ -1251,6 +1372,10 @@ class ChatStore {
     if (targetIdx === -1) return;
 
     const targetMsg = list[targetIdx];
+    if (this.streamingChats[chatId] && targetMsg.streaming) return;
+    if (this.streamingChats[chatId]) {
+      this.streamingChats = { ...this.streamingChats, [chatId]: false };
+    }
     let prevUserPrompt = '';
     for (let i = targetIdx - 1; i >= 0; i--) {
       if (list[i].role === 'user') {
@@ -1383,19 +1508,24 @@ class ChatStore {
     };
     const cur = this.pendingQueueByChat[cid] || [];
     this.pendingQueueByChat[cid] = priority === 'intervention' ? [item, ...cur] : [...cur, item];
+    this.persistPendingQueues();
   }
 
   public dequeueMessage(id: string): void {
     const cid = this.activeChatId;
     if (!cid) return;
     this.pendingQueueByChat[cid] = (this.pendingQueueByChat[cid] || []).filter((item) => item.id !== id);
+    this.persistPendingQueues();
   }
 
   public updatePendingItem(id: string, text: string): void {
     const cid = this.activeChatId;
     if (!cid) return;
     const item = (this.pendingQueueByChat[cid] || []).find((i) => i.id === id);
-    if (item && text.trim()) item.text = text.trim();
+    if (item && text.trim()) {
+      item.text = text.trim();
+      this.persistPendingQueues();
+    }
   }
 
   public async sendNow(id: string): Promise<void> {
@@ -1415,6 +1545,7 @@ class ChatStore {
     if (q.length === 0) return;
     const next = q[0];
     this.pendingQueueByChat[cid] = q.slice(1);
+    this.persistPendingQueues();
     await this.sendMessage(next.text, { targetChatId: cid });
   }
 
@@ -1623,6 +1754,11 @@ class ChatStore {
       this.saveSessions(cid);
     } else if (event.type === 'done') {
       this.flushSmoothBuffers(cid);
+      this.streamingChats = { ...this.streamingChats, [cid]: false };
+      if (this.reasoningTimers[cid]) {
+        clearInterval(this.reasoningTimers[cid]);
+        delete this.reasoningTimers[cid];
+      }
       if (event.usage) {
         currentAssistantMsg.tokenUsage = {
           promptTokens: event.usage.prompt_tokens || event.usage.promptTokens || 0,
@@ -1646,6 +1782,11 @@ class ChatStore {
       this.saveSessions(cid);
     } else if (event.type === 'error') {
       this.flushSmoothBuffers(cid);
+      this.streamingChats = { ...this.streamingChats, [cid]: false };
+      if (this.reasoningTimers[cid]) {
+        clearInterval(this.reasoningTimers[cid]);
+        delete this.reasoningTimers[cid];
+      }
       currentAssistantMsg.finishedAt = Date.now();
       currentAssistantMsg.statusText = undefined;
       currentAssistantMsg.error = event.message || event.error || 'Stream error';

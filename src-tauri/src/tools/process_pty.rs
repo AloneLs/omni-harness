@@ -42,6 +42,7 @@ pub struct PtySession {
     pub child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
     pub buffer: Arc<Mutex<Vec<u8>>>,
     pub is_alive: Arc<AtomicBool>,
+    pub exit_code: Arc<Mutex<Option<i32>>>,
 }
 
 #[derive(Clone)]
@@ -198,6 +199,49 @@ fn execute_build_tool(
     }
 }
 
+pub fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut in_escape = false;
+    let mut in_csi = false;
+    let mut in_osc = false;
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_escape {
+            if ch == '[' {
+                in_csi = true;
+                in_escape = false;
+            } else if ch == ']' {
+                in_osc = true;
+                in_escape = false;
+            } else if ch == '(' || ch == ')' {
+                i += 1;
+                in_escape = false;
+            } else {
+                in_escape = false;
+            }
+        } else if in_csi {
+            if ch.is_ascii_alphabetic() || ch == '@' || ch == '`' || ch == '~' {
+                in_csi = false;
+            }
+        } else if in_osc {
+            if ch == '\x07' || (ch == '\x1b' && i + 1 < chars.len() && chars[i + 1] == '\\') {
+                if ch == '\x1b' {
+                    i += 1;
+                }
+                in_osc = false;
+            }
+        } else if ch == '\x1b' {
+            in_escape = true;
+        } else {
+            out.push(ch);
+        }
+        i += 1;
+    }
+    out
+}
+
 pub fn run_command_direct(
     executable: &str,
     args: &[&str],
@@ -205,23 +249,59 @@ pub fn run_command_direct(
 ) -> Result<BuildOutput, String> {
     let start = Instant::now();
     let mut cmd = create_cmd(executable);
-    cmd.args(args);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
 
-    let out = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("Command execution failed: {}", e))?;
-    let duration_ms = start.elapsed().as_millis();
 
-    Ok(BuildOutput {
-        success: out.status.success(),
-        exit_code: out.status.code(),
-        stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-        duration_ms,
-    })
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+    let out_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut r) = stdout_pipe {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+    let err_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(ref mut r) = stderr_pipe {
+            let _ = r.read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    match child.wait_timeout(Duration::from_secs(60)) {
+        Ok(Some(status)) => {
+            let out_bytes = out_handle.join().unwrap_or_default();
+            let err_bytes = err_handle.join().unwrap_or_default();
+            let duration_ms = start.elapsed().as_millis();
+            Ok(BuildOutput {
+                success: status.success(),
+                exit_code: status.code(),
+                stdout: strip_ansi(&String::from_utf8_lossy(&out_bytes)),
+                stderr: strip_ansi(&String::from_utf8_lossy(&err_bytes)),
+                duration_ms,
+            })
+        }
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = out_handle.join();
+            let _ = err_handle.join();
+            Err("Command timed out after 60 seconds".to_string())
+        }
+        Err(e) => {
+            let _ = child.kill();
+            Err(format!("Process wait error: {}", e))
+        }
+    }
 }
 
 pub fn run_cargo(args: &[&str], cwd: Option<&str>, _timeout_secs: u64) -> Result<BuildOutput, String> {
@@ -338,6 +418,7 @@ impl PtyManager {
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let is_alive = Arc::new(AtomicBool::new(true));
+        let exit_code = Arc::new(Mutex::new(None));
 
         let buf_clone = buffer.clone();
         let alive_clone = is_alive.clone();
@@ -375,6 +456,7 @@ impl PtyManager {
             child: Arc::new(Mutex::new(child)),
             buffer,
             is_alive,
+            exit_code,
         };
 
         self.sessions
@@ -434,7 +516,10 @@ impl PtyManager {
                     return false;
                 }
                 if let Ok(mut ch) = s.child.lock() {
-                    if let Ok(Some(_)) = ch.try_wait() {
+                    if let Ok(Some(status)) = ch.try_wait() {
+                        if let Ok(mut ec) = s.exit_code.lock() {
+                            *ec = Some(status.exit_code() as i32);
+                        }
                         s.is_alive.store(false, Ordering::SeqCst);
                         return false;
                     }
@@ -445,12 +530,50 @@ impl PtyManager {
         false
     }
 
+    pub fn get_exit_code(&self, session_id: &str) -> Option<i32> {
+        let guard = self.sessions.read().ok()?;
+        let s = guard.get(session_id)?;
+        if let Ok(ec) = s.exit_code.lock() {
+            if ec.is_some() {
+                return *ec;
+            }
+        }
+        if let Ok(mut ch) = s.child.lock() {
+            if let Ok(Some(status)) = ch.try_wait() {
+                let code = status.exit_code() as i32;
+                if let Ok(mut ec) = s.exit_code.lock() {
+                    *ec = Some(code);
+                }
+                s.is_alive.store(false, Ordering::SeqCst);
+                return Some(code);
+            }
+        }
+        None
+    }
+
     pub fn kill_pty(&self, session_id: &str) -> Result<(), String> {
         let mut sessions = self.sessions.write().map_err(|e| e.to_string())?;
-        if let Some(session) = sessions.remove(session_id) {
+        if let Some(session) = sessions.get(session_id) {
             session.is_alive.store(false, Ordering::SeqCst);
             if let Ok(mut ch) = session.child.lock() {
+                #[cfg(windows)]
+                if let Some(pid) = ch.process_id() {
+                    let mut tk = create_cmd("taskkill");
+                    tk.args(["/F", "/T", "/PID", &pid.to_string()]);
+                    let _ = tk.output();
+                }
                 let _ = ch.kill();
+            }
+            if sessions.len() > 64 {
+                let dead_ids: Vec<String> = sessions
+                    .iter()
+                    .filter(|(id, s)| *id != session_id && !s.is_alive.load(Ordering::SeqCst))
+                    .map(|(id, _)| id.clone())
+                    .take(16)
+                    .collect();
+                for id in dead_ids {
+                    sessions.remove(&id);
+                }
             }
         }
         Ok(())

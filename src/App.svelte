@@ -94,6 +94,15 @@ function handleClose() {
 }
 
 function handleGlobalKeydown(e: KeyboardEvent) {
+  if (e.key === 'Alt') {
+    e.preventDefault();
+    return;
+  }
+  if (e.key === 'F11') {
+    e.preventDefault();
+    invoke('window_toggle_fullscreen').catch(() => {});
+    return;
+  }
   if (e.key === 'Escape' && settingsStore.isSettingsOpen) {
     settingsStore.closeSettings();
     return;
@@ -114,9 +123,14 @@ function handleGlobalKeydown(e: KeyboardEvent) {
     }
   }
 }
+function handleGlobalKeyup(e: KeyboardEvent) {
+  if (e.key === 'Alt') {
+    e.preventDefault();
+  }
+}
 </script>
 
-<svelte:window onkeydown={handleGlobalKeydown} />
+<svelte:window onkeydown={handleGlobalKeydown} onkeyup={handleGlobalKeyup} />
 
 <div
   class="w-screen h-screen flex bg-[#101012] text-[#E5E5E8] overflow-hidden select-none font-sans"

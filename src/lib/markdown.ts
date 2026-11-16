@@ -300,7 +300,8 @@ export function renderMarkdown(content: string): string {
       const cleanPath = cleanUrl.replace(/^file:\/\/\//, '').replace(/\//g, '\\');
       return `<a href="#" data-open-path="${escapeHtml(cleanPath)}" class="omni-file-link text-[#EDEDEF] underline decoration-white/30 hover:text-white hover:decoration-white transition-colors">${label}</a>`;
     }
-    return `<a href="${escapeHtml(cleanUrl)}" target="_blank" rel="noopener noreferrer" class="text-[#EDEDEF] underline decoration-white/30 hover:text-white transition-colors">${label}</a>`;
+    const safeHref = /^(https?:|mailto:)/i.test(cleanUrl) ? escapeHtml(cleanUrl) : '#';
+    return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer" class="text-[#EDEDEF] underline decoration-white/30 hover:text-white transition-colors">${label}</a>`;
   });
 
   text = text.replace(/^[ \t]*[-*+]\s+\[ \]\s+(.*)$/gm, '<div class="flex items-center gap-2 my-1"><span class="w-3.5 h-3.5 rounded-[3px] border border-white/[0.2] inline-block shrink-0"></span><span class="text-[13.5px] text-[#E5E5E8]">$1</span></div>');

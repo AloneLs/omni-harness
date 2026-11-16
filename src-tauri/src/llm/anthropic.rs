@@ -287,6 +287,8 @@ pub async fn stream_anthropic(
             let mut tool_blocks: HashMap<usize, AnthropicToolBlock> = HashMap::new();
             let mut input_tokens = 0_u32;
             let mut output_tokens = 0_u32;
+            let mut cache_read_input_tokens = 0_u32;
+            let mut cache_creation_input_tokens = 0_u32;
             let mut finish_reason: Option<String> = None;
 
             while let Some(chunk_res) = byte_stream.next().await {
@@ -323,10 +325,14 @@ pub async fn stream_anthropic(
                                 "message_start" => {
                                     if let Some(msg) = val.get("message") {
                                         if let Some(u) = msg.get("usage") {
-                                            if let Some(inp) =
-                                                u.get("input_tokens").and_then(|v| v.as_u64())
-                                            {
+                                            if let Some(inp) = u.get("input_tokens").and_then(|v| v.as_u64()) {
                                                 input_tokens = inp as u32;
+                                            }
+                                            if let Some(cr) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+                                                cache_read_input_tokens = cr as u32;
+                                            }
+                                            if let Some(cc) = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()) {
+                                                cache_creation_input_tokens = cc as u32;
                                             }
                                         }
                                     }
@@ -447,10 +453,14 @@ pub async fn stream_anthropic(
                                         }
                                     }
                                     if let Some(u) = val.get("usage") {
-                                        if let Some(out) =
-                                            u.get("output_tokens").and_then(|v| v.as_u64())
-                                        {
+                                        if let Some(out) = u.get("output_tokens").and_then(|v| v.as_u64()) {
                                             output_tokens = out as u32;
+                                        }
+                                        if let Some(cr) = u.get("cache_read_input_tokens").and_then(|v| v.as_u64()) {
+                                            cache_read_input_tokens = cr as u32;
+                                        }
+                                        if let Some(cc) = u.get("cache_creation_input_tokens").and_then(|v| v.as_u64()) {
+                                            cache_creation_input_tokens = cc as u32;
                                         }
                                     }
                                 }
@@ -463,7 +473,9 @@ pub async fn stream_anthropic(
                                                 prompt_tokens: input_tokens,
                                                 completion_tokens: output_tokens,
                                                 total_tokens: total,
-                                                cached_tokens: 0,
+                                                cached_tokens: cache_read_input_tokens,
+                                                cache_read_input_tokens,
+                                                cache_creation_input_tokens,
                                             }),
                                         })
                                         .await;

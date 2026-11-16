@@ -68,6 +68,13 @@ pub struct StdioConnection {
     child: Arc<Mutex<tokio::process::Child>>,
 }
 
+impl StdioConnection {
+    pub async fn is_alive(&self) -> bool {
+        let mut child = self.child.lock().await;
+        matches!(child.try_wait(), Ok(None))
+    }
+}
+
 pub enum McpTransportConnection {
     Stdio(StdioConnection),
     Sse {
@@ -198,9 +205,12 @@ impl McpServerInstance {
             },
         };
 
-        let res = self
-            .send_request("initialize", Some(json!(init_params)))
-            .await?;
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.send_request("initialize", Some(json!(init_params))),
+        )
+        .await
+        .map_err(|_| "MCP initialize timed out after 15s".to_string())??;
         let init_result: McpInitializeResult = serde_json::from_value(res)
             .map_err(|e| format!("Failed to parse initialize result: {}", e))?;
 
@@ -210,7 +220,12 @@ impl McpServerInstance {
             .send_notification("notifications/initialized", None)
             .await;
 
-        let tools_res = self.send_request("tools/list", None).await?;
+        let tools_res = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            self.send_request("tools/list", None),
+        )
+        .await
+        .map_err(|_| "MCP tools/list timed out after 15s".to_string())??;
         let list_tools: McpListToolsResult = serde_json::from_value(tools_res)
             .map_err(|e| format!("Failed to parse tools/list result: {}", e))?;
 
@@ -256,8 +271,17 @@ impl McpServerInstance {
     }
 
     pub async fn ping(&self) -> Result<bool, String> {
-        let res = self.send_request("ping", None).await;
-        Ok(res.is_ok())
+        if let McpTransportConnection::Stdio(conn) = &self.connection {
+            if !conn.is_alive().await {
+                return Ok(false);
+            }
+        }
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.send_request("ping", None),
+        )
+        .await;
+        Ok(matches!(res, Ok(Ok(_))))
     }
 }
 
@@ -293,7 +317,9 @@ impl McpServerCatalog {
             std_cmd.stdout(std::process::Stdio::piped());
             std_cmd.stderr(std::process::Stdio::null());
 
-            let mut child = tokio::process::Command::from(std_cmd)
+            let mut tokio_cmd = tokio::process::Command::from(std_cmd);
+            tokio_cmd.kill_on_drop(true);
+            let mut child = tokio_cmd
                 .spawn()
                 .map_err(|e| format!("Failed to spawn MCP server '{}': {}", config.name, e))?;
 
@@ -340,7 +366,10 @@ impl McpServerCatalog {
                 .url
                 .clone()
                 .ok_or_else(|| "Missing URL for SSE MCP server".to_string())?;
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default();
             let post_url = format!("{}/message", base_url.trim_end_matches('/'));
 
             McpTransportConnection::Sse {
@@ -353,7 +382,10 @@ impl McpServerCatalog {
                 .url
                 .clone()
                 .ok_or_else(|| "Missing URL for HTTP MCP server".to_string())?;
-            let client = reqwest::Client::new();
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default();
             McpTransportConnection::HttpStream { endpoint, client }
         };
 
@@ -405,19 +437,56 @@ impl McpServerCatalog {
         tool_name: &str,
         arguments: Option<Value>,
     ) -> Result<McpCallToolResult, String> {
-        let map = self.servers.read().await;
-        let srv = map
-            .get(server_name)
-            .ok_or_else(|| format!("Server '{}' not found", server_name))?;
+        let srv = {
+            let map = self.servers.read().await;
+            map.get(server_name)
+                .cloned()
+                .ok_or_else(|| format!("Server '{}' not found", server_name))?
+        };
+
+        let cfg = srv.config.clone();
+        let is_stdio = matches!(srv.connection, McpTransportConnection::Stdio(_));
+        let mut active_srv = srv;
+
+        if let McpTransportConnection::Stdio(conn) = &active_srv.connection {
+            if !conn.is_alive().await {
+                self.connect_server(&cfg).await?;
+                let map = self.servers.read().await;
+                active_srv = map
+                    .get(server_name)
+                    .cloned()
+                    .ok_or_else(|| format!("Server '{}' not found after reconnect", server_name))?;
+            }
+        }
 
         let call_params = McpCallToolParams {
             name: tool_name.to_string(),
-            arguments,
+            arguments: arguments.clone(),
         };
 
-        let res = srv
+        let res = match active_srv
             .send_request("tools/call", Some(json!(call_params)))
-            .await?;
+            .await
+        {
+            Ok(v) => v,
+            Err(err) if is_stdio => {
+                self.connect_server(&cfg).await.map_err(|re| format!("{}; reconnect failed: {}", err, re))?;
+                let map = self.servers.read().await;
+                let reconnected = map
+                    .get(server_name)
+                    .cloned()
+                    .ok_or_else(|| format!("Server '{}' missing after reconnect", server_name))?;
+                let retry_params = McpCallToolParams {
+                    name: tool_name.to_string(),
+                    arguments,
+                };
+                reconnected
+                    .send_request("tools/call", Some(json!(retry_params)))
+                    .await?
+            }
+            Err(err) => return Err(err),
+        };
+
         let parsed: McpCallToolResult = serde_json::from_value(res)
             .map_err(|e| format!("Failed to parse tools/call result: {}", e))?;
         Ok(parsed)

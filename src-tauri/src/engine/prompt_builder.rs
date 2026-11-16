@@ -64,13 +64,16 @@ impl PromptBuilder {
         prompt.push_str("- When critiquing errors use: 'Ошибка: ... / Почему это ошибка: ... / Последствие: ... / Исправление: ...' — strict on substance without sarcasm.\n");
         prompt.push_str("- Lead answers with a direct verdict ('Да', 'Нет', 'Это ошибка', 'Неизвестно', 'Возможно, но маловероятно', 'Недостаточно данных') followed by technical reasoning.\n\n");
 
-        prompt.push_str("OUTPUT & FORMATTING:\n");
+        prompt.push_str("OUTPUT & FORMATTING (UI Capabilities):\n");
         prompt.push_str("- Always respond in Russian (unless explicitly asked otherwise): maximally compressed, blunt, and information-dense — strip every unnecessary word while preserving all concrete technical specifics.\n");
         prompt.push_str("- Do not paste long file contents into chat when already written to disk — summarize the changes and link files.\n");
-        prompt.push_str("- Link local files or directories as `[filename](file:///D:/path/to/file)` so clicking opens Explorer directly on the target.\n");
-        prompt.push_str("- Use LaTeX (`$...$` inline, `$$...$$` block) for formulas, standard Markdown tables for comparisons, and NEVER emit raw `<think>` or `<tool_use>` tags.\n");
-        prompt.push_str("- Media attachments in final responses: embed images with `![alt](url_or_local_path)`, audio as `<audio src=\"url_or_local_path\"></audio>`, and video as `<video src=\"url_or_local_path\"></video>` (supports https:// and local PC paths).\n");
-        prompt.push_str("- Highlighter emphasis: mark critical points like a highlighter pen using `==text==` or `<mark color=\"yellow|purple|green|red|blue\">text</mark>`.\n");
+        prompt.push_str("- Local file links: `[filename](file:///D:/path/to/file)` or `[filename](D:\\path\\to\\file)` opens Windows Explorer directly on the target.\n");
+        prompt.push_str("- Inline images: `![alt](https://...)` or `![alt](D:\\path\\to\\image.png)` (or `<img src=\"...\">`) renders directly in the message with rounded corners and no extra borders.\n");
+        prompt.push_str("- Inline audio (voice-message style player with Play/Pause + waveform): `<audio src=\"url_or_local_path\"></audio>` or `![audio](path.mp3)` or `[listen](path.wav)` (supports .mp3, .wav, .ogg, .m4a, .opus, .flac, both https:// and local PC paths).\n");
+        prompt.push_str("- Inline video player: `<video src=\"url_or_local_path\"></video>` or `![video](path.mp4)` or `[watch](path.mp4)` (supports .mp4, .webm, .mov, .mkv, both https:// and local PC paths).\n");
+        prompt.push_str("- Color highlighter (like a marker pen): use `==critical text==` (purple highlight) or `<mark color=\"yellow|purple|green|red|blue\">important text</mark>` to call out key values, risks, or verdicts.\n");
+        prompt.push_str("- Interactive charts/diagrams: wrap standalone HTML/SVG/JS widgets inside ```viz Title ... ``` or ```chart Title ... ``` fenced blocks to render an interactive card inline.\n");
+        prompt.push_str("- Rich Markdown: LaTeX (`$...$` inline, `$$...$$` block), Markdown tables, checklists (`- [ ]` / `- [x]`), and callouts (`> [!NOTE]`, `> [!WARNING]`, `> [!IMPORTANT]`). NEVER emit raw `<think>` or `<tool_use>` tags.\n");
         prompt.push_str("- For multi-step tasks (3+ steps), plan via `task_board(action=\"set\")` first, then execute step-by-step updating statuses via `task_board(action=\"update\")`.\n");
 
         let _ = contract;

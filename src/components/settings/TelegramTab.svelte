@@ -28,6 +28,7 @@ let notifyOnComplete = $state<boolean>(true);
 let notifyOnApproval = $state<boolean>(true);
 let notifyOnError = $state<boolean>(true);
 let autoStart = $state<boolean>(false);
+let proxyUrl = $state<string>('');
 let feedbackMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
 
 async function refreshTelegramConfig() {
@@ -41,6 +42,7 @@ async function refreshTelegramConfig() {
       notifyOnApproval?: boolean;
       notifyOnError?: boolean;
       autoStart?: boolean;
+      proxyUrl?: string;
     }>('get_telegram_config');
     if (!botToken && cfg.botToken) botToken = cfg.botToken;
     if (cfg.pairingCode) pairingCode = cfg.pairingCode;
@@ -49,6 +51,7 @@ async function refreshTelegramConfig() {
     if (typeof cfg.notifyOnApproval === 'boolean') notifyOnApproval = cfg.notifyOnApproval;
     if (typeof cfg.notifyOnError === 'boolean') notifyOnError = cfg.notifyOnError;
     if (typeof cfg.autoStart === 'boolean') autoStart = cfg.autoStart;
+    if (!proxyUrl && cfg.proxyUrl) proxyUrl = cfg.proxyUrl;
     botRunning = Boolean(cfg.isRunning);
     botStatus = botRunning ? 'online' : 'stopped';
   } catch {}
@@ -146,7 +149,8 @@ async function toggleBot() {
         notifyOnComplete,
         notifyOnApproval,
         notifyOnError,
-        autoStart
+        autoStart,
+        proxyUrl: proxyUrl.trim()
       });
       await invoke('start_telegram_bot', {
         token: botToken.trim(),
@@ -170,7 +174,8 @@ async function saveBotSettings() {
       notifyOnComplete,
       notifyOnApproval,
       notifyOnError,
-      autoStart
+      autoStart,
+      proxyUrl: proxyUrl.trim()
     });
     await refreshTelegramConfig();
     feedbackMessage = { type: 'success', text: 'Configuration saved' };
@@ -239,6 +244,16 @@ async function saveBotSettings() {
         {showBotToken ? 'Hide' : 'Show'}
       </button>
     </div>
+  </div>
+
+  <div class="p-4 rounded-[6px] bg-[#1C1C1F] border border-white/[0.06] space-y-2">
+    <span class="text-xs font-medium text-[#EDEDEF] block">Telegram Proxy URL (optional)</span>
+    <input
+      bind:value={proxyUrl}
+      type="text"
+      placeholder="socks5://127.0.0.1:10808 or http://127.0.0.1:7890"
+      class="w-full px-3 py-2 rounded-[6px] bg-[#1E1E22] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-white/[0.2]"
+    />
   </div>
 
   <div class="p-4 rounded-[6px] bg-[#1C1C1F] border border-white/[0.06] flex items-center justify-between gap-4">

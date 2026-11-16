@@ -6,7 +6,7 @@ use std::time::UNIX_EPOCH;
 #[derive(Debug, Clone)]
 pub struct FileReadStamp {
     pub mtime_nanos: u128,
-    pub hash: u64,
+    pub hash: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -19,13 +19,12 @@ impl FileReadGuard {
         Self::default()
     }
 
-    pub fn hash_bytes(bytes: &[u8]) -> u64 {
-        let mut h: u64 = 0xcbf29ce484222325;
-        for b in bytes {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x100000001b3);
-        }
-        h
+    pub fn hash_bytes(bytes: &[u8]) -> String {
+        blake3::hash(bytes).to_hex().to_string()
+    }
+
+    pub fn get_last_hash(&self, path: &Path) -> Option<String> {
+        self.stamps.read().ok().and_then(|g| g.get(path).map(|s| s.hash.clone()))
     }
 
     pub fn file_mtime_nanos(path: &Path) -> u128 {

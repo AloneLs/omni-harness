@@ -1,12 +1,12 @@
 [package]
 name = "omni-harness"
-version = "0.1.0"
+version = "1.0.0"
 description = "OmniHarness Windows 11 AI-Agent Harness"
 edition = "2021"
 
 [lib]
 name = "omni_harness_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.0.5", features = [] }
@@ -21,28 +21,26 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio = { version = "1.42", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
 keyring = "2.3"
 uuid = { version = "1.11", features = ["v4", "serde"] }
 thiserror = "2.0"
 dirs = "5.0"
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "blocking", "socks"] }
-futures = "0.3"
 futures-util = "0.3"
-eventsource-stream = "0.2"
 portable-pty = "0.8"
 sysinfo = "0.32"
 ignore = "0.4"
 regex = "1.11"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }
 base64 = "0.22"
-async-trait = "0.1"
 tungstenite = "0.24"
 url = "2.5"
 urlencoding = "2.1"
 wait-timeout = "0.2"
 serde_yaml = "0.9"
+tiktoken-rs = "0.12.1"
+blake3 = "1.5"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
@@ -50,6 +48,14 @@ windows = { version = "0.58", features = [
     "Win32_UI_Accessibility",
     "Win32_Graphics_Gdi",
     "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_Security",
     "Win32_System_DataExchange",
     "Win32_System_Memory"
 ] }
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
+codegen-units = 1
+opt-level = 3

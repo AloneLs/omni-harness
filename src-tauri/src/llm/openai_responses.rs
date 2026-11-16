@@ -277,11 +277,18 @@ pub async fn stream_openai_responses(
                                             .and_then(|v| v.as_u64())
                                             .unwrap_or(0)
                                             as u32;
+                                        let cached_tokens = u
+                                            .get("input_tokens_details")
+                                            .and_then(|d| d.get("cached_tokens"))
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0) as u32;
                                         token_usage = Some(TokenUsage {
                                             prompt_tokens,
                                             completion_tokens,
                                             total_tokens,
-                                            cached_tokens: 0,
+                                            cached_tokens,
+                                            cache_read_input_tokens: cached_tokens,
+                                            cache_creation_input_tokens: 0,
                                         });
                                     }
                                 }
