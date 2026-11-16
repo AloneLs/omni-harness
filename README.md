@@ -187,6 +187,25 @@ The output artifacts are generated at:
 - `src-tauri/target/release/omni-harness.exe`
 - `src-tauri/target/release/WebView2Loader.dll` *(must remain adjacent to the executable)*
 
+### Automated CI/CD Releases (GitHub Actions)
+
+A dedicated workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) automatically builds and publishes the production package:
+
+1. **Trigger via Git Tag**:
+   ```bash
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+2. **Trigger via Web UI (Manual)**:
+   Navigate to **Actions** -> **Release Build** -> **Run workflow** (specify tag, draft or prerelease status).
+
+Each release workflow automatically outputs:
+- `OmniHarness-<version>-win64.zip` (standalone archive containing `omni-harness.exe`, `WebView2Loader.dll`, `README.md`, and `LICENSE`)
+- Raw `omni-harness.exe`
+- Raw `WebView2Loader.dll`
+- `checksums.txt` (SHA-256 integrity hashes)
+- GitHub Actions artifact storage (retained for 30 days) and automated GitHub Releases.
+
 ---
 
 ## Configuration
