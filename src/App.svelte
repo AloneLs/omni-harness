@@ -13,6 +13,7 @@ import TodoContractPanel from './components/TodoContractPanel.svelte';
 import FirstRunModal from './components/FirstRunModal.svelte';
 import ProvidersTab from './components/settings/ProvidersTab.svelte';
 import SkillsTab from './components/settings/SkillsTab.svelte';
+import SubagentsTab from './components/settings/SubagentsTab.svelte';
 import McpGatewayTab from './components/settings/McpGatewayTab.svelte';
 import TelegramTab from './components/settings/TelegramTab.svelte';
 import SpeechTab from './components/settings/SpeechTab.svelte';
@@ -24,7 +25,7 @@ import { SPRING_LAUNCH, SPRING_PANEL, SPRING_POPUP, attachPressScale } from './l
 let sidebarOpen = $state<boolean>(true);
 let contractsPanelOpen = $state<boolean>(false);
 let activeSettingsTab = $state<
-  'providers' | 'skills' | 'mcp' | 'telegram' | 'speech' | 'memory'
+  'providers' | 'skills' | 'subagents' | 'mcp' | 'telegram' | 'speech' | 'memory'
 >('providers');
 
 const launchSpring = new Spring({ opacity: 0, scale: 0.96, y: 10 }, SPRING_LAUNCH);
@@ -36,6 +37,7 @@ const navIndicator = new Spring({ y: 0, height: 34 }, { stiffness: 0.28, damping
 const SETTINGS_TABS: { id: typeof activeSettingsTab; label: string; icon: string }[] = [
   { id: 'providers', label: 'Models & Providers', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
   { id: 'skills', label: 'Skills', icon: 'M4 19.5A2.5 2.5 0 0 1 6.5 17H20 M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15z' },
+  { id: 'subagents', label: 'Subagents', icon: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2 M9 7a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M23 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75' },
   { id: 'mcp', label: 'MCP Servers', icon: 'M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z M6 12h4 M14 12h4 M10 8v8' },
   { id: 'telegram', label: 'Telegram', icon: 'M22 2L11 13 M22 2l-7 20-4-9-9-4 20-7z' },
   { id: 'speech', label: 'Speech', icon: 'M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z M19 10v2a7 7 0 0 1-14 0v-2' },
@@ -308,6 +310,8 @@ function handleGlobalKeyup(e: KeyboardEvent) {
                 <ProvidersTab />
               {:else if activeSettingsTab === 'skills'}
                 <SkillsTab />
+              {:else if activeSettingsTab === 'subagents'}
+                <SubagentsTab />
               {:else if activeSettingsTab === 'mcp'}
                 <McpGatewayTab />
               {:else if activeSettingsTab === 'telegram'}

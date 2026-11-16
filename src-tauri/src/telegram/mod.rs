@@ -1639,7 +1639,7 @@ async fn extract_and_download_attachments(
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    let dest_dir = PathBuf::from(workspace_root).join(".harness").join("tg_uploads");
+    let dest_dir = crate::state::AppState::resolve_project_data_dir(workspace_root).join("tg_uploads");
     let mut paths = Vec::new();
     for (idx, (fid, fname)) in items.into_iter().enumerate() {
         let target_name = format!("{}_{}", idx + 1, fname);

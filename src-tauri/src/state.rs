@@ -50,6 +50,25 @@ impl AppState {
         }
     }
 
+    pub fn resolve_projects_root_dir() -> PathBuf {
+        Self::resolve_data_dir().join("projects")
+    }
+
+    pub fn resolve_project_data_dir(workspace_root: &str) -> PathBuf {
+        let normalized = workspace_root
+            .trim()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        let key = if normalized.is_empty() {
+            "default".to_string()
+        } else {
+            let hex = blake3::hash(normalized.as_bytes()).to_hex().to_string();
+            hex.chars().take(16).collect()
+        };
+        Self::resolve_projects_root_dir().join(key)
+    }
+
     pub fn new() -> Result<Self, AppError> {
         let data_dir = Self::resolve_data_dir();
         std::fs::create_dir_all(&data_dir)?;

@@ -299,9 +299,63 @@ pub fn skill_search_roots(workspace_root: &str) -> Vec<std::path::PathBuf> {
     roots
 }
 
+fn builtin_system_skills() -> Vec<SkillPackage> {
+    let env_body = r#"## When to use
+Load when you need full knowledge of the OmniHarness runtime environment, directories, persistence, tools, checkpoints, or error recovery.
+
+## Environment Layout
+- App Data & SQLite DB: %LOCALAPPDATA%\OmniHarness\omniharness.db (WAL mode: chats, messages, memory_entries, checkpoints, events, plan_states, session_artifacts, compaction_events, token_cache)
+- Workspace Root: active project directory. All file tools (read_file, edit_file, patch_file, write_file, glob, grep) are strictly sandboxed to allowed workspace roots after canonicalize() — UNC paths and Windows reserved device names (CON, NUL, PRN, AUX, COM1-9, LPT1-9) are blocked.
+- %LOCALAPPDATA%\OmniHarness\projects\<hash>\objects\: content-addressed checkpoint blobs (never created inside project directory).
+- %LOCALAPPDATA%\OmniHarness\projects\<hash>\tmp\tool_<id>.log: spilled large tool outputs (>300 lines or >24KB), readable via read_file/grep by absolute path.
+- %LOCALAPPDATA%\OmniHarness\projects\<hash>\tg_uploads\: incoming files sent via Telegram bot, readable via read_file by absolute path.
+- %LOCALAPPDATA%\OmniHarness\projects\<hash>\PROJECT_SUMMARY.md: Markdown project summary (managed via project_summary tool, never inside project dir).
+- skills/: User skills (.omni/skills, .agents/skills, .claude/skills).
+
+## Tool Contracts & Safety
+- Always pass valid JSON matching each tool's schema (exact parameter names, no XML tags or raw wrappers).
+- File edits: call read_file before edit_file/patch_file/write_file (enforced by blake3+mtime FileReadGuard). edit_file requires unique old_text unless replace_all=true.
+- Terminal: terminal_exec uses redirected stdout/stderr pipes for foreground commands (returns exit_code, stdout, stderr, duration_ms, spill_file) with Win32 Job Object process-tree kill on timeout; background=true uses PTY (monitor with terminal_io).
+- Memory & Summary: use memory_tool for cross-session facts/preferences and project_summary for the project Markdown summary.
+- Telegram: use tg_send_file(action="send|status|cancel") for background non-blocking file delivery.
+- Subagents: use agent(subagent_type="Explore|Plan|general-purpose|verification") for isolated/parallel work."#;
+
+    vec![SkillPackage {
+        metadata: SkillMetadata {
+            name: "system:omni-environment".to_string(),
+            title: "OmniHarness Runtime Environment".to_string(),
+            description: "Internal system reference for OmniHarness directories, SQLite tables, checkpoints, tool contracts, and runtime behavior (hidden from user UI).".to_string(),
+            command: None,
+            version: "1.0.0".to_string(),
+            author: Some("OmniHarness".to_string()),
+            tags: vec!["system".to_string(), "environment".to_string()],
+            keywords: vec!["omniharness".to_string(), "environment".to_string(), "harness".to_string()],
+            triggers: vec![],
+            paths: vec![],
+            allowed_tools: vec![],
+            disable_model_invocation: false,
+            context: None,
+            auto_start: false,
+            enabled: true,
+            trusted: true,
+        },
+        root_dir: String::new(),
+        skill_markdown: env_body.to_string(),
+        body_content: env_body.to_string(),
+        has_assets: false,
+        has_scripts: false,
+    }]
+}
+
 pub fn discover_all_skills(workspace_root: &str) -> Vec<SkillPackage> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
+    for sys_sk in builtin_system_skills() {
+        let key = sys_sk.metadata.name.to_ascii_lowercase();
+        if seen.insert(key) {
+            result.push(sys_sk);
+        }
+    }
     for root in skill_search_roots(workspace_root) {
         if !root.is_dir() {
             continue;

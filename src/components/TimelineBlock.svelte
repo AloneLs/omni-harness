@@ -281,10 +281,26 @@ function formatToolOutputReadable(call: ToolExecutionRecord): string {
         if (entries.length === 0) return '';
         if (entries.length === 1) {
           const [, v] = entries[0];
-          return typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v);
+          if (v && typeof v === 'object') {
+            return Object.entries(v)
+              .map(([sk, sv]) => `${sk}: ${typeof sv === 'object' ? JSON.stringify(sv) : String(sv)}`)
+              .join('\n');
+          }
+          return String(v);
         }
         return entries
-          .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`)
+          .map(([k, v]) => {
+            if (Array.isArray(v)) {
+              return `${k}: ${v.map((x) => (typeof x === 'object' ? (x?.name || x?.path || x?.title || JSON.stringify(x)) : String(x))).join(', ')}`;
+            }
+            if (v && typeof v === 'object') {
+              const sub = Object.entries(v)
+                .map(([sk, sv]) => `${sk}=${typeof sv === 'object' ? JSON.stringify(sv) : String(sv)}`)
+                .join(', ');
+              return `${k}: ${sub}`;
+            }
+            return `${k}: ${String(v)}`;
+          })
           .join('\n');
         return entries
           .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v)}`)

@@ -148,7 +148,12 @@ mod win32 {
     pub const MOUSEEVENTF_MIDDLEDOWN: DWORD = 0x0020;
     pub const MOUSEEVENTF_MIDDLEUP: DWORD = 0x0040;
     pub const MOUSEEVENTF_WHEEL: DWORD = 0x0800;
+    pub const MOUSEEVENTF_VIRTUALDESK: DWORD = 0x4000;
     pub const MOUSEEVENTF_ABSOLUTE: DWORD = 0x8000;
+    pub const SM_XVIRTUALSCREEN: i32 = 76;
+    pub const SM_YVIRTUALSCREEN: i32 = 77;
+    pub const SM_CXVIRTUALSCREEN: i32 = 78;
+    pub const SM_CYVIRTUALSCREEN: i32 = 79;
 
     pub const KEYEVENTF_KEYUP: DWORD = 0x0002;
     pub const KEYEVENTF_UNICODE: DWORD = 0x0004;
@@ -196,6 +201,8 @@ mod win32 {
         pub fn SendMessageW(hWnd: HWND, Msg: UINT, wParam: WPARAM, lParam: LPARAM) -> LRESULT;
         pub fn SendInput(cInputs: UINT, pInputs: *const INPUT, cbSize: i32) -> UINT;
         pub fn GetSystemMetrics(nIndex: i32) -> i32;
+        pub fn SetProcessDPIAware() -> BOOL;
+        pub fn GetAsyncKeyState(vKey: i32) -> i16;
         pub fn GetDC(hWnd: HWND) -> HDC;
         pub fn ReleaseDC(hWnd: HWND, hDC: HDC) -> i32;
         pub fn CreateCompatibleDC(hDC: HDC) -> HDC;
@@ -398,41 +405,86 @@ fn encode_bmp_32bpp(width: i32, height: i32, bgra_pixels: &[u8]) -> Vec<u8> {
     out
 }
 
+#[cfg(windows)]
+fn ensure_dpi_aware() {
+    static DPI_ONCE: std::sync::Once = std::sync::Once::new();
+    DPI_ONCE.call_once(|| unsafe {
+        win32::SetProcessDPIAware();
+    });
+}
+
+#[cfg(windows)]
+fn is_panic_hotkey_pressed() -> bool {
+    unsafe {
+        (win32::GetAsyncKeyState(0x11) as u16 & 0x8000) != 0
+            && (win32::GetAsyncKeyState(0x12) as u16 & 0x8000) != 0
+            && (win32::GetAsyncKeyState(0x10) as u16 & 0x8000) != 0
+            && (win32::GetAsyncKeyState(0x1B) as u16 & 0x8000) != 0
+    }
+}
+
+fn encode_png_rgba(width: u32, height: u32, bgra_pixels: &[u8]) -> Result<Vec<u8>, String> {
+    let mut rgba = Vec::with_capacity(bgra_pixels.len());
+    for chunk in bgra_pixels.chunks_exact(4) {
+        rgba.push(chunk[2]);
+        rgba.push(chunk[1]);
+        rgba.push(chunk[0]);
+        rgba.push(255);
+    }
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(png::Compression::Fast);
+        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        writer.write_image_data(&rgba).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
 pub fn capture_screen(target_hwnd: Option<usize>) -> Result<CaptureResult, String> {
     #[cfg(windows)]
     unsafe {
-        let (hwnd, width, height) = match target_hwnd {
+        ensure_dpi_aware();
+        if is_panic_hotkey_pressed() {
+            return Err("Computer use aborted by panic hotkey (Ctrl+Alt+Shift+Esc).".to_string());
+        }
+
+        let (hwnd, win_x, win_y, width, height) = match target_hwnd {
             Some(h) => {
                 let win_h = h as win32::HWND;
                 let mut r = win32::RECT::default();
                 win32::GetWindowRect(win_h, &mut r);
                 let w = (r.right - r.left).max(1);
                 let h_val = (r.bottom - r.top).max(1);
-                (win_h, w, h_val)
+                (win_h, r.left, r.top, w, h_val)
             }
             None => {
-                let w = win32::GetSystemMetrics(0);
-                let h_val = win32::GetSystemMetrics(1);
-                (null_mut(), w, h_val)
+                let vx = win32::GetSystemMetrics(win32::SM_XVIRTUALSCREEN);
+                let vy = win32::GetSystemMetrics(win32::SM_YVIRTUALSCREEN);
+                let vw = win32::GetSystemMetrics(win32::SM_CXVIRTUALSCREEN).max(1);
+                let vh = win32::GetSystemMetrics(win32::SM_CYVIRTUALSCREEN).max(1);
+                (null_mut(), vx, vy, vw, vh)
             }
         };
 
-        let hdc_src = win32::GetDC(hwnd);
-        if hdc_src.is_null() {
-            return Err("Failed to get window DC".to_string());
+        let hdc_screen = win32::GetDC(null_mut());
+        if hdc_screen.is_null() {
+            return Err("Failed to get screen DC".to_string());
         }
 
-        let hdc_mem = win32::CreateCompatibleDC(hdc_src);
-        let hbm = win32::CreateCompatibleBitmap(hdc_src, width, height);
+        let hdc_mem = win32::CreateCompatibleDC(hdc_screen);
+        let hbm = win32::CreateCompatibleBitmap(hdc_screen, width, height);
         let old_obj = win32::SelectObject(hdc_mem, hbm);
 
+        let mut captured_via_print = false;
         if !hwnd.is_null() {
             let res = win32::PrintWindow(hwnd, hdc_mem, win32::PW_RENDERFULLCONTENT);
-            if res == 0 {
-                win32::BitBlt(hdc_mem, 0, 0, width, height, hdc_src, 0, 0, win32::SRCCOPY);
-            }
-        } else {
-            win32::BitBlt(hdc_mem, 0, 0, width, height, hdc_src, 0, 0, win32::SRCCOPY);
+            captured_via_print = res != 0;
+        }
+        if !captured_via_print {
+            win32::BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, win_x, win_y, win32::SRCCOPY);
         }
 
         let mut bmi = win32::BITMAPINFO {
@@ -463,19 +515,38 @@ pub fn capture_screen(target_hwnd: Option<usize>) -> Result<CaptureResult, Strin
             0,
         );
 
+        if captured_via_print {
+            let all_black = pixel_buf.chunks_exact(4).step_by(64).all(|c| c[0] == 0 && c[1] == 0 && c[2] == 0);
+            if all_black {
+                win32::BitBlt(hdc_mem, 0, 0, width, height, hdc_screen, win_x, win_y, win32::SRCCOPY);
+                win32::GetDIBits(
+                    hdc_mem,
+                    hbm,
+                    0,
+                    height as u32,
+                    pixel_buf.as_mut_ptr() as *mut c_void,
+                    &mut bmi,
+                    0,
+                );
+            }
+        }
+
         win32::SelectObject(hdc_mem, old_obj);
         win32::DeleteObject(hbm);
         win32::DeleteDC(hdc_mem);
-        win32::ReleaseDC(hwnd, hdc_src);
+        win32::ReleaseDC(null_mut(), hdc_screen);
 
-        let bmp_bytes = encode_bmp_32bpp(width, height, &pixel_buf);
-        let base64_image = base64::engine::general_purpose::STANDARD.encode(&bmp_bytes);
+        let (bytes, mime_type) = match encode_png_rgba(width as u32, height as u32, &pixel_buf) {
+            Ok(png_bytes) => (png_bytes, "image/png".to_string()),
+            Err(_) => (encode_bmp_32bpp(width, height, &pixel_buf), "image/bmp".to_string()),
+        };
+        let base64_image = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
         Ok(CaptureResult {
             width: width as u32,
             height: height as u32,
             base64_image,
-            mime_type: "image/bmp".to_string(),
+            mime_type,
         })
     }
     #[cfg(not(windows))]
@@ -487,6 +558,9 @@ pub fn capture_screen(target_hwnd: Option<usize>) -> Result<CaptureResult, Strin
 pub fn send_keyboard_chords(keys: &[KeyAction]) -> Result<(), String> {
     #[cfg(windows)]
     unsafe {
+        if is_panic_hotkey_pressed() {
+            return Err("Computer use aborted by panic hotkey (Ctrl+Alt+Shift+Esc).".to_string());
+        }
         let mut inputs: Vec<win32::INPUT> = Vec::with_capacity(keys.len());
 
         for action in keys {
@@ -538,14 +612,20 @@ pub fn send_keyboard_chords(keys: &[KeyAction]) -> Result<(), String> {
 pub fn send_mouse_input(action: MouseAction) -> Result<(), String> {
     #[cfg(windows)]
     unsafe {
-        let screen_w = win32::GetSystemMetrics(0);
-        let screen_h = win32::GetSystemMetrics(1);
+        ensure_dpi_aware();
+        if is_panic_hotkey_pressed() {
+            return Err("Computer use aborted by panic hotkey (Ctrl+Alt+Shift+Esc).".to_string());
+        }
+        let vx = win32::GetSystemMetrics(win32::SM_XVIRTUALSCREEN);
+        let vy = win32::GetSystemMetrics(win32::SM_YVIRTUALSCREEN);
+        let vw = win32::GetSystemMetrics(win32::SM_CXVIRTUALSCREEN).max(1);
+        let vh = win32::GetSystemMetrics(win32::SM_CYVIRTUALSCREEN).max(1);
 
         let mut flags = 0u32;
         let mut data = 0u32;
 
         if action.move_cursor {
-            flags |= win32::MOUSEEVENTF_MOVE | win32::MOUSEEVENTF_ABSOLUTE;
+            flags |= win32::MOUSEEVENTF_MOVE | win32::MOUSEEVENTF_ABSOLUTE | win32::MOUSEEVENTF_VIRTUALDESK;
         }
 
         if let Some(btn) = action.click_button {
@@ -579,8 +659,8 @@ pub fn send_mouse_input(action: MouseAction) -> Result<(), String> {
             data = scroll as u32;
         }
 
-        let norm_x = ((action.x as f64 / screen_w as f64) * 65535.0) as i32;
-        let norm_y = ((action.y as f64 / screen_h as f64) * 65535.0) as i32;
+        let norm_x = (((action.x - vx) as f64 / vw as f64) * 65535.0).round() as i32;
+        let norm_y = (((action.y - vy) as f64 / vh as f64) * 65535.0).round() as i32;
 
         let mi = win32::MOUSEINPUT {
             dx: norm_x,
@@ -755,7 +835,7 @@ fn append_png_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
     out.extend_from_slice(&crc32_ieee(&crc_input).to_be_bytes());
 }
 
-fn encode_png_rgba(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
+fn encode_png_rgba_raw(width: u32, height: u32, rgba: &[u8]) -> Vec<u8> {
     let stride = (width * 4) as usize;
     let mut raw = Vec::with_capacity((stride + 1) * height as usize);
     for y in 0..height as usize {
@@ -865,7 +945,7 @@ pub fn capture_screen_png(target_hwnd: Option<usize>) -> Result<serde_json::Valu
             }
         }
 
-        let png_bytes = encode_png_rgba(out_w, out_h, &rgba);
+        let png_bytes = encode_png_rgba_raw(out_w, out_h, &rgba);
         let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
         let windows: Vec<serde_json::Value> = find_windows(None, None)
             .into_iter()

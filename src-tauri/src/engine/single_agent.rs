@@ -1604,6 +1604,19 @@ impl SingleAgentRunner {
                     )
                     .await;
                     let elapsed_ms = tool_started.elapsed().as_millis() as u64;
+                if let Some(d) = db {
+                    d.emit_event(
+                        chat_id,
+                        "tool_span",
+                        serde_json::json!({
+                            "turnSeq": turn_seq,
+                            "toolCallId": tc.id,
+                            "toolName": tool_name,
+                            "durationMs": elapsed_ms,
+                            "success": ok
+                        }),
+                    );
+                }
 
                 if let Some(pre_m) = pre_exec_manifest {
                     if let Ok(post_m) = crate::tools::blob_store::capture_workspace_manifest(workspace_root, &pre_m.checkpoint_id, "post_exec", false) {

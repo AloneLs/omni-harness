@@ -46,7 +46,7 @@ pub struct RewindResult {
 }
 
 pub fn objects_dir(workspace_root: &str) -> PathBuf {
-    Path::new(workspace_root).join(".harness").join("objects")
+    crate::state::AppState::resolve_project_data_dir(workspace_root).join("objects")
 }
 
 pub fn hash_file_streaming(path: &Path) -> Result<String, String> {

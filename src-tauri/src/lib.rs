@@ -2189,11 +2189,54 @@ async fn open_path_in_explorer(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn list_subagents(
+    state: State<'_, AppManagedState>,
+) -> Result<Vec<engine::subagents::SubagentInfo>, String> {
+    let ws = state.app_state.get_workspace_dir().await;
+    Ok(engine::subagents::list_all_subagents(&ws.to_string_lossy()))
+}
+
+#[tauri::command]
+async fn save_custom_subagent(
+    state: State<'_, AppManagedState>,
+    name: String,
+    description: String,
+    tools: Vec<String>,
+    disallowed_tools: Vec<String>,
+    model: Option<String>,
+    max_turns: Option<u32>,
+    system_prompt: String,
+    scope: String,
+) -> Result<engine::subagents::SubagentInfo, String> {
+    let ws = state.app_state.get_workspace_dir().await;
+    let def = engine::subagents::CustomSubagentDef {
+        name,
+        description,
+        tools,
+        disallowed_tools,
+        model,
+        max_turns,
+        system_prompt,
+    };
+    engine::subagents::save_custom_subagent(&ws.to_string_lossy(), def, &scope)
+}
+
+#[tauri::command]
+async fn delete_custom_subagent(
+    state: State<'_, AppManagedState>,
+    name: String,
+    file_path: Option<String>,
+) -> Result<(), String> {
+    let ws = state.app_state.get_workspace_dir().await;
+    engine::subagents::delete_custom_subagent(&ws.to_string_lossy(), &name, file_path.as_deref())
+}
+
+#[tauri::command]
 async fn list_skills(
     state: State<'_, AppManagedState>,
 ) -> Result<Vec<skills::SkillPackage>, String> {
     let ws = state.app_state.get_workspace_dir().await;
-    Ok(skills::discover_all_skills(&ws.to_string_lossy()))
+    Ok(skills::discover_all_skills(&ws.to_string_lossy()).into_iter().filter(|sk| !sk.metadata.name.starts_with("system:")).collect())
 }
 
 #[tauri::command]
@@ -2618,6 +2661,9 @@ pub fn run() {
             install_app_to_dir,
             set_windows_autostart,
             create_desktop_shortcut,
+            list_subagents,
+            save_custom_subagent,
+            delete_custom_subagent,
             list_skills,
             delete_skill,
             import_skill_zip,

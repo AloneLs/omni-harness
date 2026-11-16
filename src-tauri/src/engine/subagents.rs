@@ -37,22 +37,48 @@ fn store() -> &'static Mutex<HashMap<String, SubagentTranscript>> {
     SUBAGENT_STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn load_custom_agents(workspace_root: &str) -> Vec<CustomSubagentDef> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentInfo {
+    pub name: String,
+    pub description: String,
+    pub is_system: bool,
+    pub tools: Vec<String>,
+    pub disallowed_tools: Vec<String>,
+    pub model: Option<String>,
+    pub max_turns: Option<u32>,
+    pub system_prompt: String,
+    pub file_path: String,
+    pub scope: String,
+}
+
+pub fn is_system_subagent_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "explore" | "plan" | "general-purpose" | "verification" | "verifier"
+    )
+}
+
+pub fn subagent_search_roots(workspace_root: &str) -> Vec<(std::path::PathBuf, &'static str)> {
     let mut roots = Vec::new();
     let ws = Path::new(workspace_root);
-    roots.push(ws.join(".omni").join("agents"));
-    roots.push(ws.join(".agents").join("agents"));
-    roots.push(ws.join(".claude").join("agents"));
+    roots.push((ws.join(".omni").join("agents"), "workspace"));
+    roots.push((ws.join(".agents").join("agents"), "workspace"));
+    roots.push((ws.join(".claude").join("agents"), "workspace"));
     if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
         let h = Path::new(&home);
-        roots.push(h.join(".omni").join("agents"));
-        roots.push(h.join(".agents").join("agents"));
-        roots.push(h.join(".claude").join("agents"));
+        roots.push((h.join(".omni").join("agents"), "global"));
+        roots.push((h.join(".agents").join("agents"), "global"));
+        roots.push((h.join(".claude").join("agents"), "global"));
     }
+    roots
+}
 
+fn load_custom_agents_with_meta(workspace_root: &str) -> Vec<(CustomSubagentDef, String, String)> {
+    let roots = subagent_search_roots(workspace_root);
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for dir in roots {
+    for (dir, scope) in roots {
         if !dir.is_dir() {
             continue;
         }
@@ -78,18 +104,244 @@ fn load_custom_agents(workspace_root: &str) -> Vec<CustomSubagentDef> {
             let yaml_str = &rest[..end_idx];
             let body = rest[end_idx + 3..].trim().to_string();
             if let Ok(mut def) = serde_yaml::from_str::<CustomSubagentDef>(yaml_str) {
-                if def.name.trim().is_empty() {
+                if def.name.trim().is_empty() || is_system_subagent_name(&def.name) {
                     continue;
                 }
                 let key = def.name.to_ascii_lowercase();
                 if seen.insert(key) {
                     def.system_prompt = body;
-                    out.push(def);
+                    out.push((def, p.to_string_lossy().to_string(), scope.to_string()));
                 }
             }
         }
     }
     out
+}
+
+fn load_custom_agents(workspace_root: &str) -> Vec<CustomSubagentDef> {
+    load_custom_agents_with_meta(workspace_root)
+        .into_iter()
+        .map(|(def, _, _)| def)
+        .collect()
+}
+
+pub fn list_all_subagents(workspace_root: &str) -> Vec<SubagentInfo> {
+    let system_defs: [(&str, &str, u32); 4] = [
+        (
+            "Explore",
+            "Fast, strictly read-only codebase exploration subagent for searching files, tracing symbols, and reading code.",
+            25,
+        ),
+        (
+            "Plan",
+            "Strictly read-only software architecture planning subagent for designing implementation plans and inspecting module boundaries.",
+            25,
+        ),
+        (
+            "general-purpose",
+            "Autonomous coding and shell subagent in an isolated context window for multi-step implementation tasks.",
+            40,
+        ),
+        (
+            "verification",
+            "Adversarial read-only verification subagent that inspects diffs and runs builds, linters, and tests.",
+            25,
+        ),
+    ];
+
+    let mut out = Vec::new();
+    for (name, desc, turns) in system_defs {
+        let tools = allowed_tools_for_subagent(name, None)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        out.push(SubagentInfo {
+            name: name.to_string(),
+            description: desc.to_string(),
+            is_system: true,
+            tools,
+            disallowed_tools: Vec::new(),
+            model: Some("inherit".to_string()),
+            max_turns: Some(turns),
+            system_prompt: build_subagent_system_prompt(name, workspace_root, None),
+            file_path: String::new(),
+            scope: "system".to_string(),
+        });
+    }
+
+    for (def, file_path, scope) in load_custom_agents_with_meta(workspace_root) {
+        let tools = if def.tools.is_empty() {
+            allowed_tools_for_subagent(&def.name, Some(&def))
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            def.tools.clone()
+        };
+        out.push(SubagentInfo {
+            name: def.name,
+            description: def.description,
+            is_system: false,
+            tools,
+            disallowed_tools: def.disallowed_tools,
+            model: def.model,
+            max_turns: def.max_turns,
+            system_prompt: def.system_prompt,
+            file_path,
+            scope,
+        });
+    }
+    out
+}
+
+pub fn build_custom_subagents_prompt_catalog(workspace_root: &str) -> String {
+    let custom = load_custom_agents(workspace_root);
+    if custom.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("AVAILABLE CUSTOM SUBAGENTS (invoke via `agent(subagent_type=\"<name>\", ...)`):\n");
+    for def in custom {
+        let tools_str = if def.tools.is_empty() {
+            "default".to_string()
+        } else {
+            def.tools.join(", ")
+        };
+        out.push_str(&format!(
+            "- `{}`: {} [tools: {}]\n",
+            def.name,
+            def.description.trim(),
+            tools_str
+        ));
+    }
+    out
+}
+
+pub fn save_custom_subagent(
+    workspace_root: &str,
+    mut def: CustomSubagentDef,
+    scope: &str,
+) -> Result<SubagentInfo, String> {
+    let clean_name = def.name.trim().to_string();
+    if clean_name.is_empty() {
+        return Err("Subagent name must not be empty".to_string());
+    }
+    if !clean_name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("Subagent name may only contain ASCII letters, digits, '-' and '_'".to_string());
+    }
+    if is_system_subagent_name(&clean_name) {
+        return Err(format!("'{}' is a reserved system subagent name", clean_name));
+    }
+    if def.description.trim().is_empty() {
+        return Err("Subagent description must not be empty".to_string());
+    }
+    if def.system_prompt.trim().is_empty() {
+        return Err("Subagent system prompt must not be empty".to_string());
+    }
+
+    def.name = clean_name.clone();
+    def.description = def.description.trim().to_string();
+    def.tools = def
+        .tools
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    def.disallowed_tools = def
+        .disallowed_tools
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    def.model = def
+        .model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    def.max_turns = def.max_turns.map(|t| t.clamp(1, 80));
+
+    let effective_scope = if scope.eq_ignore_ascii_case("global") {
+        "global"
+    } else {
+        "workspace"
+    };
+
+    let target_dir = if effective_scope == "global" {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .map_err(|_| "Cannot resolve user home directory for global subagent".to_string())?;
+        Path::new(&home).join(".omni").join("agents")
+    } else {
+        Path::new(workspace_root).join(".omni").join("agents")
+    };
+    std::fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+
+    let yaml = serde_yaml::to_string(&def).map_err(|e| e.to_string())?;
+    let yaml_clean = yaml.trim_start_matches("---").trim();
+    let content = format!("---
+{}
+---
+
+{}
+", yaml_clean, def.system_prompt.trim());
+    let file_path = target_dir.join(format!("{}.md", clean_name));
+    crate::tools::workspace::atomic_write_bytes(&file_path, content.as_bytes())?;
+
+    Ok(SubagentInfo {
+        name: def.name,
+        description: def.description,
+        is_system: false,
+        tools: def.tools,
+        disallowed_tools: def.disallowed_tools,
+        model: def.model,
+        max_turns: def.max_turns,
+        system_prompt: def.system_prompt,
+        file_path: file_path.to_string_lossy().to_string(),
+        scope: effective_scope.to_string(),
+    })
+}
+
+pub fn delete_custom_subagent(
+    workspace_root: &str,
+    name: &str,
+    file_path: Option<&str>,
+) -> Result<(), String> {
+    if is_system_subagent_name(name) {
+        return Err("Built-in system subagents cannot be deleted".to_string());
+    }
+    let allowed_roots = subagent_search_roots(workspace_root);
+    let mut candidates = Vec::new();
+    if let Some(fp) = file_path.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        candidates.push(std::path::PathBuf::from(fp));
+    }
+    for (root, _) in &allowed_roots {
+        candidates.push(root.join(format!("{}.md", name.trim())));
+    }
+
+    for candidate in candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+        let Ok(canon_target) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        let mut inside_root = false;
+        for (root, _) in &allowed_roots {
+            if let Ok(canon_root) = std::fs::canonicalize(root) {
+                if canon_target.starts_with(&canon_root) && canon_target != canon_root {
+                    inside_root = true;
+                    break;
+                }
+            }
+        }
+        if inside_root && canon_target.extension().and_then(|e| e.to_str()) == Some("md") {
+            std::fs::remove_file(&canon_target).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+
+    Err(format!("Custom subagent '{}' not found", name))
 }
 
 fn map_tool_alias(t: &str) -> &str {

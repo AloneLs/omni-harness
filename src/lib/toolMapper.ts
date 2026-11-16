@@ -92,6 +92,7 @@ const ACTION_NAMES: Record<string, string> = {
   inspect_preview: 'Inspect Preview',
   web_research: 'Web Research',
   explore_subagent: 'Explore Subagent',
+  subagent_builder: 'Subagent Builder',
   task_board: 'Task Board',
   tool_hub: 'Tool Hub',
   computer_use: 'Computer Use'
@@ -130,8 +131,19 @@ export function formatArgPreview(args: any, maxLen = 72): string {
       preview = `query: "${args.query || args.pattern}"`;
     } else if (args.url) {
       preview = String(args.url);
+    } else if (typeof args.raw === 'string') {
+      try {
+        const inner = JSON.parse(args.raw);
+        if (inner && typeof inner === 'object' && (inner.path || inner.file_path)) {
+          preview = String(inner.path || inner.file_path);
+        } else {
+          preview = args.raw.slice(0, maxLen);
+        }
+      } catch {
+        preview = args.raw.replace(/^\s*\{?"?content"?:\s*"?/, '').slice(0, maxLen);
+      }
     } else {
-      const keys = Object.keys(args);
+      const keys = Object.keys(args).filter((k) => k !== 'raw');
       const parts = keys.slice(0, 3).map((k) => {
         const val = typeof args[k] === 'object' ? '{...}' : String(args[k]);
         return `${k}: ${val}`;

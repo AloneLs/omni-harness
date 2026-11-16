@@ -80,12 +80,11 @@ pub fn compute_prompt_cache_key(workspace_root: &str, chat_id: &str) -> String {
 }
 
 pub fn resolve_spill_tmp_dir(workspace_root: &str) -> std::path::PathBuf {
-    let ws = Path::new(workspace_root);
-    if !workspace_root.trim().is_empty() && ws.is_dir() {
-        ws.join(".harness").join("tmp")
-    } else {
-        crate::state::AppState::resolve_chat_temp_dir(None).join("tmp")
-    }
+    crate::state::AppState::resolve_project_data_dir(workspace_root).join("tmp")
+}
+
+pub fn resolve_project_summary_path(workspace_root: &str) -> std::path::PathBuf {
+    crate::state::AppState::resolve_project_data_dir(workspace_root).join("PROJECT_SUMMARY.md")
 }
 
 pub fn cleanup_old_tmp_logs(workspace_root: &str, max_age_hours: u64) {
@@ -140,11 +139,7 @@ pub fn spill_tool_output_with_path(
     let _ = std::fs::create_dir_all(&tmp_dir);
     let log_path = tmp_dir.join(&file_name);
     let _ = std::fs::write(&log_path, raw_output);
-    let rel_display = if !workspace_root.trim().is_empty() && Path::new(workspace_root).is_dir() {
-        format!(".harness/tmp/{}", file_name)
-    } else {
-        log_path.to_string_lossy().to_string()
-    };
+    let rel_display = log_path.to_string_lossy().to_string();
 
     if total_lines <= 10 && raw_output.len() > 24_000 {
         let head = safe_slice_head(raw_output, 2_000);
@@ -188,7 +183,13 @@ pub fn read_project_memory_prefix(workspace_root: &str) -> String {
     let root = Path::new(workspace_root);
     let mut out = String::new();
 
-    let summary_path = root.join(".omniharness").join("PROJECT_SUMMARY.md");
+    let primary_summary = resolve_project_summary_path(workspace_root);
+    let legacy_summary = root.join(".omniharness").join("PROJECT_SUMMARY.md");
+    let summary_path = if primary_summary.is_file() {
+        primary_summary
+    } else {
+        legacy_summary
+    };
     if summary_path.is_file() {
         if let Ok(content) = std::fs::read_to_string(&summary_path) {
             let trimmed = content.trim();
@@ -207,7 +208,7 @@ pub fn read_project_memory_prefix(workspace_root: &str) -> String {
                     .map(|days| format!("\n<system-reminder>PROJECT_SUMMARY.md is {} day(s) old. Verify critical claims against live files if code changed.</system-reminder>", days))
                     .unwrap_or_default();
                 out.push_str(&format!(
-                    "\n--- PROJECT SUMMARY (.omniharness/PROJECT_SUMMARY.md - SOURCE OF TRUTH) ---\n{}{}\n",
+                    "\n--- PROJECT SUMMARY (PROJECT_SUMMARY.md - SOURCE OF TRUTH) ---\n{}{}\n",
                     cap, age_note
                 ));
             }

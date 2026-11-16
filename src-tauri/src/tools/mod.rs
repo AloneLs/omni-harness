@@ -47,6 +47,25 @@ pub struct ToolExecutionResult {
     pub elapsed_ms: u128,
 }
 
+static FILE_LOCKS: std::sync::OnceLock<std::sync::RwLock<std::collections::HashMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>> = std::sync::OnceLock::new();
+
+async fn acquire_file_lock(path: &std::path::Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let map = FILE_LOCKS.get_or_init(|| std::sync::RwLock::new(std::collections::HashMap::new()));
+    if let Ok(r) = map.read() {
+        if let Some(m) = r.get(&key) {
+            return m.clone();
+        }
+    }
+    if let Ok(mut w) = map.write() {
+        return w
+            .entry(key)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+    }
+    std::sync::Arc::new(tokio::sync::Mutex::new(()))
+}
+
 pub struct ToolDispatcher {
     pub pty_manager: process_pty::PtyManager,
     pub cdp_controller: web_browser::CdpController,
@@ -58,10 +77,15 @@ pub struct ToolDispatcher {
 }
 
 impl ToolDispatcher {
-    pub fn new(allowed_roots: Vec<PathBuf>, github_token: Option<String>) -> Self {
+    pub fn new(mut allowed_roots: Vec<PathBuf>, github_token: Option<String>) -> Self {
         let pty_manager = process_pty::PtyManager::new();
         let cdp_controller = web_browser::CdpController::new(9222);
         let github_client = github::GithubClient::new(github_token).ok();
+        let projects_root = crate::state::AppState::resolve_projects_root_dir();
+        let _ = std::fs::create_dir_all(&projects_root);
+        if !allowed_roots.contains(&projects_root) {
+            allowed_roots.push(projects_root);
+        }
 
         Self {
             pty_manager,
@@ -171,7 +195,7 @@ impl ToolDispatcher {
 
         declarations.push(make_decl(
             "project_summary",
-            "Read, write, or append to the project's Markdown source-of-truth summary (.omniharness/PROJECT_SUMMARY.md). Use to persist architecture, key modules, build/test commands, and invariants.",
+            "Read, write, or append to the project's Markdown source-of-truth summary (stored in OmniHarness AppData project store, never inside project dir). Use to persist architecture, key modules, build/test commands, and invariants.",
             &[
                 ("action", "string", "read | write | append"),
                 ("content", "string", "Markdown content (for write or append)"),
@@ -204,7 +228,7 @@ impl ToolDispatcher {
 
         declarations.push(make_decl(
             "fs_ops",
-            "Safe filesystem operations without shell: move, copy, mkdir, or delete (moves to .omniharness/trash).",
+            "Safe filesystem operations without shell: move, copy, mkdir, or delete (moves to OmniHarness AppData trash).",
             &[
                 ("action", "string", "move | copy | mkdir | delete"),
                 ("path", "string", "Target path"),
@@ -308,6 +332,23 @@ impl ToolDispatcher {
         ));
 
         declarations.push(make_decl(
+            "subagent_builder",
+            "List, create, update, or delete custom subagents (.omni/agents/*.md). System subagents (Explore, Plan, general-purpose, verification) are read-only and cannot be deleted.",
+            &[
+                ("action", "string", "list | create | update | delete"),
+                ("name", "string", "Subagent name (ASCII letters, digits, '-' and '_')"),
+                ("description", "string", "Short description of when to invoke this subagent"),
+                ("tools", "array", "Allowed tool names (e.g. read_file, write_file, edit_file, glob, grep, terminal_exec, web_research, code_intel, memory_tool)"),
+                ("disallowed_tools", "array", "Explicitly denied tool names"),
+                ("model", "string", "Optional model ID override or 'inherit'"),
+                ("max_turns", "integer", "Optional turn limit (1-80)"),
+                ("system_prompt", "string", "Full system prompt instructions for the subagent"),
+                ("scope", "string", "workspace | global (default workspace)"),
+            ],
+            &["action"],
+        ));
+
+        declarations.push(make_decl(
             "explore_subagent",
             "Spawn an isolated read-only subagent to explore many files or search the codebase and return a concise summary.",
             &[("prompt", "string", "Exploration objective")],
@@ -388,6 +429,39 @@ impl ToolDispatcher {
         declarations
     }
 
+    fn validate_tool_args(&self, name: &str, args: &Value) -> Result<(), String> {
+        let Some(obj) = args.as_object() else {
+            return Err(format!("Invalid arguments for '{}': expected JSON object.", name));
+        };
+        if obj.contains_key("raw") && obj.len() == 1 {
+            return Err(format!("Invalid arguments for '{}': malformed raw tool call. Pass valid JSON matching the tool schema.", name));
+        }
+        if let Some(decl) = self.get_all_tool_declarations().into_iter().find(|d| d.name == name) {
+            for req_key in &decl.parameters.required {
+                if !obj.contains_key(req_key) || obj.get(req_key).map(|v| v.is_null()).unwrap_or(true) {
+                    return Err(format!("Missing required parameter '{}' for tool '{}'.", req_key, name));
+                }
+            }
+            for (k, v) in obj {
+                if let Some(prop) = decl.parameters.properties.get(k) {
+                    let ok = match prop.prop_type.as_str() {
+                        "string" => v.is_string(),
+                        "integer" => v.is_i64() || v.is_u64(),
+                        "number" => v.is_number(),
+                        "boolean" => v.is_boolean(),
+                        "array" => v.is_array(),
+                        "object" => v.is_object(),
+                        _ => true,
+                    };
+                    if !ok && !v.is_null() {
+                        return Err(format!("Invalid type for parameter '{}' in '{}': expected {}.", k, name, prop.prop_type));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn dispatch_tool(
         &self,
         name: &str,
@@ -396,6 +470,15 @@ impl ToolDispatcher {
         chat_id: Option<&str>,
     ) -> ToolExecutionResult {
         let start = std::time::Instant::now();
+        if let Err(verr) = self.validate_tool_args(name, args) {
+            return ToolExecutionResult {
+                tool_name: name.to_string(),
+                success: false,
+                output: json!({ "error": verr }),
+                error: Some(verr),
+                elapsed_ms: start.elapsed().as_millis(),
+            };
+        }
         let (output, error, success) = match self.execute_internal(name, args, conn, chat_id).await {
             Ok(v) => (v, None, true),
             Err(e) => (Value::Null, Some(e), false),
@@ -460,6 +543,8 @@ impl ToolDispatcher {
                     return Err("Plan Mode: edit_file is disabled in read-only Plan mode.".to_string());
                 }
                 let path = args.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
+                let _file_guard = acquire_file_lock(std::path::Path::new(path)).await;
+                let _lock_held = _file_guard.lock().await;
                 let replace_all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
                 let mut edits: Vec<workspace::EditOp> = Vec::new();
                 if let Some(arr) = args.get("edits").and_then(|v| v.as_array()) {
@@ -498,6 +583,8 @@ impl ToolDispatcher {
                     return Err("Plan Mode: write_file is disabled in read-only Plan mode.".to_string());
                 }
                 let path = args.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
+                let _file_guard = acquire_file_lock(std::path::Path::new(path)).await;
+                let _lock_held = _file_guard.lock().await;
                 let content = args.get("content").and_then(|v| v.as_str()).ok_or("Missing content")?;
                 let overwrite = args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(true);
                 let res = workspace::write_file_atomic(
@@ -588,7 +675,7 @@ impl ToolDispatcher {
             }
             "project_summary" => {
                 let action = args.get("action").and_then(|v| v.as_str()).ok_or("Missing action")?;
-                let summary_path = std::path::Path::new(&ws_root).join(".omniharness").join("PROJECT_SUMMARY.md");
+                let summary_path = crate::engine::context_engine::resolve_project_summary_path(&ws_root);
                 match action {
                     "read" => {
                         if summary_path.is_file() {
@@ -635,6 +722,8 @@ impl ToolDispatcher {
                 match action {
                     "send" => {
                         let path = args.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
+                let _file_guard = acquire_file_lock(std::path::Path::new(path)).await;
+                let _lock_held = _file_guard.lock().await;
                         let resolved = workspace::validate_path(path, &self.allowed_roots)?;
                         safety::SecretShield::check_path(&resolved)?;
                         if !resolved.is_file() {
@@ -1114,6 +1203,56 @@ impl ToolDispatcher {
                         Ok(json!({ "chat_id": target_id, "path": rel, "content": bounded }))
                     }
                     other => Err(format!("Unsupported cross_chat action: {}", other)),
+                }
+            }
+            "subagent_builder" => {
+                let action = args.get("action").and_then(|v| v.as_str()).ok_or("Missing action")?;
+                match action {
+                    "list" => {
+                        let list = crate::engine::subagents::list_all_subagents(&ws_root);
+                        Ok(json!({ "subagents": list }))
+                    }
+                    "create" | "update" => {
+                        if plan_mode {
+                            return Err("Plan Mode: subagent_builder create/update is disabled in read-only Plan mode.".to_string());
+                        }
+                        let name = args.get("name").and_then(|v| v.as_str()).ok_or("Missing name")?.to_string();
+                        let description = args.get("description").and_then(|v| v.as_str()).ok_or("Missing description")?.to_string();
+                        let system_prompt = args.get("system_prompt").and_then(|v| v.as_str()).ok_or("Missing system_prompt")?.to_string();
+                        let tools: Vec<String> = args
+                            .get("tools")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default();
+                        let disallowed_tools: Vec<String> = args
+                            .get("disallowed_tools")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect())
+                            .unwrap_or_default();
+                        let model = args.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        let max_turns = args.get("max_turns").and_then(|v| v.as_u64()).map(|n| n as u32);
+                        let scope = args.get("scope").and_then(|v| v.as_str()).unwrap_or("workspace");
+                        let def = crate::engine::subagents::CustomSubagentDef {
+                            name,
+                            description,
+                            tools,
+                            disallowed_tools,
+                            model,
+                            max_turns,
+                            system_prompt,
+                        };
+                        let saved = crate::engine::subagents::save_custom_subagent(&ws_root, def, scope)?;
+                        Ok(json!({ "status": action, "subagent": saved }))
+                    }
+                    "delete" => {
+                        if plan_mode {
+                            return Err("Plan Mode: subagent_builder delete is disabled in read-only Plan mode.".to_string());
+                        }
+                        let name = args.get("name").and_then(|v| v.as_str()).ok_or("Missing name")?;
+                        crate::engine::subagents::delete_custom_subagent(&ws_root, name, None)?;
+                        Ok(json!({ "status": "deleted", "name": name }))
+                    }
+                    other => Err(format!("Unsupported subagent_builder action: {}", other)),
                 }
             }
             _ => Err(format!("Unknown tool '{}'. Use one of the core tools.", name)),

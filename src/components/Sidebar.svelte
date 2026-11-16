@@ -43,6 +43,10 @@ let hasMoreSessions = $derived(
   chatStore.recentSessions.length > INITIAL_LIMIT
 );
 
+let projectChats = $derived(visibleRecent.filter((c) => Boolean(c.projectPath)));
+let standaloneChats = $derived(visibleRecent.filter((c) => !c.projectPath));
+let orderedRecent = $derived([...projectChats, ...standaloneChats]);
+
 function handleDragMouseDown(e: MouseEvent) {
   if (e.buttons !== 1) return;
   if ((e.target as HTMLElement).closest('button')) return;
@@ -260,19 +264,13 @@ function formatRelativeAge(timestamp: number): string {
         </div>
       {/if}
 
-      {@const projectChats = visibleRecent.filter((c) => Boolean(c.projectPath))}
-      {@const standaloneChats = visibleRecent.filter((c) => !c.projectPath)}
-      {@const orderedRecent = [...projectChats, ...standaloneChats]}
       <div class="space-y-0.5">
         {#each orderedRecent as chat, chatIdx (chat.id)}
-          {#if projectChats.length > 0 && standaloneChats.length > 0 && chatIdx === projectChats.length}
-            <div class="my-2 border-t border-white/[0.07]"></div>
-          {/if}
           <div
             animate:flip={{ duration: 170 }}
             in:pinReceive={{ key: chat.id }}
             out:pinSend={{ key: chat.id }}
-            class="group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[6px] cursor-pointer transition-colors duration-150 {chatStore.activeChatId === chat.id ? 'bg-white/[0.08] text-[#F5F5F7]' : 'text-[#B3B3BA] hover:bg-white/[0.04] hover:text-[#E5E5E8]'}"
+            class="group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[6px] cursor-pointer transition-colors duration-150 {chatStore.activeChatId === chat.id ? 'bg-white/[0.08] text-[#F5F5F7]' : 'text-[#B3B3BA] hover:bg-white/[0.04] hover:text-[#E5E5E8]'} {projectChats.length > 0 && standaloneChats.length > 0 && chatIdx === projectChats.length ? 'border-t border-white/[0.07] pt-2 mt-2' : ''}"
             onclick={() => chatStore.selectSession(chat.id)}
             role="button"
             tabindex="0"

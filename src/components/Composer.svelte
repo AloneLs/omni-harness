@@ -963,7 +963,7 @@ async function stopAndSendVoice() {
             bind:this={mirrorEl}
             aria-hidden="true"
             class="pointer-events-none absolute inset-0 px-1 font-sans text-[13.5px] leading-relaxed whitespace-pre-wrap break-words overflow-hidden"
-          ><span class="font-bold text-[#FFFFFF]">{slashLeadMatch[1]}</span><span class="text-[#E5E5E8]">{slashLeadMatch[2]}</span></div>
+          ><span class="text-[#D8B4FE] bg-[#8B5CF6]/15 rounded-[3px]">{slashLeadMatch[1]}</span><span class="text-[#E5E5E8]">{slashLeadMatch[2]}</span></div>
         {/if}
         <textarea
           bind:this={textareaEl}
