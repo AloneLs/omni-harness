@@ -25,6 +25,26 @@ pub async fn stream_openai_codex(
     .await
 }
 
+pub async fn stream_xai_oauth(
+    client: &reqwest::Client,
+    caps_registry: &CapabilityRegistry,
+    request: ChatRequest,
+    sender: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> Result<(), LlmError> {
+    let empty_pool = KeyPool::new();
+    stream_openai_responses_inner(
+        client,
+        "https://cli-chat-proxy.grok.com/v1/responses",
+        &empty_pool,
+        "xai_oauth",
+        caps_registry,
+        request,
+        sender,
+        true,
+    )
+    .await
+}
+
 pub async fn stream_openai_responses(
     client: &reqwest::Client,
     base_url: &str,
@@ -70,7 +90,7 @@ async fn stream_openai_responses_inner(
     let mut last_oauth_err: Option<LlmError> = None;
     for attempt in 1..=max_attempts {
         let (api_key, oauth_acc) = if use_codex_oauth {
-            let acc = match crate::llm::oauth_accounts::acquire_valid_account(client, "openai_codex", &excluded_oauth).await {
+            let acc = match crate::llm::oauth_accounts::acquire_valid_account(client, provider_name, &excluded_oauth).await {
                 Ok(a) => a,
                 Err(e) => return Err(last_oauth_err.unwrap_or(LlmError::ProviderError { status: 401, message: e })),
             };
@@ -81,22 +101,96 @@ async fn stream_openai_responses_inner(
         let caps = caps_registry.get(&request.model);
         normalize_request(&mut request, &caps);
 
-        let input_items: Vec<serde_json::Value> = request
-            .messages
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "role": m.role,
-                    "content": m.content.as_text_lossy(),
-                })
-            })
-            .collect();
+        let mut system_instructions = Vec::new();
+        let mut input_items: Vec<serde_json::Value> = Vec::new();
+        for m in &request.messages {
+            if m.role == "system" {
+                let txt = m.content.as_text_lossy();
+                if !txt.trim().is_empty() {
+                    system_instructions.push(txt);
+                }
+            } else if m.role == "tool" {
+                let cid = m.tool_call_id.clone().unwrap_or_default();
+                input_items.push(serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": cid,
+                    "output": m.content.as_text_lossy(),
+                }));
+            } else if m.role == "assistant" {
+                let txt = m.content.as_text_lossy();
+                if !txt.is_empty() {
+                    input_items.push(serde_json::json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": txt,
+                        }],
+                    }));
+                }
+                if let Some(ref tcs) = m.tool_calls {
+                    for tc in tcs {
+                        input_items.push(serde_json::json!({
+                            "type": "function_call",
+                            "call_id": tc.id,
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }));
+                    }
+                }
+            } else {
+                let mut content_parts: Vec<serde_json::Value> = Vec::new();
+                match &m.content {
+                    crate::llm::request_compat::MessageContent::Text(t) => {
+                        if !t.is_empty() {
+                            content_parts.push(serde_json::json!({
+                                "type": "input_text",
+                                "text": t,
+                            }));
+                        }
+                    }
+                    crate::llm::request_compat::MessageContent::Parts(parts) => {
+                        for part in parts {
+                            match part {
+                                crate::llm::request_compat::ContentPart::Text { text } => {
+                                    content_parts.push(serde_json::json!({
+                                        "type": "input_text",
+                                        "text": text,
+                                    }));
+                                }
+                                crate::llm::request_compat::ContentPart::ImageUrl { image_url } => {
+                                    content_parts.push(serde_json::json!({
+                                        "type": "input_image",
+                                        "image_url": image_url.url,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                if !content_parts.is_empty() {
+                    input_items.push(serde_json::json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": content_parts,
+                    }));
+                }
+            }
+        }
 
         let mut payload = serde_json::json!({
             "model": request.model,
             "input": input_items,
             "stream": true,
         });
+        let instr_joined = system_instructions.join("
+
+");
+        if !instr_joined.is_empty() {
+            payload["instructions"] = serde_json::json!(instr_joined);
+        } else if use_codex_oauth && provider_name == "openai_codex" {
+            payload["instructions"] = serde_json::json!("You are a helpful assistant.");
+        }
 
         if let Some(ref re) = request.reasoning_effort {
             payload["reasoning"] = serde_json::json!({ "effort": re });
@@ -122,7 +216,7 @@ async fn stream_openai_responses_inner(
             payload["tools"] = serde_json::json!(mapped_tools);
         }
 
-        if use_codex_oauth {
+        if use_codex_oauth && provider_name == "openai_codex" {
             payload["store"] = serde_json::json!(false);
         }
         let mut req_builder = client
@@ -235,8 +329,8 @@ async fn stream_openai_responses_inner(
                                         let item_type = item.get("type").and_then(|v| v.as_str());
                                         if item_type == Some("function_call") {
                                             let call_id = item
-                                                .get("id")
-                                                .or_else(|| item.get("call_id"))
+                                                .get("call_id")
+                                                .or_else(|| item.get("id"))
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or("")
                                                 .to_string();
@@ -290,8 +384,8 @@ async fn stream_openai_responses_inner(
                                         let item_type = item.get("type").and_then(|v| v.as_str());
                                         if item_type == Some("function_call") {
                                             let call_id = item
-                                                .get("id")
-                                                .or_else(|| item.get("call_id"))
+                                                .get("call_id")
+                                                .or_else(|| item.get("id"))
                                                 .and_then(|v| v.as_str())
                                                 .unwrap_or("");
                                             let fn_name = item
@@ -419,6 +513,9 @@ async fn stream_openai_responses_inner(
         let code = status.as_u16();
         if let Some(ref acc) = oauth_acc {
             let cd = if code == 429 { 120 } else { 30 };
+            if code == 429 {
+                crate::llm::oauth_accounts::mark_account_quota_exhausted(&acc.id, Some(0.0), None).await;
+            }
             crate::llm::oauth_accounts::mark_account_cooldown(&acc.id, cd, &error_body).await;
             excluded_oauth.insert(acc.id.clone());
             last_oauth_err = Some(LlmError::ProviderError { status: code, message: error_body.clone() });

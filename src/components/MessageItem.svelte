@@ -389,7 +389,7 @@ function handleContainerClick(event: MouseEvent) {
       {/if}
     </div>
   {:else}
-    <div class="w-full space-y-2">
+    <div data-omni-message="assistant" class="w-full space-y-2">
       {#if message.streaming || message.paused || message.error || message.reasoningContent || (message.toolCalls && message.toolCalls.length > 0) || (message.steps && message.steps.length > 0) || (message.todos && message.todos.length > 0)}
         <TimelineBlock
           steps={splitPipeline.timelineSteps}

@@ -1,4 +1,5 @@
 <script lang="ts">
+import { themeStore } from '../lib/stores/theme.svelte';
 export type IconName =
   | 'plus-circle'
   | 'search'
@@ -34,9 +35,14 @@ let {
   filled?: boolean;
   strokeWidth?: number;
 } = $props();
+let overrideSvg = $derived(themeStore.resolveIconOverride(name));
 </script>
 
+{#if overrideSvg && overrideSvg.startsWith('<svg')}
+  <span class="inline-flex items-center justify-center {className}" data-omni-icon={name}>{@html overrideSvg}</span>
+{:else}
 <svg
+  data-omni-icon={name}
   class={className}
   viewBox="0 0 24 24"
   fill={filled ? 'currentColor' : 'none'}
@@ -46,7 +52,9 @@ let {
   stroke-linejoin="round"
   aria-hidden="true"
 >
-  {#if name === 'plus-circle'}
+  {#if overrideSvg}
+    <path d={overrideSvg}></path>
+  {:else if name === 'plus-circle'}
     <circle cx="12" cy="12" r="9"></circle>
     <line x1="12" y1="8.5" x2="12" y2="15.5"></line>
     <line x1="8.5" y1="12" x2="15.5" y2="12"></line>
@@ -111,3 +119,5 @@ let {
     <polyline points="20 6 9 17 4 12"></polyline>
   {/if}
 </svg>
+
+{/if}

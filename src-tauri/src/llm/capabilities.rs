@@ -76,7 +76,11 @@ impl ModelCapabilities {
             return Self {
                 model_id: model_name.to_string(),
                 family: ModelFamily::OpenAi,
-                context_window: if short.contains("gpt-6") || short.contains("gpt-5.6") {
+                context_window: if short.contains("gpt-6.1-sol") || short.contains("gpt-6-astra") || short.contains("gpt-6-sol") {
+                    524_288
+                } else if short.contains("gpt-6-luna") || short.contains("gpt-6-chat") {
+                    272_000
+                } else if short.contains("gpt-6") || short.contains("gpt-5.6") {
                     400_000
                 } else {
                     200_000
@@ -239,11 +243,12 @@ impl ModelCapabilities {
 
         if short.contains("grok") {
             let is_reasoning = short.contains("grok-4") || short.contains("mini") || short.contains("reason");
+            let is_grok_45_plus = short.contains("grok-4.5") || short.contains("grok-4.6") || short.contains("grok-4.7");
             return Self {
                 model_id: model_name.to_string(),
                 family: ModelFamily::Custom,
-                context_window: 256_000,
-                max_output_tokens: 32_768,
+                context_window: if is_grok_45_plus { 500_000 } else { 256_000 },
+                max_output_tokens: if short.contains("grok-4.7") { 128_000 } else if is_grok_45_plus { 65_536 } else { 32_768 },
                 supports_reasoning: is_reasoning,
                 reasoning_type: if is_reasoning {
                     ReasoningType::OpenAiEffort
@@ -263,8 +268,8 @@ impl ModelCapabilities {
             return Self {
                 model_id: model_name.to_string(),
                 family: ModelFamily::Custom,
-                context_window: 256_000,
-                max_output_tokens: 32_768,
+                context_window: if short.contains("k3") && !short.contains("256k") { 1_000_000 } else { 262_144 },
+                max_output_tokens: if short.contains("k2.6") || short.contains("k2.7") || short.contains("k2.8") || short.contains("k3") { 65_536 } else { 32_768 },
                 supports_reasoning: is_reasoning,
                 reasoning_type: if is_reasoning {
                     ReasoningType::DeepSeekThinking
@@ -334,6 +339,27 @@ impl ModelCapabilities {
                 supports_reasoning: short.contains("reason") || short.contains("think"),
                 reasoning_type: ReasoningType::DeepSeekThinking,
                 supports_tools: true,
+                supports_vision: true,
+                supports_response_format: true,
+                supports_temperature: true,
+                use_max_completion_tokens: false,
+            };
+        }
+
+        if short.contains("sonar") {
+            let is_reasoning = short.contains("reason") || short.contains("deep-research");
+            return Self {
+                model_id: model_name.to_string(),
+                family: ModelFamily::Custom,
+                context_window: if short.contains("pro") || short.contains("deep-research") { 200_000 } else { 128_000 },
+                max_output_tokens: 16_384,
+                supports_reasoning: is_reasoning,
+                reasoning_type: if is_reasoning {
+                    ReasoningType::OpenAiEffort
+                } else {
+                    ReasoningType::None
+                },
+                supports_tools: false,
                 supports_vision: true,
                 supports_response_format: true,
                 supports_temperature: true,
@@ -511,4 +537,40 @@ impl CapabilityRegistry {
         }
     }
 
+    pub fn update_full_model_caps(
+        &self,
+        model_id: &str,
+        context_window: Option<u32>,
+        max_output_tokens: Option<u32>,
+        supports_reasoning: Option<bool>,
+        supports_vision: Option<bool>,
+        supports_tools: Option<bool>,
+    ) {
+        let mut caps = self.get(model_id);
+        if let Some(cw) = context_window {
+            if cw > 0 {
+                caps.context_window = cw;
+            }
+        }
+        if let Some(mo) = max_output_tokens {
+            if mo > 0 {
+                caps.max_output_tokens = mo;
+            }
+        }
+        if let Some(sr) = supports_reasoning {
+            caps.supports_reasoning = sr;
+            if !sr {
+                caps.reasoning_type = ReasoningType::None;
+            }
+        }
+        if let Some(sv) = supports_vision {
+            caps.supports_vision = sv;
+        }
+        if let Some(st) = supports_tools {
+            caps.supports_tools = st;
+        }
+        if let Ok(mut map) = self.entries.write() {
+            map.insert(model_id.to_string(), caps);
+        }
+    }
 }

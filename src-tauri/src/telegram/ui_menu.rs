@@ -289,6 +289,31 @@ impl TelegramMenuBuilder {
         }
     }
 
+    pub fn history_menu(page: usize, page_count: usize) -> InlineKeyboardMarkup {
+        let mut rows = Vec::new();
+        if page_count > 1 {
+            let mut nav = Vec::new();
+            if page > 0 {
+                nav.push(InlineKeyboardButton::callback("◀", format!("tg:hist:page:{}", page - 1)));
+            } else {
+                nav.push(InlineKeyboardButton::callback("·", "tg:hist:noop"));
+            }
+            nav.push(InlineKeyboardButton::callback(format!("{}/{}", page + 1, page_count), "tg:hist:noop"));
+            if page + 1 < page_count {
+                nav.push(InlineKeyboardButton::callback("▶", format!("tg:hist:page:{}", page + 1)));
+            } else {
+                nav.push(InlineKeyboardButton::callback("·", "tg:hist:noop"));
+            }
+            rows.push(nav);
+        }
+        rows.push(vec![
+            InlineKeyboardButton::callback("📋 Сессия", "tg:cmd:status"),
+            InlineKeyboardButton::callback("💬 Все чаты", "tg:cmd:chats"),
+            InlineKeyboardButton::callback("⬅️ Меню", "tg:cmd:menu"),
+        ]);
+        InlineKeyboardMarkup { inline_keyboard: rows }
+    }
+
     pub fn back_menu() -> InlineKeyboardMarkup {
         InlineKeyboardMarkup {
             inline_keyboard: vec![vec![InlineKeyboardButton::callback("⬅️ Меню", "tg:cmd:menu")]],

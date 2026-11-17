@@ -188,6 +188,18 @@ pub async fn dispatch_stream_with_protocol(
     if proto == "claude_oauth" {
         return anthropic::stream_anthropic_oauth(client, caps_registry, request, sender).await;
     }
+    if proto == "kimi_oauth" {
+        return anthropic::stream_kimi_oauth(client, caps_registry, request, sender).await;
+    }
+    if proto == "xai_oauth" {
+        return openai_responses::stream_xai_oauth(client, caps_registry, request, sender).await;
+    }
+    if proto == "zcode_oauth" {
+        return anthropic::stream_zcode_oauth(client, caps_registry, request, sender).await;
+    }
+    if proto == "perplexity_oauth" {
+        return openai_chat::stream_perplexity_oauth(client, caps_registry, request, sender).await;
+    }
 
     let use_google = match proto.as_str() {
         "google_gemini" | "gemini" => true,

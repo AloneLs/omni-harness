@@ -5,6 +5,7 @@ import { flip } from 'svelte/animate';
 import { invoke } from '@tauri-apps/api/core';
 import { Spring } from 'svelte/motion';
 import Icon from './Icon.svelte';
+import { themeStore } from '../lib/stores/theme.svelte';
 import { chatStore } from '../lib/stores/chat.svelte';
 import { workspaceStore } from '../lib/stores/workspace.svelte';
 import { settingsStore } from '../lib/stores/settings.svelte';
@@ -100,7 +101,7 @@ function formatRelativeAge(timestamp: number): string {
 }
 </script>
 
-<aside class="w-[240px] h-full bg-[#171719] border-r border-white/[0.06] flex flex-col select-none shrink-0 overflow-hidden">
+<aside data-omni-sidebar="" class="w-[240px] h-full bg-[#171719] border-r border-white/[0.06] flex flex-col select-none shrink-0 overflow-hidden">
   <div
     data-tauri-drag-region
     role="presentation"
@@ -135,7 +136,7 @@ function formatRelativeAge(timestamp: number): string {
 
   <div class="px-4 pt-3.5 pb-2 flex items-center justify-between shrink-0">
     <span class="text-[12px] font-sans font-medium text-[#A3A3AA]">
-      {chatStore.showArchived ? 'Archived' : 'Task list'}
+      {chatStore.showArchived ? 'Archived' : themeStore.t('task_list', 'Task list')}
     </span>
     <div class="flex items-center gap-1 shrink-0">
       <button

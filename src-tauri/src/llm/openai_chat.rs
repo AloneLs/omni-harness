@@ -519,3 +519,28 @@ pub async fn stream_openai_chat(
         message: "Maximum retries exceeded".to_string(),
     })
 }
+
+
+pub async fn stream_perplexity_oauth(
+    client: &reqwest::Client,
+    caps_registry: &CapabilityRegistry,
+    request: ChatRequest,
+    sender: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> Result<(), LlmError> {
+    let excluded = std::collections::HashSet::new();
+    let acc = crate::llm::oauth_accounts::acquire_valid_account(client, "perplexity_oauth", &excluded)
+        .await
+        .map_err(|e| LlmError::ProviderError { status: 401, message: e })?;
+    let pool = KeyPool::new();
+    pool.set_keys("perplexity_oauth", vec![acc.access_token]);
+    stream_openai_chat(
+        client,
+        "https://api.perplexity.ai",
+        &pool,
+        "perplexity_oauth",
+        caps_registry,
+        request,
+        sender,
+    )
+    .await
+}

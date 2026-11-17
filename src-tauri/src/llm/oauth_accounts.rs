@@ -7,31 +7,32 @@ use tauri::Emitter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-static ANTIGRAVITY_ID: OnceLock<String> = OnceLock::new();
-static ANTIGRAVITY_SECRET: OnceLock<String> = OnceLock::new();
-
-pub fn get_antigravity_client_id() -> &'static str {
-    ANTIGRAVITY_ID.get_or_init(|| {
-        const B: [u8; 73] = [
-            107, 106, 109, 107, 106, 106, 108, 106, 108, 106, 111, 99, 107, 119, 46, 55, 50, 41,
-            41, 51, 52, 104, 50, 104, 107, 54, 57, 40, 63, 104, 105, 111, 44, 46, 53, 54, 53, 48,
-            50, 110, 61, 110, 106, 105, 63, 42, 116, 59, 42, 42, 41, 116, 61, 53, 53, 61, 54, 63,
-            47, 41, 63, 40, 57, 53, 52, 46, 63, 52, 46, 116, 57, 53, 55,
-        ];
-        B.iter().map(|b| (b ^ 0x5A) as char).collect()
-    })
+const fn xor_deobf<const N: usize>(encoded: [u8; N]) -> [u8; N] {
+    let mut out = [0u8; N];
+    let mut i = 0usize;
+    while i < N {
+        out[i] = encoded[i] ^ 0x5A;
+        i += 1;
+    }
+    out
 }
 
-pub fn get_antigravity_client_secret() -> &'static str {
-    ANTIGRAVITY_SECRET.get_or_init(|| {
-        const B: [u8; 35] = [
-            29, 21, 25, 9, 10, 2, 119, 17, 111, 98, 28, 13, 8, 110, 98, 108, 22, 62, 22, 16, 107,
-            55, 22, 24, 98, 41, 2, 25, 110, 32, 108, 43, 30, 27, 60,
-        ];
-        B.iter().map(|b| (b ^ 0x5A) as char).collect()
-    })
-}
+const ANTIGRAVITY_CLIENT_ID_BYTES: [u8; 73] = xor_deobf([
+    107, 106, 109, 107, 106, 106, 108, 106, 108, 106, 111, 99, 107, 119, 46, 55, 50, 41,
+    41, 51, 52, 104, 50, 104, 107, 54, 57, 40, 63, 104, 105, 111, 44, 46, 53, 54, 53, 48,
+    50, 110, 61, 110, 106, 105, 63, 42, 116, 59, 42, 42, 41, 116, 61, 53, 53, 61, 54, 63,
+    47, 41, 63, 40, 57, 53, 52, 46, 63, 52, 46, 116, 57, 53, 55,
+]);
 
+const ANTIGRAVITY_CLIENT_SECRET_BYTES: [u8; 35] = xor_deobf([
+    29, 21, 25, 9, 10, 2, 119, 17, 111, 98, 28, 13, 8, 110, 98, 108, 22, 62, 22, 16, 107,
+    55, 22, 24, 98, 41, 2, 25, 110, 32, 108, 43, 30, 27, 60,
+]);
+
+pub const ANTIGRAVITY_CLIENT_ID: &str =
+    unsafe { std::str::from_utf8_unchecked(&ANTIGRAVITY_CLIENT_ID_BYTES) };
+pub const ANTIGRAVITY_CLIENT_SECRET: &str =
+    unsafe { std::str::from_utf8_unchecked(&ANTIGRAVITY_CLIENT_SECRET_BYTES) };
 pub const ANTIGRAVITY_REDIRECT_URI: &str = "http://localhost:51121/oauth-callback";
 
 pub const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -39,6 +40,11 @@ pub const OPENAI_CODEX_REDIRECT_URI: &str = "http://localhost:1455/auth/callback
 
 pub const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 pub const CLAUDE_OAUTH_REDIRECT_URI: &str = "http://localhost:54545/callback";
+
+pub const KIMI_CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
+pub const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+pub const XAI_SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
+pub const ZCODE_CLIENT_ID: &str = "client_P8X5CMWmlaRO9gyO-KSqtg";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +67,18 @@ pub struct OAuthAccount {
     pub last_error: Option<String>,
     #[serde(default)]
     pub last_used_ms: i64,
+    #[serde(default)]
+    pub quota_5h_remaining: Option<f64>,
+    #[serde(default)]
+    pub quota_5h_reset_at_ms: Option<i64>,
+    #[serde(default)]
+    pub quota_weekly_remaining: Option<f64>,
+    #[serde(default)]
+    pub quota_weekly_reset_at_ms: Option<i64>,
+    #[serde(default)]
+    pub quota_label: Option<String>,
+    #[serde(default)]
+    pub quota_updated_at_ms: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -79,6 +97,12 @@ pub struct OAuthAccountPublic {
     pub expires_at_ms: i64,
     pub cooldown_until_ms: Option<i64>,
     pub last_error: Option<String>,
+    pub quota_5h_remaining: Option<f64>,
+    pub quota_5h_reset_at_ms: Option<i64>,
+    pub quota_weekly_remaining: Option<f64>,
+    pub quota_weekly_reset_at_ms: Option<i64>,
+    pub quota_label: Option<String>,
+    pub quota_updated_at_ms: Option<i64>,
 }
 
 impl From<&OAuthAccount> for OAuthAccountPublic {
@@ -93,8 +117,54 @@ impl From<&OAuthAccount> for OAuthAccountPublic {
             expires_at_ms: a.expires_at_ms,
             cooldown_until_ms: a.cooldown_until_ms,
             last_error: a.last_error.clone(),
+            quota_5h_remaining: a.quota_5h_remaining,
+            quota_5h_reset_at_ms: a.quota_5h_reset_at_ms,
+            quota_weekly_remaining: a.quota_weekly_remaining,
+            quota_weekly_reset_at_ms: a.quota_weekly_reset_at_ms,
+            quota_label: a.quota_label.clone(),
+            quota_updated_at_ms: a.quota_updated_at_ms,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OAuthProxyConfig {
+    pub enabled: bool,
+    pub url: String,
+}
+
+fn oauth_proxy_file_path() -> PathBuf {
+    crate::state::AppState::resolve_data_dir().join("oauth_proxy.json")
+}
+
+pub fn load_oauth_proxy() -> OAuthProxyConfig {
+    let p = oauth_proxy_file_path();
+    if let Ok(raw) = std::fs::read_to_string(&p) {
+        if let Ok(cfg) = serde_json::from_str::<OAuthProxyConfig>(&raw) {
+            return cfg;
+        }
+    }
+    OAuthProxyConfig::default()
+}
+
+pub fn save_oauth_proxy(cfg: OAuthProxyConfig) -> Result<(), String> {
+    let p = oauth_proxy_file_path();
+    let json = serde_json::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    crate::tools::workspace::atomic_write_bytes(&p, json.as_bytes())
+}
+
+pub fn resolve_oauth_proxy(proxy_enabled: Option<bool>, proxy_url: Option<&str>) -> (Option<bool>, Option<String>) {
+    if proxy_enabled == Some(true) {
+        if let Some(u) = proxy_url.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            return (Some(true), Some(u.to_string()));
+        }
+    }
+    let saved = load_oauth_proxy();
+    if saved.enabled && !saved.url.trim().is_empty() {
+        return (Some(true), Some(saved.url.trim().to_string()));
+    }
+    (proxy_enabled, proxy_url.map(|s| s.to_string()))
 }
 
 #[derive(Debug, Clone)]
@@ -344,6 +414,56 @@ pub async fn mark_account_cooldown(id: &str, cooldown_secs: u64, reason: &str) {
     }
 }
 
+pub async fn mark_account_quota_exhausted(id: &str, q5h: Option<f64>, q7d: Option<f64>) {
+    let _guard = store_lock().lock().await;
+    let mut list = read_accounts_unlocked();
+    if let Some(a) = list.iter_mut().find(|x| x.id == id) {
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(v) = q5h {
+            a.quota_5h_remaining = Some(v.clamp(0.0, 100.0));
+            if a.quota_5h_reset_at_ms.map(|r| r <= now).unwrap_or(true) {
+                a.quota_5h_reset_at_ms = Some(now + 5 * 3600 * 1000);
+            }
+        }
+        if let Some(v) = q7d {
+            a.quota_weekly_remaining = Some(v.clamp(0.0, 100.0));
+            if a.quota_weekly_reset_at_ms.map(|r| r <= now).unwrap_or(true) {
+                a.quota_weekly_reset_at_ms = Some(now + 7 * 24 * 3600 * 1000);
+            }
+        }
+        a.quota_updated_at_ms = Some(now);
+        let _ = write_accounts_unlocked(&list);
+    }
+}
+
+pub async fn update_account_quota_partial(
+    id: &str,
+    q5h: Option<f64>,
+    r5h_ms: Option<i64>,
+    q7d: Option<f64>,
+    r7d_ms: Option<i64>,
+) {
+    let _guard = store_lock().lock().await;
+    let mut list = read_accounts_unlocked();
+    if let Some(a) = list.iter_mut().find(|x| x.id == id) {
+        let now = chrono::Utc::now().timestamp_millis();
+        if let Some(v) = q5h {
+            a.quota_5h_remaining = Some(v.clamp(0.0, 100.0));
+        }
+        if let Some(r) = r5h_ms {
+            a.quota_5h_reset_at_ms = Some(r);
+        }
+        if let Some(v) = q7d {
+            a.quota_weekly_remaining = Some(v.clamp(0.0, 100.0));
+        }
+        if let Some(r) = r7d_ms {
+            a.quota_weekly_reset_at_ms = Some(r);
+        }
+        a.quota_updated_at_ms = Some(now);
+        let _ = write_accounts_unlocked(&list);
+    }
+}
+
 async fn refresh_account_tokens(client: &reqwest::Client, acc: &mut OAuthAccount) -> Result<(), String> {
     if acc.refresh_token.trim().is_empty() {
         return Err("Missing refresh_token".to_string());
@@ -352,8 +472,8 @@ async fn refresh_account_tokens(client: &reqwest::Client, acc: &mut OAuthAccount
     match acc.provider.as_str() {
         "antigravity" => {
             let params = [
-                ("client_id", get_antigravity_client_id()),
-                ("client_secret", get_antigravity_client_secret()),
+                ("client_id", ANTIGRAVITY_CLIENT_ID),
+                ("client_secret", ANTIGRAVITY_CLIENT_SECRET),
                 ("grant_type", "refresh_token"),
                 ("refresh_token", acc.refresh_token.as_str()),
             ];
@@ -441,8 +561,100 @@ async fn refresh_account_tokens(client: &reqwest::Client, acc: &mut OAuthAccount
             acc.last_error = None;
             Ok(())
         }
+        "kimi_oauth" => {
+            let params = [
+                ("client_id", KIMI_CLIENT_ID),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", acc.refresh_token.as_str()),
+            ];
+            let host = if acc.account_id.as_deref() == Some("kimi.ai") {
+                "https://auth.kimi.ai"
+            } else {
+                "https://auth.kimi.com"
+            };
+            let resp = client
+                .post(format!("{}/api/oauth/token", host))
+                .header("X-Msh-Platform", "kimi_cli")
+                .header("X-Msh-Version", "1.0.0")
+                .header("X-Msh-Device-Id", machine_session_id())
+                .form(&params)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("Kimi refresh failed ({}): {}", status, txt));
+            }
+            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let at = data.get("access_token").and_then(|v| v.as_str()).ok_or("No access_token")?;
+            let exp_in = data.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
+            acc.access_token = at.to_string();
+            if let Some(rt) = data.get("refresh_token").and_then(|v| v.as_str()) {
+                if !rt.is_empty() {
+                    acc.refresh_token = rt.to_string();
+                }
+            }
+            acc.expires_at_ms = now + exp_in * 1000 - 60_000;
+            acc.last_error = None;
+            Ok(())
+        }
+        "xai_oauth" => {
+            let token_ep = client
+                .get("https://auth.x.ai/.well-known/openid-configuration")
+                .send()
+                .await
+                .ok()
+                .and_then(|_| None::<String>)
+                .unwrap_or_else(|| "https://auth.x.ai/oauth/token".to_string());
+            let mut resolved_ep = token_ep;
+            if let Ok(disc_resp) = client.get("https://auth.x.ai/.well-known/openid-configuration").send().await {
+                if let Ok(disc) = disc_resp.json::<serde_json::Value>().await {
+                    if let Some(ep) = disc.get("token_endpoint").and_then(|v| v.as_str()) {
+                        resolved_ep = ep.to_string();
+                    }
+                }
+            }
+            let params = [
+                ("client_id", XAI_CLIENT_ID),
+                ("grant_type", "refresh_token"),
+                ("refresh_token", acc.refresh_token.as_str()),
+            ];
+            let resp = client
+                .post(&resolved_ep)
+                .form(&params)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("xAI refresh failed ({}): {}", status, txt));
+            }
+            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let at = data.get("access_token").and_then(|v| v.as_str()).ok_or("No access_token")?;
+            let exp_in = data.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
+            acc.access_token = at.to_string();
+            if let Some(rt) = data.get("refresh_token").and_then(|v| v.as_str()) {
+                if !rt.is_empty() {
+                    acc.refresh_token = rt.to_string();
+                }
+            }
+            acc.expires_at_ms = now + exp_in * 1000 - 60_000;
+            acc.last_error = None;
+            Ok(())
+        }
+        "zcode_oauth" | "perplexity_oauth" => Ok(()),
         other => Err(format!("Unsupported OAuth provider: {}", other)),
     }
+}
+
+fn is_quota_exhausted_for_now(a: &OAuthAccount, now: i64) -> bool {
+    let q5_dead = matches!(a.quota_5h_remaining, Some(v) if v <= 0.01)
+        && a.quota_5h_reset_at_ms.map(|r| r > now).unwrap_or(true);
+    let q7_dead = matches!(a.quota_weekly_remaining, Some(v) if v <= 0.01)
+        && a.quota_weekly_reset_at_ms.map(|r| r > now).unwrap_or(true);
+    q5_dead || q7_dead
 }
 
 pub async fn acquire_valid_account(
@@ -454,6 +666,39 @@ pub async fn acquire_valid_account(
     let mut list = read_accounts_unlocked();
     let now = chrono::Utc::now().timestamp_millis();
 
+    for a in list.iter_mut() {
+        if a.provider == provider {
+            if let Some(r5) = a.quota_5h_reset_at_ms {
+                if r5 <= now && matches!(a.quota_5h_remaining, Some(v) if v <= 0.01) {
+                    a.quota_5h_remaining = None;
+                    a.quota_5h_reset_at_ms = None;
+                }
+            }
+            if let Some(r7) = a.quota_weekly_reset_at_ms {
+                if r7 <= now && matches!(a.quota_weekly_remaining, Some(v) if v <= 0.01) {
+                    a.quota_weekly_remaining = None;
+                    a.quota_weekly_reset_at_ms = None;
+                }
+            }
+        }
+    }
+
+    let total_for_provider = list.iter().filter(|a| a.provider == provider).count();
+    if total_for_provider == 0 {
+        return Err(format!(
+            "No OAuth accounts configured for '{}'. Connect an account in Settings -> Models & Providers.",
+            provider
+        ));
+    }
+
+    let enabled_for_provider = list.iter().filter(|a| a.provider == provider && a.enabled).count();
+    if enabled_for_provider == 0 {
+        return Err(format!(
+            "All {} OAuth account(s) for '{}' are currently disabled.",
+            total_for_provider, provider
+        ));
+    }
+
     let mut candidates: Vec<usize> = list
         .iter()
         .enumerate()
@@ -462,31 +707,43 @@ pub async fn acquire_valid_account(
                 && a.enabled
                 && !excluded_ids.contains(&a.id)
                 && a.cooldown_until_ms.map(|c| c <= now).unwrap_or(true)
+                && !is_quota_exhausted_for_now(a, now)
         })
         .map(|(i, _)| i)
         .collect();
 
     if candidates.is_empty() {
-        let any_enabled = list.iter().any(|a| a.provider == provider && a.enabled && !excluded_ids.contains(&a.id));
-        if any_enabled {
-            candidates = list
-                .iter()
-                .enumerate()
-                .filter(|(_, a)| a.provider == provider && a.enabled && !excluded_ids.contains(&a.id))
-                .map(|(i, _)| i)
-                .collect();
-        }
+        candidates = list
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| {
+                a.provider == provider
+                    && a.enabled
+                    && !excluded_ids.contains(&a.id)
+                    && !is_quota_exhausted_for_now(a, now)
+            })
+            .map(|(i, _)| i)
+            .collect();
     }
 
     if candidates.is_empty() {
-        return Err(format!("No active OAuth accounts configured for '{}'. Connect an account in Settings -> Models & Providers.", provider));
+        let last_msg = list
+            .iter()
+            .filter(|a| a.provider == provider && a.enabled)
+            .find_map(|a| a.last_error.clone());
+        return Err(last_msg.unwrap_or_else(|| {
+            format!(
+                "All active OAuth accounts for '{}' are rate-limited, quota-exhausted, or failed during this request.",
+                provider
+            )
+        }));
     }
 
     candidates.sort_by_key(|&idx| list[idx].last_used_ms);
     let chosen_idx = candidates[0];
     let mut chosen = list[chosen_idx].clone();
 
-    if chosen.access_token.is_empty() || chosen.expires_at_ms <= now {
+    if chosen.access_token.is_empty() || (chosen.expires_at_ms > 0 && chosen.expires_at_ms <= now) {
         if let Err(e) = refresh_account_tokens(client, &mut chosen).await {
             list[chosen_idx].last_error = Some(e.clone());
             list[chosen_idx].cooldown_until_ms = Some(now + 120_000);
@@ -523,8 +780,8 @@ async fn exchange_code_for_account(
     match flow.provider.as_str() {
         "antigravity" => {
             let params = [
-                ("client_id", get_antigravity_client_id()),
-                ("client_secret", get_antigravity_client_secret()),
+                ("client_id", ANTIGRAVITY_CLIENT_ID),
+                ("client_secret", ANTIGRAVITY_CLIENT_SECRET),
                 ("code", code),
                 ("grant_type", "authorization_code"),
                 ("redirect_uri", flow.redirect_uri.as_str()),
@@ -574,6 +831,12 @@ async fn exchange_code_for_account(
                 cooldown_until_ms: None,
                 last_error: None,
                 last_used_ms: 0,
+                quota_5h_remaining: None,
+                quota_5h_reset_at_ms: None,
+                quota_weekly_remaining: None,
+                quota_weekly_reset_at_ms: None,
+                quota_label: None,
+                quota_updated_at_ms: None,
             };
             upsert_account(acc).await
         }
@@ -615,6 +878,12 @@ async fn exchange_code_for_account(
                 cooldown_until_ms: None,
                 last_error: None,
                 last_used_ms: 0,
+                quota_5h_remaining: None,
+                quota_5h_reset_at_ms: None,
+                quota_weekly_remaining: None,
+                quota_weekly_reset_at_ms: None,
+                quota_label: None,
+                quota_updated_at_ms: None,
             };
             upsert_account(acc).await
         }
@@ -665,6 +934,86 @@ async fn exchange_code_for_account(
                 cooldown_until_ms: None,
                 last_error: None,
                 last_used_ms: 0,
+                quota_5h_remaining: None,
+                quota_5h_reset_at_ms: None,
+                quota_weekly_remaining: None,
+                quota_weekly_reset_at_ms: None,
+                quota_label: None,
+                quota_updated_at_ms: None,
+            };
+            upsert_account(acc).await
+        }
+        "zcode_oauth" => {
+            let resp = client
+                .post("https://zcode.z.ai/api/v1/oauth/token")
+                .json(&serde_json::json!({
+                    "provider": "zai",
+                    "code": code,
+                    "redirect_uri": flow.redirect_uri,
+                    "state": returned_state.unwrap_or(&flow.state),
+                }))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("ZCode token exchange failed: {}", txt));
+            }
+            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let zai_at = data
+                .pointer("/data/zai/access_token")
+                .or_else(|| data.pointer("/data/token"))
+                .or_else(|| data.get("access_token"))
+                .and_then(|v| v.as_str())
+                .ok_or("Missing Z.ai access_token in ZCode response")?
+                .to_string();
+            let mut zcode_jwt = zai_at.clone();
+            if let Ok(biz_resp) = client
+                .post("https://api.z.ai/api/auth/z/login")
+                .json(&serde_json::json!({ "token": zai_at }))
+                .send()
+                .await
+            {
+                if biz_resp.status().is_success() {
+                    if let Ok(biz_val) = biz_resp.json::<serde_json::Value>().await {
+                        if let Some(jwt) = biz_val
+                            .pointer("/data/access_token")
+                            .or_else(|| biz_val.pointer("/data/token"))
+                            .and_then(|v| v.as_str())
+                        {
+                            if !jwt.is_empty() {
+                                zcode_jwt = jwt.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+            let email = data
+                .pointer("/data/user/username")
+                .or_else(|| data.pointer("/data/user/email"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("zcode-user")
+                .to_string();
+            let exp_in = data.pointer("/data/expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
+            let acc = OAuthAccount {
+                id: format!("zcode-{}", uuid::Uuid::new_v4().simple()),
+                provider: "zcode_oauth".to_string(),
+                email,
+                access_token: zcode_jwt,
+                refresh_token: String::new(),
+                expires_at_ms: now + exp_in * 1000 - 60_000,
+                project_id: None,
+                account_id: None,
+                enabled: true,
+                cooldown_until_ms: None,
+                last_error: None,
+                last_used_ms: 0,
+                quota_5h_remaining: None,
+                quota_5h_reset_at_ms: None,
+                quota_weekly_remaining: None,
+                quota_weekly_reset_at_ms: None,
+                quota_label: None,
+                quota_updated_at_ms: None,
             };
             upsert_account(acc).await
         }
@@ -827,6 +1176,13 @@ pub async fn start_oauth_login(
     http_client: reqwest::Client,
     provider: &str,
 ) -> Result<serde_json::Value, String> {
+    if provider == "kimi_oauth" {
+        return start_kimi_device_flow(app_handle, http_client).await;
+    }
+    if provider == "xai_oauth" {
+        return start_xai_device_flow(app_handle, http_client).await;
+    }
+
     let (verifier, challenge, state) = generate_pkce_pair();
     let (auth_url, redirect_uri, callback_port, callback_path, mode) = match provider {
         "antigravity" => {
@@ -838,7 +1194,7 @@ pub async fn start_oauth_login(
             let dyn_redirect = format!("http://localhost:{}/auth/callback", bound_port);
             let u = format!(
                 "https://accounts.google.com/o/oauth2/auth?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={}&code_challenge_method=S256&state={}&access_type=offline&prompt=consent",
-                urlencoding::encode(get_antigravity_client_id()),
+                urlencoding::encode(ANTIGRAVITY_CLIENT_ID),
                 urlencoding::encode(&dyn_redirect),
                 urlencoding::encode(scope),
                 urlencoding::encode(&challenge),
@@ -870,6 +1226,16 @@ pub async fn start_oauth_login(
                 urlencoding::encode(&claude_state),
             );
             (u, CLAUDE_OAUTH_REDIRECT_URI.to_string(), Some(54545u16), "/callback", "callback")
+        }
+        "zcode_oauth" => {
+            let zcode_redirect = "zcode://zai-auth/callback";
+            let u = format!(
+                "https://chat.z.ai/api/oauth/authorize?response_type=code&client_id={}&redirect_uri={}&state={}",
+                urlencoding::encode(ZCODE_CLIENT_ID),
+                urlencoding::encode(zcode_redirect),
+                urlencoding::encode(&state),
+            );
+            (u, zcode_redirect.to_string(), None, "/callback", "manual")
         }
         other => return Err(format!("Unknown OAuth provider: {}", other)),
     };
@@ -993,7 +1359,7 @@ pub async fn complete_manual_oauth(
         return Err("Authorization code or redirect URL cannot be empty".to_string());
     }
 
-    let (code, st) = if raw.starts_with("http://") || raw.starts_with("https://") {
+    let (code, st) = if raw.starts_with("http://") || raw.starts_with("https://") || raw.starts_with("zcode://") {
         let u = url::Url::parse(raw).map_err(|e| format!("Invalid redirect URL: {}", e))?;
         let c = u
             .query_pairs()
@@ -1057,6 +1423,12 @@ pub async fn import_local_accounts(
                             cooldown_until_ms: None,
                             last_error: None,
                             last_used_ms: 0,
+                            quota_5h_remaining: None,
+                            quota_5h_reset_at_ms: None,
+                            quota_weekly_remaining: None,
+                            quota_weekly_reset_at_ms: None,
+                            quota_label: None,
+                            quota_updated_at_ms: None,
                         };
                         let _ = refresh_account_tokens(&http_client, &mut acc).await;
                         if acc.project_id.is_none() && !acc.access_token.is_empty() {
@@ -1114,6 +1486,12 @@ pub async fn import_local_accounts(
                     cooldown_until_ms: None,
                     last_error: None,
                     last_used_ms: 0,
+                    quota_5h_remaining: None,
+                    quota_5h_reset_at_ms: None,
+                    quota_weekly_remaining: None,
+                    quota_weekly_reset_at_ms: None,
+                    quota_label: None,
+                    quota_updated_at_ms: None,
                 };
                 if !acc.refresh_token.is_empty() {
                     let _ = refresh_account_tokens(&http_client, &mut acc).await;
@@ -1167,6 +1545,12 @@ pub async fn import_local_accounts(
                         cooldown_until_ms: None,
                         last_error: None,
                         last_used_ms: 0,
+                        quota_5h_remaining: None,
+                        quota_5h_reset_at_ms: None,
+                        quota_weekly_remaining: None,
+                        quota_weekly_reset_at_ms: None,
+                        quota_label: None,
+                        quota_updated_at_ms: None,
                     };
                     if let Ok(saved) = upsert_account(acc).await {
                         imported.push(OAuthAccountPublic::from(&saved));
@@ -1199,6 +1583,12 @@ pub async fn import_local_accounts(
                         cooldown_until_ms: None,
                         last_error: None,
                         last_used_ms: 0,
+                        quota_5h_remaining: None,
+                        quota_5h_reset_at_ms: None,
+                        quota_weekly_remaining: None,
+                        quota_weekly_reset_at_ms: None,
+                        quota_label: None,
+                        quota_updated_at_ms: None,
                     };
                     if let Ok(saved) = upsert_account(acc).await {
                         imported.push(OAuthAccountPublic::from(&saved));
@@ -1344,6 +1734,670 @@ pub async fn fetch_claude_models(client: &reqwest::Client) -> Result<Vec<serde_j
                 "supportsTools": true,
                 "supportsAudio": false,
                 "supportsFiles": true
+            })
+        })
+        .collect())
+}
+
+
+async fn start_kimi_device_flow(
+    app_handle: tauri::AppHandle,
+    http_client: reqwest::Client,
+) -> Result<serde_json::Value, String> {
+    let device_id = uuid::Uuid::new_v4().to_string();
+    let resp = http_client
+        .post("https://auth.kimi.com/api/oauth/device_authorization")
+        .header("X-Msh-Platform", "kimi_cli")
+        .header("X-Msh-Version", "1.0.0")
+        .header("X-Msh-Device-Id", &device_id)
+        .form(&[("client_id", KIMI_CLIENT_ID)])
+        .send()
+        .await
+        .map_err(|e| format!("Kimi device auth failed: {}", e))?;
+    if !resp.status().is_success() {
+        let txt = resp.text().await.unwrap_or_default();
+        return Err(format!("Kimi device auth error: {}", txt));
+    }
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let device_code = data.get("device_code").and_then(|v| v.as_str()).ok_or("Missing device_code")?.to_string();
+    let user_code = data.get("user_code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let v_uri = data
+        .get("verification_uri_complete")
+        .or_else(|| data.get("verification_uri"))
+        .and_then(|v| v.as_str())
+        .ok_or("Missing verification_uri")?
+        .to_string();
+    let interval = data.get("interval").and_then(|v| v.as_u64()).unwrap_or(5).max(3);
+
+    open_url_in_browser(&v_uri);
+
+    let app_clone = app_handle.clone();
+    let client_clone = http_client.clone();
+    let dev_id_clone = device_id.clone();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            let Ok(r) = client_clone
+                .post("https://auth.kimi.com/api/oauth/token")
+                .header("X-Msh-Platform", "kimi_cli")
+                .header("X-Msh-Version", "1.0.0")
+                .header("X-Msh-Device-Id", &dev_id_clone)
+                .form(&[
+                    ("client_id", KIMI_CLIENT_ID),
+                    ("device_code", device_code.as_str()),
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ])
+                .send()
+                .await
+            else {
+                continue;
+            };
+            let Ok(val) = r.json::<serde_json::Value>().await else {
+                continue;
+            };
+            if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
+                if err == "authorization_pending" || err == "slow_down" {
+                    continue;
+                }
+                break;
+            }
+            if let Some(at) = val.get("access_token").and_then(|v| v.as_str()) {
+                let rt = val.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let exp_in = val.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
+                let now = chrono::Utc::now().timestamp_millis();
+                let acc = OAuthAccount {
+                    id: format!("kimi-{}", uuid::Uuid::new_v4().simple()),
+                    provider: "kimi_oauth".to_string(),
+                    email: format!("kimi-{}", &dev_id_clone[..6]),
+                    access_token: at.to_string(),
+                    refresh_token: rt,
+                    expires_at_ms: now + exp_in * 1000 - 60_000,
+                    project_id: None,
+                    account_id: Some("kimi.com".to_string()),
+                    enabled: true,
+                    cooldown_until_ms: None,
+                    last_error: None,
+                    last_used_ms: 0,
+                    quota_5h_remaining: None,
+                    quota_5h_reset_at_ms: None,
+                    quota_weekly_remaining: None,
+                    quota_weekly_reset_at_ms: None,
+                    quota_label: None,
+                    quota_updated_at_ms: None,
+                };
+                if let Ok(saved) = upsert_account(acc).await {
+                    let _ = app_clone.emit(
+                        "oauth-accounts-updated",
+                        serde_json::json!({ "provider": "kimi_oauth", "email": saved.email }),
+                    );
+                }
+                break;
+            }
+        }
+    });
+
+    Ok(serde_json::json!({
+        "authUrl": v_uri,
+        "userCode": user_code,
+        "mode": "device_code",
+        "provider": "kimi_oauth"
+    }))
+}
+
+async fn start_xai_device_flow(
+    app_handle: tauri::AppHandle,
+    http_client: reqwest::Client,
+) -> Result<serde_json::Value, String> {
+    let disc_resp = http_client
+        .get("https://auth.x.ai/.well-known/openid-configuration")
+        .send()
+        .await
+        .map_err(|e| format!("xAI discovery failed: {}", e))?;
+    if !disc_resp.status().is_success() {
+        let txt = disc_resp.text().await.unwrap_or_default();
+        return Err(format!("xAI discovery error: {}", txt));
+    }
+    let disc: serde_json::Value = disc_resp.json().await.map_err(|e| e.to_string())?;
+    let dev_ep = disc
+        .get("device_authorization_endpoint")
+        .and_then(|v| v.as_str())
+        .ok_or("xAI discovery missing device_authorization_endpoint")?
+        .to_string();
+    let tok_ep = disc
+        .get("token_endpoint")
+        .and_then(|v| v.as_str())
+        .ok_or("xAI discovery missing token_endpoint")?
+        .to_string();
+
+    let resp = http_client
+        .post(&dev_ep)
+        .form(&[("client_id", XAI_CLIENT_ID), ("scope", XAI_SCOPE)])
+        .send()
+        .await
+        .map_err(|e| format!("xAI device code request failed: {}", e))?;
+    if !resp.status().is_success() {
+        let txt = resp.text().await.unwrap_or_default();
+        return Err(format!("xAI device code error: {}", txt));
+    }
+    let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let device_code = data.get("device_code").and_then(|v| v.as_str()).ok_or("Missing device_code")?.to_string();
+    let user_code = data.get("user_code").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let v_uri = data
+        .get("verification_uri_complete")
+        .or_else(|| data.get("verification_uri"))
+        .and_then(|v| v.as_str())
+        .ok_or("Missing verification_uri")?
+        .to_string();
+    let interval = data.get("interval").and_then(|v| v.as_u64()).unwrap_or(5).max(3);
+
+    open_url_in_browser(&v_uri);
+
+    let app_clone = app_handle.clone();
+    let client_clone = http_client.clone();
+    tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+        while tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+            let Ok(r) = client_clone
+                .post(&tok_ep)
+                .form(&[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("device_code", device_code.as_str()),
+                    ("client_id", XAI_CLIENT_ID),
+                ])
+                .send()
+                .await
+            else {
+                continue;
+            };
+            let Ok(val) = r.json::<serde_json::Value>().await else {
+                continue;
+            };
+            if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
+                if err == "authorization_pending" || err == "slow_down" {
+                    continue;
+                }
+                break;
+            }
+            if let Some(at) = val.get("access_token").and_then(|v| v.as_str()) {
+                let rt = val.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id_tok = val.get("id_token").and_then(|v| v.as_str());
+                let exp_in = val.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
+                let (email_opt, _) = extract_chatgpt_claims(id_tok, at);
+                let now = chrono::Utc::now().timestamp_millis();
+                let acc = OAuthAccount {
+                    id: format!("xai-{}", uuid::Uuid::new_v4().simple()),
+                    provider: "xai_oauth".to_string(),
+                    email: email_opt.unwrap_or_else(|| "grok-user".to_string()),
+                    access_token: at.to_string(),
+                    refresh_token: rt,
+                    expires_at_ms: now + exp_in * 1000 - 60_000,
+                    project_id: None,
+                    account_id: None,
+                    enabled: true,
+                    cooldown_until_ms: None,
+                    last_error: None,
+                    last_used_ms: 0,
+                    quota_5h_remaining: None,
+                    quota_5h_reset_at_ms: None,
+                    quota_weekly_remaining: None,
+                    quota_weekly_reset_at_ms: None,
+                    quota_label: None,
+                    quota_updated_at_ms: None,
+                };
+                if let Ok(saved) = upsert_account(acc).await {
+                    let _ = app_clone.emit(
+                        "oauth-accounts-updated",
+                        serde_json::json!({ "provider": "xai_oauth", "email": saved.email }),
+                    );
+                }
+                break;
+            }
+        }
+    });
+
+    Ok(serde_json::json!({
+        "authUrl": v_uri,
+        "userCode": user_code,
+        "mode": "device_code",
+        "provider": "xai_oauth"
+    }))
+}
+
+pub async fn add_manual_token_account(
+    app_handle: tauri::AppHandle,
+    provider: &str,
+    label: &str,
+    token: &str,
+) -> Result<OAuthAccountPublic, String> {
+    let tok = token.trim();
+    if tok.is_empty() {
+        return Err("Token or API key cannot be empty".to_string());
+    }
+    let email = if label.trim().is_empty() {
+        format!("{}-{}", provider, &uuid::Uuid::new_v4().simple().to_string()[..6])
+    } else {
+        label.trim().to_string()
+    };
+    let acc = OAuthAccount {
+        id: format!("{}-{}", provider, uuid::Uuid::new_v4().simple()),
+        provider: provider.to_string(),
+        email,
+        access_token: tok.to_string(),
+        refresh_token: String::new(),
+        expires_at_ms: 0,
+        project_id: None,
+        account_id: None,
+        enabled: true,
+        cooldown_until_ms: None,
+        last_error: None,
+        last_used_ms: 0,
+        quota_5h_remaining: None,
+        quota_5h_reset_at_ms: None,
+        quota_weekly_remaining: None,
+        quota_weekly_reset_at_ms: None,
+        quota_label: None,
+        quota_updated_at_ms: None,
+    };
+    let saved = upsert_account(acc).await?;
+    let pub_acc = OAuthAccountPublic::from(&saved);
+    let _ = app_handle.emit(
+        "oauth-accounts-updated",
+        serde_json::json!({ "provider": saved.provider, "email": saved.email }),
+    );
+    Ok(pub_acc)
+}
+
+async fn fetch_account_quota_inner(client: &reqwest::Client, acc: &mut OAuthAccount) -> Result<(), String> {
+    let now = chrono::Utc::now().timestamp_millis();
+    if acc.access_token.is_empty() || (acc.expires_at_ms > 0 && acc.expires_at_ms <= now) {
+        if !acc.refresh_token.is_empty() {
+            refresh_account_tokens(client, acc).await?;
+        }
+    }
+    match acc.provider.as_str() {
+        "openai_codex" => {
+            let mut req = client
+                .get("https://chatgpt.com/backend-api/wham/usage")
+                .bearer_auth(&acc.access_token)
+                .header("Accept", "application/json");
+            if let Some(ref aid) = acc.account_id {
+                if !aid.trim().is_empty() {
+                    req = req.header("ChatGPT-Account-Id", aid.trim());
+                }
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            let status = resp.status();
+            if !status.is_success() {
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("Codex usage HTTP {}: {}", status.as_u16(), txt));
+            }
+            let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            if let Some(plan) = val.get("plan_type").and_then(|v| v.as_str()) {
+                acc.quota_label = Some(plan.to_string());
+            }
+            let rl = val.get("rate_limit");
+            let allowed = rl.and_then(|r| r.get("allowed")).and_then(|v| v.as_bool()).unwrap_or(true);
+            for win_key in ["primary_window", "secondary_window"] {
+                if let Some(win) = rl.and_then(|r| r.get(win_key)) {
+                    if win.is_null() {
+                        continue;
+                    }
+                    let used = win.get("used_percent").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let rem = if allowed { (100.0 - used).clamp(0.0, 100.0) } else { 0.0 };
+                    let secs = win.get("limit_window_seconds").and_then(|v| v.as_i64()).unwrap_or(18000);
+                    let reset_ms = win
+                        .get("reset_at")
+                        .and_then(|v| v.as_i64())
+                        .map(|s| s * 1000)
+                        .or_else(|| {
+                            win.get("reset_after_seconds")
+                                .and_then(|v| v.as_i64())
+                                .map(|s| now + s * 1000)
+                        });
+                    if secs <= 21600 {
+                        acc.quota_5h_remaining = Some(rem);
+                        acc.quota_5h_reset_at_ms = reset_ms;
+                    } else {
+                        acc.quota_weekly_remaining = Some(rem);
+                        acc.quota_weekly_reset_at_ms = reset_ms;
+                    }
+                }
+            }
+            acc.quota_updated_at_ms = Some(now);
+            acc.last_error = None;
+            acc.cooldown_until_ms = None;
+            Ok(())
+        }
+        "claude_oauth" => {
+            let resp = client
+                .get("https://api.anthropic.com/api/oauth/usage")
+                .header("Authorization", format!("Bearer {}", acc.access_token))
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", "oauth-2025-04-20")
+                .header("user-agent", "claude-cli/1.0.0 (external, cli)")
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = resp.status();
+            if !status.is_success() {
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("Claude usage HTTP {}: {}", status.as_u16(), txt));
+            }
+            let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            if let Some(fh) = val.get("five_hour") {
+                if let Some(util) = fh.get("utilization").and_then(|v| v.as_f64()) {
+                    let pct = if util <= 1.0 { util * 100.0 } else { util };
+                    acc.quota_5h_remaining = Some((100.0 - pct).clamp(0.0, 100.0));
+                }
+                if let Some(ra) = fh.get("resets_at").and_then(|v| v.as_str()) {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ra) {
+                        acc.quota_5h_reset_at_ms = Some(dt.timestamp_millis());
+                    }
+                }
+            }
+            if let Some(sd) = val.get("seven_day") {
+                if let Some(util) = sd.get("utilization").and_then(|v| v.as_f64()) {
+                    let pct = if util <= 1.0 { util * 100.0 } else { util };
+                    acc.quota_weekly_remaining = Some((100.0 - pct).clamp(0.0, 100.0));
+                }
+                if let Some(ra) = sd.get("resets_at").and_then(|v| v.as_str()) {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ra) {
+                        acc.quota_weekly_reset_at_ms = Some(dt.timestamp_millis());
+                    }
+                }
+            }
+            acc.quota_updated_at_ms = Some(now);
+            acc.last_error = None;
+            acc.cooldown_until_ms = None;
+            Ok(())
+        }
+        "antigravity" => {
+            let pid = match acc.project_id.clone() {
+                Some(p) if !p.is_empty() => p,
+                _ => {
+                    let fetched = fetch_antigravity_project_id(client, &acc.access_token).await;
+                    if !fetched.is_empty() {
+                        acc.project_id = Some(fetched.clone());
+                    }
+                    fetched
+                }
+            };
+            let resp = client
+                .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
+                .bearer_auth(&acc.access_token)
+                .header("User-Agent", antigravity_hub_ua())
+                .header("X-Machine-Session-Id", machine_session_id())
+                .json(&serde_json::json!({ "project": pid }))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = resp.status();
+            if !status.is_success() {
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("Antigravity check HTTP {}: {}", status.as_u16(), txt));
+            }
+            let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let mut min_frac: Option<f64> = None;
+            let mut earliest_reset: Option<i64> = None;
+            if let Some(models) = val.get("models").and_then(|m| m.as_object()) {
+                for (_, info) in models {
+                    if info.get("isInternal").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(qi) = info.get("quotaInfo") {
+                        if let Some(frac) = qi.get("remainingFraction").and_then(|v| v.as_f64()) {
+                            min_frac = Some(min_frac.map(|m| m.min(frac)).unwrap_or(frac));
+                        }
+                        if let Some(rt) = qi.get("resetTime").and_then(|v| v.as_str()) {
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rt) {
+                                let ms = dt.timestamp_millis();
+                                earliest_reset = Some(earliest_reset.map(|e| e.min(ms)).unwrap_or(ms));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(frac) = min_frac {
+                acc.quota_5h_remaining = Some((frac * 100.0).clamp(0.0, 100.0));
+                acc.quota_5h_reset_at_ms = earliest_reset;
+            }
+            acc.quota_updated_at_ms = Some(now);
+            acc.last_error = None;
+            acc.cooldown_until_ms = None;
+            Ok(())
+        }
+        "zcode_oauth" => {
+            let resp = client
+                .get("https://api.z.ai/api/monitor/usage/quota/limit")
+                .bearer_auth(&acc.access_token)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = resp.status();
+            if !status.is_success() {
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("ZCode quota HTTP {}: {}", status.as_u16(), txt));
+            }
+            let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            if let Some(arr) = val.get("plans").or_else(|| val.get("balances")).and_then(|v| v.as_array()) {
+                if let Some(first) = arr.first() {
+                    let total = first.get("total_units").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    let avail = first.get("available_units").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                    if total > 0.0 {
+                        acc.quota_weekly_remaining = Some(((avail / total) * 100.0).clamp(0.0, 100.0));
+                    }
+                    if let Some(pe) = first.get("period_end").and_then(|v| v.as_i64()) {
+                        acc.quota_weekly_reset_at_ms = Some(pe * 1000);
+                    }
+                }
+            }
+            acc.quota_updated_at_ms = Some(now);
+            acc.last_error = None;
+            acc.cooldown_until_ms = None;
+            Ok(())
+        }
+        "kimi_oauth" => {
+            let host = if acc.account_id.as_deref() == Some("kimi.ai") {
+                "https://api.kimi.ai/coding/v1/models"
+            } else {
+                "https://api.kimi.com/coding/v1/models"
+            };
+            let resp = client.get(host).bearer_auth(&acc.access_token).send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let st = resp.status().as_u16();
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("Kimi check HTTP {}: {}", st, txt));
+            }
+            acc.quota_updated_at_ms = Some(now);
+            acc.last_error = None;
+            acc.cooldown_until_ms = None;
+            Ok(())
+        }
+        "xai_oauth" => {
+            let resp = client
+                .get("https://api.x.ai/v1/models")
+                .bearer_auth(&acc.access_token)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let st = resp.status().as_u16();
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("xAI check HTTP {}: {}", st, txt));
+            }
+            acc.quota_updated_at_ms = Some(now);
+            acc.last_error = None;
+            acc.cooldown_until_ms = None;
+            Ok(())
+        }
+        "perplexity_oauth" => {
+            let resp = client
+                .post("https://api.perplexity.ai/chat/completions")
+                .bearer_auth(&acc.access_token)
+                .json(&serde_json::json!({
+                    "model": "sonar",
+                    "messages": [{ "role": "user", "content": "ping" }],
+                    "max_tokens": 1
+                }))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let st = resp.status().as_u16();
+                let txt = resp.text().await.unwrap_or_default();
+                return Err(format!("Perplexity check HTTP {}: {}", st, txt));
+            }
+            acc.quota_updated_at_ms = Some(now);
+            acc.last_error = None;
+            acc.cooldown_until_ms = None;
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+pub async fn check_account_liveness(client: &reqwest::Client, id: &str) -> Result<OAuthAccountPublic, String> {
+    let _guard = store_lock().lock().await;
+    let mut list = read_accounts_unlocked();
+    let idx = list.iter().position(|a| a.id == id).ok_or("Account not found")?;
+    let mut acc = list[idx].clone();
+    let res = fetch_account_quota_inner(client, &mut acc).await;
+    if let Err(ref e) = res {
+        acc.last_error = Some(e.chars().take(240).collect());
+    }
+    list[idx] = acc.clone();
+    write_accounts_unlocked(&list)?;
+    match res {
+        Ok(()) => Ok(OAuthAccountPublic::from(&acc)),
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn refresh_all_quotas(client: &reqwest::Client, provider: Option<&str>) -> Result<Vec<OAuthAccountPublic>, String> {
+    let _guard = store_lock().lock().await;
+    let mut list = read_accounts_unlocked();
+    for acc in list.iter_mut() {
+        if let Some(p) = provider {
+            if acc.provider != p {
+                continue;
+            }
+        }
+        if !acc.enabled {
+            continue;
+        }
+        if let Err(e) = fetch_account_quota_inner(client, acc).await {
+            acc.last_error = Some(e.chars().take(240).collect());
+        }
+    }
+    write_accounts_unlocked(&list)?;
+    Ok(list
+        .iter()
+        .filter(|a| provider.map(|p| a.provider == p).unwrap_or(true))
+        .map(OAuthAccountPublic::from)
+        .collect())
+}
+
+pub async fn fetch_kimi_models(_client: &reqwest::Client) -> Result<Vec<serde_json::Value>, String> {
+    let models = [
+        ("kimi-k3.1-pro", "Kimi K3.1 Pro", 1_000_000u64, 65536u64, true, true),
+        ("kimi-k3", "Kimi K3", 1_000_000u64, 65536u64, true, true),
+        ("kimi-k2.8-code", "Kimi K2.8 Code", 262_144u64, 65536u64, true, true),
+        ("kimi-k2.6", "Kimi K2.6", 262_144u64, 65536u64, true, true),
+        ("kimi-k2.5", "Kimi K2.5", 262_144u64, 32768u64, true, true),
+        ("kimi-k2-thinking", "Kimi K2 Thinking", 131_072u64, 32768u64, true, false),
+    ];
+    Ok(models
+        .iter()
+        .map(|(id, name, ctx, out, r, v)| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "contextWindow": ctx,
+                "maxOutputTokens": out,
+                "supportsReasoning": r,
+                "supportsVision": v,
+                "supportsTools": true,
+                "supportsAudio": false,
+                "supportsFiles": true
+            })
+        })
+        .collect())
+}
+
+pub async fn fetch_xai_models(_client: &reqwest::Client) -> Result<Vec<serde_json::Value>, String> {
+    let models = [
+        ("grok-4.7", "Grok 4.7", 500_000u64, 128_000u64, true, true),
+        ("grok-4.7-build-fast", "Grok 4.7 Fast", 500_000u64, 128_000u64, true, true),
+        ("grok-4.6", "Grok 4.6", 500_000u64, 65_536u64, true, true),
+        ("grok-4.5", "Grok 4.5", 500_000u64, 65_536u64, true, true),
+        ("grok-build-0.1", "Grok Build 0.1", 256_000u64, 65_536u64, false, true),
+    ];
+    Ok(models
+        .iter()
+        .map(|(id, name, ctx, out, r, v)| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "contextWindow": ctx,
+                "maxOutputTokens": out,
+                "supportsReasoning": r,
+                "supportsVision": v,
+                "supportsTools": true,
+                "supportsAudio": false,
+                "supportsFiles": true
+            })
+        })
+        .collect())
+}
+
+pub async fn fetch_zcode_models(_client: &reqwest::Client) -> Result<Vec<serde_json::Value>, String> {
+    let models = [
+        ("glm-5.3", "GLM-5.3", 200_000u64, 64_000u64, true, false),
+        ("glm-5.3-flash", "GLM-5.3 Flash", 200_000u64, 64_000u64, true, true),
+        ("glm-5.1", "GLM-5.1", 200_000u64, 64_000u64, true, false),
+        ("glm-5-turbo", "GLM-5 Turbo", 200_000u64, 64_000u64, true, false),
+        ("glm-4.7", "GLM-4.7", 200_000u64, 128_000u64, true, false),
+    ];
+    Ok(models
+        .iter()
+        .map(|(id, name, ctx, out, r, v)| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "contextWindow": ctx,
+                "maxOutputTokens": out,
+                "supportsReasoning": r,
+                "supportsVision": v,
+                "supportsTools": true,
+                "supportsAudio": false,
+                "supportsFiles": true
+            })
+        })
+        .collect())
+}
+
+pub async fn fetch_perplexity_models(_client: &reqwest::Client) -> Result<Vec<serde_json::Value>, String> {
+    let models = [
+        ("sonar-pro", "Sonar Pro", 200_000u64, 16_384u64, false),
+        ("sonar-reasoning-pro", "Sonar Reasoning Pro", 200_000u64, 16_384u64, true),
+        ("sonar-deep-research", "Sonar Deep Research", 200_000u64, 16_384u64, true),
+        ("sonar", "Sonar", 128_000u64, 8_192u64, false),
+    ];
+    Ok(models
+        .iter()
+        .map(|(id, name, ctx, out, r)| {
+            serde_json::json!({
+                "id": id,
+                "name": name,
+                "contextWindow": ctx,
+                "maxOutputTokens": out,
+                "supportsReasoning": r,
+                "supportsVision": true,
+                "supportsTools": false,
+                "supportsAudio": false,
+                "supportsFiles": false
             })
         })
         .collect())

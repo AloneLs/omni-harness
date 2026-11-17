@@ -4,6 +4,7 @@ import { Spring } from 'svelte/motion';
 import { fly, slide } from 'svelte/transition';
 import Icon from './Icon.svelte';
 import FileToolIcon from './FileToolIcon.svelte';
+import { themeStore } from '../lib/stores/theme.svelte';
 import { chatStore, type ChatAttachment } from '../lib/stores/chat.svelte';
 import { renderMarkdown } from '../lib/markdown';
 import { settingsStore, type ReasoningLevel } from '../lib/stores/settings.svelte';
@@ -569,8 +570,11 @@ function handleSubmit() {
     return;
   }
   if (dynamicButtonState === 'queue') {
-    chatStore.enqueueMessage(inputText.trim());
+    const qText = inputText.trim();
     inputText = '';
+    chatStore.setDraftText(chatStore.activeChatId, '');
+    chatStore.setDraftText(null, '');
+    chatStore.enqueueMessage(qText);
     return;
   }
   if (inputText.trim() || attachments.length > 0) {
@@ -578,6 +582,10 @@ function handleSubmit() {
     const currentAttachments = [...attachments];
     inputText = '';
     attachments = [];
+    chatStore.setDraftText(chatStore.activeChatId, '');
+    chatStore.setDraftAttachments(chatStore.activeChatId, []);
+    chatStore.setDraftText(null, '');
+    chatStore.setDraftAttachments(null, []);
     chatStore.sendMessage(text, { attachments: currentAttachments });
   }
 }
@@ -669,7 +677,7 @@ async function stopAndSendVoice() {
 
 <svelte:window onpointerdown={handleWindowPointerDown} />
 
-<div bind:this={composerRootEl} class="relative w-full max-w-[680px] mx-auto select-none">
+<div bind:this={composerRootEl} data-omni-composer="" class="relative w-full max-w-[680px] mx-auto select-none">
   {#if chatStore.activeGoal && chatStore.activeGoal.condition}
     {@const g = chatStore.activeGoal}
     <div class="mb-2 px-3 py-2 rounded-[8px] bg-[#121214]/95 border border-white/[0.08] flex items-center justify-between gap-3">
@@ -1037,7 +1045,7 @@ async function stopAndSendVoice() {
           onkeydown={handleKeyDown}
           onpaste={handlePaste}
           onscroll={() => { if (mirrorEl && textareaEl) mirrorEl.scrollTop = textareaEl.scrollTop; }}
-          placeholder="Ask OmniHarness anything, @ to add context, / for commands or capabilities"
+          data-omni-composer-input="" placeholder={themeStore.t('ask_placeholder', 'Ask OmniHarness anything, @ to add context, / for commands or capabilities')}
           rows="1"
           class="relative z-10 w-full px-1 bg-transparent font-sans text-[13.5px] {slashLeadMatch ? 'text-transparent caret-[#EDEDEF] selection:bg-white/20' : 'text-[#E5E5E8]'} placeholder-[#686870] outline-none focus:outline-none focus:ring-0 resize-none min-h-[24px] max-h-[180px] leading-relaxed transition-[height] duration-150 ease-out"
         ></textarea>

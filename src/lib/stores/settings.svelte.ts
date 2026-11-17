@@ -14,7 +14,7 @@ export interface DetectedModelInfo {
   supportsFiles: boolean;
 }
 
-export type ApiProtocol = 'auto' | 'chat_completions' | 'responses' | 'anthropic_messages' | 'google_gemini' | 'antigravity' | 'openai_codex' | 'claude_oauth';
+export type ApiProtocol = 'auto' | 'chat_completions' | 'responses' | 'anthropic_messages' | 'google_gemini' | 'antigravity' | 'openai_codex' | 'claude_oauth' | 'kimi_oauth' | 'xai_oauth' | 'zcode_oauth' | 'perplexity_oauth';
 
 export interface ProviderConfig {
   id: string;
@@ -135,6 +135,39 @@ class SettingsStore {
 
   private async init(): Promise<void> {
     await this.loadSettings();
+    import('@tauri-apps/api/event')
+      .then(({ listen }) => {
+        listen<{ providerId?: string | null; modelId?: string | null; reasoningEffort?: string | null }>(
+          'telegram-settings-updated',
+          (ev) => {
+            const p = ev.payload;
+            if (!p) return;
+            let changed = false;
+            if (p.providerId && this.data.providers[p.providerId] && this.data.activeProvider !== p.providerId) {
+              this.data.activeProvider = p.providerId;
+              changed = true;
+            }
+            if (p.modelId && this.data.activeModel !== p.modelId) {
+              this.data.activeModel = p.modelId;
+              changed = true;
+            }
+            if (p.reasoningEffort) {
+              const mapped = p.reasoningEffort.toUpperCase() as ReasoningLevel;
+              if (['OFF', 'LOW', 'MEDIUM', 'HIGH', 'MAX'].includes(mapped) && this.data.reasoningLevel !== mapped) {
+                this.data.reasoningLevel = mapped;
+                changed = true;
+              }
+            }
+            if (changed) {
+              if (typeof localStorage !== 'undefined') {
+                localStorage.setItem('omni_settings', JSON.stringify(this.data));
+              }
+              invoke('save_settings', { settings: this.data }).catch(() => {});
+            }
+          }
+        );
+      })
+      .catch(() => {});
     this.refreshAllModelCapabilities();
     try {
       const cfg = await invoke<{ firstRunCompleted?: boolean; workspaceDir?: string | null }>('get_bootstrap_config');

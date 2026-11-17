@@ -6,6 +6,7 @@ pub mod mcp;
 pub mod skills;
 pub mod speech;
 pub mod state;
+mod themes;
 pub mod telegram;
 pub mod tools;
 
@@ -860,10 +861,21 @@ async fn sync_chat_context(
         let existing = db.list_messages(&chat_id).unwrap_or_default();
         if parsed.len() > existing.len() {
             let mut seq = existing.last().map(|m| m.sequence_num).unwrap_or(0);
-            for item in parsed.iter().skip(existing.len()) {
+            for (idx, item) in parsed.iter().enumerate().skip(existing.len()) {
                 let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string();
                 let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 if content.trim().is_empty() {
+                    continue;
+                }
+                let is_dup = existing
+                    .get(idx)
+                    .map(|e| e.role == role && e.content == content)
+                    .unwrap_or(false)
+                    || existing
+                        .last()
+                        .map(|e| e.role == role && e.content == content)
+                        .unwrap_or(false);
+                if is_dup {
                     continue;
                 }
                 seq += 1;
@@ -1014,7 +1026,16 @@ async fn start_chat_stream(
     if context_window.is_some() || max_output_tokens.is_some() || supports_reasoning.is_some() {
         caps_reg.update_model_caps(&model_id, context_window, max_output_tokens, supports_reasoning);
     }
-    let http_client = build_http_client(proxy_enabled, proxy_url.as_deref(), Some(&state.http_client))?;
+    let is_oauth_proto = matches!(
+        api_protocol.as_deref().unwrap_or(""),
+        "antigravity" | "openai_codex" | "claude_oauth" | "kimi_oauth" | "xai_oauth" | "zcode_oauth" | "perplexity_oauth"
+    );
+    let (eff_px_en, eff_px_url) = if is_oauth_proto {
+        llm::oauth_accounts::resolve_oauth_proxy(proxy_enabled, proxy_url.as_deref())
+    } else {
+        (proxy_enabled, proxy_url.clone())
+    };
+    let http_client = build_http_client(eff_px_en, eff_px_url.as_deref(), Some(&state.http_client))?;
 
     let (mut resolved_provider, mut resolved_url) = ("OpenAI".to_string(), "https://api.openai.com/v1".to_string());
     if let Ok(model_rec) = state.app_state.db.get_model(&model_id) {
@@ -2189,6 +2210,21 @@ async fn oauth_list_accounts(provider: Option<String>) -> Result<Vec<llm::oauth_
     Ok(llm::oauth_accounts::list_accounts(provider.as_deref()).await)
 }
 
+fn oauth_client_with_fallback(proxy_enabled: Option<bool>, proxy_url: Option<&str>) -> Result<reqwest::Client, String> {
+    let (en, url) = llm::oauth_accounts::resolve_oauth_proxy(proxy_enabled, proxy_url);
+    build_http_client(en, url.as_deref(), None)
+}
+
+#[tauri::command]
+async fn oauth_get_proxy() -> Result<llm::oauth_accounts::OAuthProxyConfig, String> {
+    Ok(llm::oauth_accounts::load_oauth_proxy())
+}
+
+#[tauri::command]
+async fn oauth_set_proxy(enabled: bool, url: String) -> Result<(), String> {
+    llm::oauth_accounts::save_oauth_proxy(llm::oauth_accounts::OAuthProxyConfig { enabled, url })
+}
+
 #[tauri::command]
 async fn oauth_start_login(
     app: tauri::AppHandle,
@@ -2196,7 +2232,7 @@ async fn oauth_start_login(
     proxy_enabled: Option<bool>,
     proxy_url: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
     llm::oauth_accounts::start_oauth_login(app, client, &provider).await
 }
 
@@ -2208,8 +2244,18 @@ async fn oauth_complete_manual_login(
     proxy_enabled: Option<bool>,
     proxy_url: Option<String>,
 ) -> Result<llm::oauth_accounts::OAuthAccountPublic, String> {
-    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
     llm::oauth_accounts::complete_manual_oauth(app, client, &provider, &code_or_url).await
+}
+
+#[tauri::command]
+async fn oauth_add_manual_token(
+    app: tauri::AppHandle,
+    provider: String,
+    label: String,
+    token: String,
+) -> Result<llm::oauth_accounts::OAuthAccountPublic, String> {
+    llm::oauth_accounts::add_manual_token_account(app, &provider, &label, &token).await
 }
 
 #[tauri::command]
@@ -2218,7 +2264,7 @@ async fn oauth_import_local_accounts(
     proxy_enabled: Option<bool>,
     proxy_url: Option<String>,
 ) -> Result<Vec<llm::oauth_accounts::OAuthAccountPublic>, String> {
-    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
     llm::oauth_accounts::import_local_accounts(app, client).await
 }
 
@@ -2233,11 +2279,31 @@ async fn oauth_delete_account(id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn oauth_check_account(
+    id: String,
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<llm::oauth_accounts::OAuthAccountPublic, String> {
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
+    llm::oauth_accounts::check_account_liveness(&client, &id).await
+}
+
+#[tauri::command]
+async fn oauth_refresh_quotas(
+    provider: Option<String>,
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<Vec<llm::oauth_accounts::OAuthAccountPublic>, String> {
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
+    llm::oauth_accounts::refresh_all_quotas(&client, provider.as_deref()).await
+}
+
+#[tauri::command]
 async fn oauth_fetch_antigravity_models(
     proxy_enabled: Option<bool>,
     proxy_url: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
     llm::oauth_accounts::fetch_antigravity_models(&client).await
 }
 
@@ -2246,7 +2312,7 @@ async fn oauth_fetch_codex_models(
     proxy_enabled: Option<bool>,
     proxy_url: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
     llm::oauth_accounts::fetch_codex_models(&client).await
 }
 
@@ -2255,8 +2321,44 @@ async fn oauth_fetch_claude_models(
     proxy_enabled: Option<bool>,
     proxy_url: Option<String>,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let client = build_http_client(proxy_enabled, proxy_url.as_deref(), None)?;
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
     llm::oauth_accounts::fetch_claude_models(&client).await
+}
+
+#[tauri::command]
+async fn oauth_fetch_kimi_models(
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
+    llm::oauth_accounts::fetch_kimi_models(&client).await
+}
+
+#[tauri::command]
+async fn oauth_fetch_xai_models(
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
+    llm::oauth_accounts::fetch_xai_models(&client).await
+}
+
+#[tauri::command]
+async fn oauth_fetch_zcode_models(
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
+    llm::oauth_accounts::fetch_zcode_models(&client).await
+}
+
+#[tauri::command]
+async fn oauth_fetch_perplexity_models(
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let client = oauth_client_with_fallback(proxy_enabled, proxy_url.as_deref())?;
+    llm::oauth_accounts::fetch_perplexity_models(&client).await
 }
 
 #[tauri::command]
@@ -2400,6 +2502,20 @@ async fn sync_providers_to_backend(
     active_provider: String,
     active_model: String,
 ) -> Result<(), String> {
+    for prov in &providers {
+        if let Some(ref caps_map) = prov.model_capabilities {
+            for (mid, cap) in caps_map {
+                state.caps_registry.update_full_model_caps(
+                    mid,
+                    Some(cap.context_window),
+                    Some(cap.max_output_tokens),
+                    Some(cap.supports_reasoning),
+                    Some(cap.supports_vision),
+                    Some(cap.supports_tools),
+                );
+            }
+        }
+    }
     let snap = telegram::ProvidersSnapshotFile {
         providers,
         active_provider,
@@ -2740,7 +2856,22 @@ pub fn run() {
             oauth_delete_account,
             oauth_fetch_antigravity_models,
             oauth_fetch_codex_models,
+            oauth_get_proxy,
+            oauth_set_proxy,
+            oauth_add_manual_token,
+            oauth_check_account,
+            oauth_refresh_quotas,
             oauth_fetch_claude_models,
+            oauth_fetch_kimi_models,
+            oauth_fetch_xai_models,
+            oauth_fetch_zcode_models,
+            oauth_fetch_perplexity_models,
+            list_themes,
+            save_theme,
+            delete_theme,
+            get_active_theme_id,
+            set_active_theme_id,
+            start_theme_agent_stream,
             list_subagents,
             save_custom_subagent,
             delete_custom_subagent,
@@ -2764,4 +2895,142 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("Error while running OmniHarness application");
+}
+
+
+#[tauri::command]
+async fn list_themes() -> Result<Vec<themes::OmniTheme>, String> {
+    themes::list_themes()
+}
+
+#[tauri::command]
+async fn save_theme(theme: themes::OmniTheme) -> Result<themes::OmniTheme, String> {
+    themes::save_theme(theme)
+}
+
+#[tauri::command]
+async fn delete_theme(id: String) -> Result<(), String> {
+    themes::delete_theme(&id)
+}
+
+#[tauri::command]
+async fn get_active_theme_id() -> Result<Option<String>, String> {
+    themes::get_active_theme_id()
+}
+
+#[tauri::command]
+async fn set_active_theme_id(id: Option<String>) -> Result<(), String> {
+    themes::set_active_theme_id(id)
+}
+
+#[tauri::command]
+async fn start_theme_agent_stream(
+    state: State<'_, AppManagedState>,
+    app: tauri::AppHandle,
+    theme_id: String,
+    prompt: String,
+    model_id: String,
+    reasoning_effort: String,
+    provider_name: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    api_protocol: Option<String>,
+    proxy_enabled: Option<bool>,
+    proxy_url: Option<String>,
+    history: Option<Vec<HistoryInputItem>>,
+    on_event: Channel<serde_json::Value>,
+) -> Result<String, String> {
+    let chat_id = format!("theme-studio-{}", theme_id);
+    let session = state.stream_mgr.create_session(&chat_id).await;
+    let tools = state.tool_dispatcher.for_theme_studio(app.clone(), &theme_id);
+    let key_pool = (*state.key_pool).clone();
+    let caps_reg = (*state.caps_registry).clone();
+
+    let is_oauth_proto = matches!(
+        api_protocol.as_deref().unwrap_or(""),
+        "antigravity" | "openai_codex" | "claude_oauth" | "kimi_oauth" | "xai_oauth" | "zcode_oauth" | "perplexity_oauth"
+    );
+    let (eff_px_en, eff_px_url) = if is_oauth_proto {
+        llm::oauth_accounts::resolve_oauth_proxy(proxy_enabled, proxy_url.as_deref())
+    } else {
+        (proxy_enabled, proxy_url.clone())
+    };
+    let http_client = build_http_client(eff_px_en, eff_px_url.as_deref(), Some(&state.http_client))?;
+    let prov_name = provider_name.unwrap_or_else(|| "OpenAI".to_string());
+    let b_url = base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    if let Some(ak) = api_key {
+        if !ak.trim().is_empty() {
+            key_pool.set_keys(&prov_name, vec![ak.trim().to_string()]);
+        }
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+    let on_event_clone = on_event.clone();
+    tokio::spawn(async move {
+        while let Some(evt) = rx.recv().await {
+            let val = match evt {
+                llm::StreamEvent::ContentDelta { delta } => json!({ "type": "delta", "content": delta }),
+                llm::StreamEvent::ReasoningDelta { delta } => json!({ "type": "reasoning_delta", "content": delta }),
+                llm::StreamEvent::ToolCallComplete { id, name, arguments, .. } => {
+                    json!({ "type": "tool_call_complete", "id": id, "name": name, "arguments": arguments })
+                }
+                llm::StreamEvent::ToolExecEnd { id, success, output, error, elapsed_ms } => {
+                    json!({ "type": "tool_end", "id": id, "success": success, "output": output, "error": error, "elapsedMs": elapsed_ms })
+                }
+                llm::StreamEvent::Finish { usage, .. } => json!({ "type": "done", "usage": usage }),
+                llm::StreamEvent::Error { error } => json!({ "type": "error", "error": error }),
+                _ => continue,
+            };
+            let _ = on_event_clone.send(val);
+        }
+    });
+
+    let sys_prompt = "You are OmniHarness Theme Designer, a specialized UI/CSS/SVG engineer. Your ONLY job is to customize the OmniHarness interface theme in real time using your theme_* tools. Always call theme_get_dom_spec and theme_read_current first, then apply clean, valid CSS (using [data-omni-*] selectors, CSS variables, @keyframes, @font-face, omni-asset:// URLs), custom SVG icons via theme_set_icon, and UI text/language overrides via theme_set_texts. Never invent files or commands outside your theme_* tools.".to_string();
+
+    let mut msgs = vec![llm::request_compat::ChatMessage::system(sys_prompt)];
+    if let Some(hist) = history {
+        for h in hist {
+            if h.role == "user" {
+                msgs.push(llm::request_compat::ChatMessage::user(h.content));
+            } else if h.role == "assistant" {
+                msgs.push(llm::request_compat::ChatMessage::assistant(h.content));
+            }
+        }
+    }
+
+    let ws_dir = state::AppState::resolve_data_dir().join("themes").to_string_lossy().to_string();
+    let app_state = state.app_state.clone();
+    let stream_mgr = state.stream_mgr.clone();
+    let cid_clone = chat_id.clone();
+
+    tokio::spawn(async move {
+        let res = engine::single_agent::SingleAgentRunner::run_turn(
+            &http_client,
+            &cid_clone,
+            &prompt,
+            &ws_dir,
+            tools,
+            &key_pool,
+            &caps_reg,
+            &prov_name,
+            &b_url,
+            api_protocol.as_deref(),
+            &model_id,
+            &reasoning_effort,
+            None,
+            Some(&app_state.db),
+            false,
+            &session,
+            &mut None,
+            &mut msgs,
+            tx.clone(),
+        )
+        .await;
+        if let Err(e) = res {
+            let _ = tx.send(llm::StreamEvent::Error { error: e }).await;
+        }
+        stream_mgr.remove_session(&cid_clone).await;
+    });
+
+    Ok(chat_id)
 }

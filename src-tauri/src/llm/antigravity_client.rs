@@ -214,6 +214,27 @@ pub async fn stream_antigravity(
         }
     }
 
+    let mut merged_contents: Vec<serde_json::Value> = Vec::with_capacity(contents.len());
+    for item in contents {
+        let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
+        let can_merge = merged_contents
+            .last()
+            .and_then(|prev| prev.get("role").and_then(|r| r.as_str()))
+            .map(|r| r == role)
+            .unwrap_or(false);
+        if can_merge {
+            if let (Some(prev_parts), Some(cur_parts)) = (
+                merged_contents.last_mut().and_then(|p| p.get_mut("parts")).and_then(|a| a.as_array_mut()),
+                item.get("parts").and_then(|a| a.as_array()),
+            ) {
+                prev_parts.extend(cur_parts.iter().cloned());
+                continue;
+            }
+        }
+        merged_contents.push(item);
+    }
+    let contents = merged_contents;
+
     let mut gen_cfg = serde_json::Map::new();
     if let Some(t) = request.temperature {
         gen_cfg.insert("temperature".to_string(), serde_json::json!(t));
@@ -353,12 +374,17 @@ pub async fn stream_antigravity(
                     }
                 }
             }
-            oauth_accounts::mark_account_cooldown(&acc.id, 300, "401 Unauthorized").await;
+            let msg_401 = format!("Antigravity authentication failed (401) for {}", acc.email);
+            oauth_accounts::mark_account_cooldown(&acc.id, 300, &msg_401).await;
             excluded_ids.insert(acc.id.clone());
+            last_err = Some(LlmError::ProviderError {
+                status: 401,
+                message: msg_401.clone(),
+            });
             if attempt == max_attempts {
                 return Err(LlmError::ProviderError {
                     status: 401,
-                    message: format!("Antigravity authentication failed for {}", acc.email),
+                    message: msg_401,
                 });
             }
             continue;
@@ -371,6 +397,9 @@ pub async fn stream_antigravity(
         let code = status.as_u16();
         let err_body = response.text().await.unwrap_or_default();
         let cooldown = if code == 429 { 120 } else { 30 };
+        if code == 429 {
+            oauth_accounts::mark_account_quota_exhausted(&acc.id, Some(0.0), None).await;
+        }
         oauth_accounts::mark_account_cooldown(&acc.id, cooldown, &err_body).await;
         excluded_ids.insert(acc.id.clone());
         last_err = Some(LlmError::ProviderError {

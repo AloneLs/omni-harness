@@ -635,7 +635,7 @@ class ChatStore {
         tail.error = undefined;
       }
       this.messagesByChat[chatId] = [...list];
-      this.saveSessions(chatId);
+      this.safeSetStorage('omni_chat_sessions', JSON.stringify(this.sessions.filter((s) => !s.isDraft)));
       return;
     }
 
@@ -703,7 +703,7 @@ class ChatStore {
       }
       this.messagesByChat[chatId] = [...list];
       this.saveChatMessagesToStorage(chatId, list);
-      this.saveSessions(chatId);
+      this.safeSetStorage('omni_chat_sessions', JSON.stringify(this.sessions.filter((s) => !s.isDraft)));
     }
   }
 
@@ -755,7 +755,13 @@ class ChatStore {
           sessionsChanged = true;
         }
 
-        if ((!targetChatId || targetChatId === bc.id) && !this.streamingChats[bc.id]) {
+        if (!targetChatId || targetChatId === bc.id) {
+          const localMsgs = this.messagesByChat[bc.id] || [];
+          const lastLocal = localMsgs[localMsgs.length - 1];
+          const isTgStreaming = Boolean(this.streamingChats[bc.id]) && Boolean(lastLocal?.id?.startsWith('tg-'));
+          if (this.streamingChats[bc.id] && !(targetChatId === bc.id && isTgStreaming)) {
+            continue;
+          }
           const dbMsgs = await invoke<
             Array<{
               id: string;
@@ -767,21 +773,52 @@ class ChatStore {
             }>
           >('list_messages', { chatId: bc.id });
           if (Array.isArray(dbMsgs)) {
-            const localMsgs = this.messagesByChat[bc.id] || [];
             const lastDb = dbMsgs[dbMsgs.length - 1];
-            const lastLocal = localMsgs[localMsgs.length - 1];
             const changed =
               dbMsgs.length !== localMsgs.length ||
               (lastDb && lastLocal && (lastDb.content !== lastLocal.content || lastDb.id !== lastLocal.id));
-            if (changed && dbMsgs.length >= localMsgs.length) {
-              const converted: ChatMessage[] = dbMsgs.map((m) => ({
-                id: m.id,
-                chatId: m.chatId,
-                role: m.role,
-                content: m.content,
-                reasoningContent: m.reasoningContent || undefined,
-                createdAt: Date.parse(m.createdAt) || Date.now()
-              }));
+            const isTgDoneInDb =
+              isTgStreaming &&
+              targetChatId === bc.id &&
+              lastDb?.role === 'assistant' &&
+              Boolean(lastDb.content?.trim()) &&
+              (dbMsgs.length > localMsgs.length || lastDb.id !== lastLocal?.id);
+            if (isTgDoneInDb) {
+              this.streamingChats[bc.id] = false;
+            }
+            if (!this.streamingChats[bc.id] && ((changed && dbMsgs.length >= localMsgs.length) || isTgDoneInDb)) {
+              const dedupedDb: typeof dbMsgs = [];
+              for (const m of dbMsgs) {
+                const tail = dedupedDb[dedupedDb.length - 1];
+                if (tail && tail.role === 'assistant' && m.role === 'assistant' && tail.content.trim() === m.content.trim()) {
+                  continue;
+                }
+                dedupedDb.push(m);
+              }
+              const usedPrevIds = new Set<string>();
+              const converted: ChatMessage[] = dedupedDb.map((m, idx) => {
+                let prev = localMsgs.find((lm) => lm.id === m.id && !usedPrevIds.has(lm.id));
+                if (!prev && localMsgs[idx]?.role === m.role && localMsgs[idx]?.content.trim() === m.content.trim() && !usedPrevIds.has(localMsgs[idx].id)) {
+                  prev = localMsgs[idx];
+                }
+                if (!prev) {
+                  prev = localMsgs.find((lm) => !usedPrevIds.has(lm.id) && lm.role === m.role && lm.content.trim() === m.content.trim());
+                }
+                if (prev) usedPrevIds.add(prev.id);
+                return {
+                  id: m.id,
+                  chatId: m.chatId,
+                  role: m.role,
+                  content: m.content,
+                  reasoningContent: prev?.reasoningContent || m.reasoningContent || undefined,
+                  toolCalls: prev?.toolCalls,
+                  steps: prev?.steps,
+                  startedAt: prev?.startedAt,
+                  finishedAt: prev?.finishedAt,
+                  createdAt: prev?.createdAt || Date.parse(m.createdAt) || Date.now(),
+                  streaming: false
+                };
+              });
               this.messagesByChat[bc.id] = converted;
               this.saveChatMessagesToStorage(bc.id, converted);
               const sess = this.sessions.find((s) => s.id === bc.id);
@@ -1423,10 +1460,20 @@ class ChatStore {
     }
 
     const titleSeed = text.trim() || options.attachments?.[0]?.name || 'New task';
+    const prevActive = this.activeChatId;
     let chatId = options.targetChatId || this.activeChatId;
     if (!chatId) {
       chatId = await this.createSession(titleSeed.slice(0, 36));
     }
+    if (prevActive) {
+      delete this.draftTextByChat[prevActive];
+      delete this.draftAttachmentsByChat[prevActive];
+    }
+    delete this.draftTextByChat[chatId];
+    delete this.draftAttachmentsByChat[chatId];
+    delete this.draftTextByChat['__new__'];
+    delete this.draftAttachmentsByChat['__new__'];
+    this.persistDrafts();
 
     const userMsgId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
     const userMessage: ChatMessage = {

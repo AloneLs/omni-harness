@@ -233,6 +233,19 @@ impl Database {
 
     pub fn create_message(&self, message: &Message) -> Result<(), AppError> {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        if message.role == "assistant" && !message.content.trim().is_empty() {
+            let mut chk = conn.prepare(
+                "SELECT role, content FROM messages WHERE chat_id = ?1 ORDER BY sequence_num DESC LIMIT 1"
+            )?;
+            let last_pair: Option<(String, String)> = chk
+                .query_row([&message.chat_id], |r| Ok((r.get(0)?, r.get(1)?)))
+                .ok();
+            if let Some((lr, lc)) = last_pair {
+                if lr == "assistant" && lc.trim() == message.content.trim() {
+                    return Ok(());
+                }
+            }
+        }
         conn.execute(
             "INSERT INTO messages (id, chat_id, role, content, reasoning_content, tool_calls, tool_call_id, sequence_num, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",

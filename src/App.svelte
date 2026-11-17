@@ -18,6 +18,10 @@ import McpGatewayTab from './components/settings/McpGatewayTab.svelte';
 import TelegramTab from './components/settings/TelegramTab.svelte';
 import SpeechTab from './components/settings/SpeechTab.svelte';
 import MemorySystemTab from './components/settings/MemorySystemTab.svelte';
+import AppearanceTab from './components/settings/AppearanceTab.svelte';
+import ThemeStudio from './components/themes/ThemeStudio.svelte';
+import MockHarnessPreview from './components/themes/MockHarnessPreview.svelte';
+import { themeStore, compileThemeCss } from './lib/stores/theme.svelte';
 import { settingsStore } from './lib/stores/settings.svelte';
 import { chatStore } from './lib/stores/chat.svelte';
 import { SPRING_LAUNCH, SPRING_PANEL, SPRING_POPUP, attachPressScale } from './lib/motion';
@@ -25,7 +29,7 @@ import { SPRING_LAUNCH, SPRING_PANEL, SPRING_POPUP, attachPressScale } from './l
 let sidebarOpen = $state<boolean>(true);
 let contractsPanelOpen = $state<boolean>(false);
 let activeSettingsTab = $state<
-  'providers' | 'skills' | 'subagents' | 'mcp' | 'telegram' | 'speech' | 'memory'
+  'providers' | 'appearance' | 'skills' | 'subagents' | 'mcp' | 'telegram' | 'speech' | 'memory'
 >('providers');
 
 const launchSpring = new Spring({ opacity: 0, scale: 0.96, y: 10 }, SPRING_LAUNCH);
@@ -36,6 +40,7 @@ const navIndicator = new Spring({ y: 0, height: 34 }, { stiffness: 0.28, damping
 
 const SETTINGS_TABS: { id: typeof activeSettingsTab; label: string; icon: string }[] = [
   { id: 'providers', label: 'Models & Providers', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
+  { id: 'appearance', label: 'Appearance & CSS', icon: 'M12 2L2 7l10 5 10-5-10-5z M2 17l10 5 10-5 M2 12l10 5 10-5' },
   { id: 'skills', label: 'Skills', icon: 'M4 19.5A2.5 2.5 0 0 1 6.5 17H20 M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15z' },
   { id: 'subagents', label: 'Subagents', icon: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2 M9 7a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M23 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75' },
   { id: 'mcp', label: 'MCP Servers', icon: 'M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z M6 12h4 M14 12h4 M10 8v8' },
@@ -146,7 +151,10 @@ function handleGlobalKeyup(e: KeyboardEvent) {
 
 <svelte:window onkeydown={handleGlobalKeydown} onkeyup={handleGlobalKeyup} />
 
+{@html themeStore.activeTheme ? `<style id="omni-active-theme">${compileThemeCss(themeStore.activeTheme, '[data-omni-app]')}</style>` : ''}
+
 <div
+  data-omni-app=""
   class="w-screen h-screen flex bg-[#101012] text-[#E5E5E8] overflow-hidden select-none font-sans"
   style="opacity: {launchSpring.current.opacity}; transform: translateY({launchSpring.current.y}px) scale({launchSpring.current.scale});"
 >
@@ -163,6 +171,7 @@ function handleGlobalKeyup(e: KeyboardEvent) {
     <DotGridCanvas active={chatStore.isStreaming} />
 
     <div
+      data-omni-titlebar=""
       data-tauri-drag-region
       role="presentation"
       class="h-11 w-full flex items-center justify-between pl-3 pr-2 shrink-0 z-40 relative"
@@ -217,7 +226,7 @@ function handleGlobalKeyup(e: KeyboardEvent) {
       </div>
     </div>
 
-    <div class="flex-1 flex min-h-0 overflow-hidden relative z-10">
+    <div data-omni-main="" class="flex-1 flex min-h-0 overflow-hidden relative z-10">
       <DiffReviewPanel />
       <ChatView onToggleContracts={toggleContractsPanel} />
 
@@ -251,20 +260,23 @@ function handleGlobalKeyup(e: KeyboardEvent) {
 
 {#if settingsStore.isSettingsOpen || settingsModalSpring.current.opacity > 0.02}
   <div
-    class="fixed inset-0 bg-black/65 backdrop-blur-[6px] z-[200] flex items-center justify-center p-8 select-none {settingsStore.isSettingsOpen ? 'pointer-events-auto' : 'pointer-events-none'}"
+    class="fixed inset-0 bg-black/65 backdrop-blur-[6px] z-[200] flex items-center justify-center select-none transition-[padding] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] {themeStore.isStudioOpen ? 'p-0' : 'p-8'} {settingsStore.isSettingsOpen ? 'pointer-events-auto' : 'pointer-events-none'}"
     style="opacity: {settingsModalSpring.current.opacity};"
-    onclick={() => settingsStore.closeSettings()}
+    onclick={() => { if (!themeStore.isStudioOpen) settingsStore.closeSettings(); }}
     role="presentation"
   >
     <div
-      class="w-full max-w-[920px] h-[650px] bg-[#161618] border border-white/[0.08] rounded-[6px] flex flex-col overflow-hidden"
-      style="transform: translateY({settingsModalSpring.current.y}px) scale({settingsModalSpring.current.scale});"
+      class="bg-[#161618] border border-white/[0.08] flex flex-col overflow-hidden transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] {themeStore.isStudioOpen ? 'w-screen h-screen max-w-none rounded-none border-0' : 'w-full max-w-[920px] h-[650px] rounded-[6px]'}"
+      style="transform: translateY({themeStore.isStudioOpen ? 0 : settingsModalSpring.current.y}px) scale({themeStore.isStudioOpen ? 1 : settingsModalSpring.current.scale});"
       onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => { if (e.key === 'Escape') settingsStore.closeSettings(); }}
+      onkeydown={(e) => { if (e.key === 'Escape') { if (themeStore.isStudioOpen) themeStore.closeStudio(); else settingsStore.closeSettings(); } }}
       role="dialog"
       aria-modal="true"
       tabindex="-1"
     >
+      {#if themeStore.isStudioOpen}
+        <ThemeStudio />
+      {:else}
       <div class="h-11 px-5 bg-[#121214] border-b border-white/[0.06] flex items-center justify-between shrink-0">
         <span class="font-mono text-xs text-[#D4D4D8] tracking-wide">OMNIHARNESS // SETTINGS</span>
         <button
@@ -318,6 +330,8 @@ function handleGlobalKeyup(e: KeyboardEvent) {
                 <TelegramTab />
               {:else if activeSettingsTab === 'speech'}
                 <SpeechTab />
+              {:else if activeSettingsTab === 'appearance'}
+                <AppearanceTab />
               {:else if activeSettingsTab === 'memory'}
                 <MemorySystemTab />
               {/if}
@@ -325,6 +339,49 @@ function handleGlobalKeyup(e: KeyboardEvent) {
           {/key}
         </section>
       </div>
+      {/if}
+    </div>
+  </div>
+{/if}
+
+{#if themeStore.isFullscreenPreview}
+  <div class="fixed inset-0 z-[300] bg-[#08080B]">
+    <MockHarnessPreview theme={themeStore.editingTheme} fullscreen={true} />
+    <div
+      data-omni-preview-bar=""
+      class="fixed top-3 left-1/2 -translate-x-1/2 z-[350] flex items-center gap-2.5 px-3.5 py-1.5 rounded-full bg-[#0C0C10]/90 backdrop-blur-md border border-white/[0.14] shadow-2xl text-xs text-[#EDEDEF] select-none"
+    >
+      <span class="font-mono text-[11px] text-[#C4B5FD]">Preview: {themeStore.editingTheme?.name || 'Custom'}</span>
+      <button
+        type="button"
+        onclick={() => (themeStore.isFullscreenPreview = false)}
+        class="px-2.5 py-0.5 rounded-full bg-white/[0.1] hover:bg-white/[0.2] text-[11px] text-white transition-colors"
+      >
+        Exit Preview
+      </button>
+      <button
+        type="button"
+        onclick={async () => {
+          if (themeStore.editingTheme) {
+            const saved = await themeStore.saveTheme(themeStore.editingTheme);
+            await themeStore.setActiveTheme(saved.id);
+          }
+          themeStore.isFullscreenPreview = false;
+        }}
+        class="px-2.5 py-0.5 rounded-full bg-[#8B5CF6] hover:bg-[#7C3AED] text-[11px] text-white font-medium transition-colors"
+      >
+        Apply
+      </button>
+      <button
+        type="button"
+        onclick={() => {
+          themeStore.setActiveTheme(null);
+          themeStore.isFullscreenPreview = false;
+        }}
+        class="px-2 py-0.5 rounded-full bg-white/[0.06] hover:bg-[#EF4444]/30 text-[11px] text-[#A3A3AA] hover:text-white transition-colors"
+      >
+        Off
+      </button>
     </div>
   </div>
 {/if}

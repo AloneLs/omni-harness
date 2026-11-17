@@ -1,4 +1,5 @@
 <script lang="ts">
+import { themeStore } from '../lib/stores/theme.svelte';
 import { slide } from 'svelte/transition';
 import { convertFileSrc } from '@tauri-apps/api/core';
 import Icon from './Icon.svelte';
@@ -359,7 +360,7 @@ function toggleTool(id: string) {
     {#if isStreaming && normalizedSteps.length === 0 && !error}
       <div class="relative inline-flex items-center gap-2 py-1 group/retry">
         <span class="font-sans text-[12.5px] font-medium shimmer-text">
-          {statusText || 'Working'} · {totalDurationLabel}
+          {statusText || themeStore.t('working', 'Working')} · {totalDurationLabel}
         </span>
         {#if retryReason}
           <div class="pointer-events-none absolute left-0 bottom-full mb-1.5 z-30 max-w-md px-2.5 py-1.5 rounded-[6px] bg-[#18181B] border border-white/[0.12] shadow-lg font-mono text-[11px] text-[#F87171] whitespace-pre-wrap opacity-0 translate-y-0.5 group-hover/retry:opacity-100 group-hover/retry:translate-y-0 transition-all duration-150">
@@ -379,7 +380,7 @@ function toggleTool(id: string) {
         {#if isStreaming}
           <span class="relative inline-flex items-center group/retry">
             <span class="font-sans text-[12.5px] font-medium shimmer-text">
-              {statusText || 'Working'} · {totalDurationLabel}
+              {statusText || themeStore.t('working', 'Working')} · {totalDurationLabel}
             </span>
             {#if retryReason}
               <span class="pointer-events-none absolute left-0 bottom-full mb-1.5 z-30 max-w-md px-2.5 py-1.5 rounded-[6px] bg-[#18181B] border border-white/[0.12] shadow-lg font-mono text-[11px] text-[#F87171] whitespace-pre-wrap text-left opacity-0 translate-y-0.5 group-hover/retry:opacity-100 group-hover/retry:translate-y-0 transition-all duration-150">
@@ -390,7 +391,7 @@ function toggleTool(id: string) {
         {:else if paused}
           <span class="font-sans text-[12.5px] font-medium text-[#D4D4D8]">Paused · {totalDurationLabel}</span>
         {:else}
-          <span class="font-sans text-[12.5px] font-medium">Worked for {totalDurationLabel}</span>
+          <span class="font-sans text-[12.5px] font-medium">{themeStore.t('worked_for', 'Worked for')} {totalDurationLabel}</span>
         {/if}
         <Icon
           name="chevron-down"

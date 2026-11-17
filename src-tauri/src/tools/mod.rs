@@ -6,6 +6,7 @@ pub mod project_intel;
 pub mod safety;
 pub mod subagents;
 pub mod web_browser;
+pub mod theme_tools;
 pub mod workspace;
 
 use serde::{Deserialize, Serialize};
@@ -74,6 +75,7 @@ pub struct ToolDispatcher {
     pub read_guard: safety::FileReadGuard,
     pub plan_mode: AtomicBool,
     pub db: std::sync::RwLock<Option<crate::db::Database>>,
+    pub theme_studio: Option<(tauri::AppHandle, String)>,
 }
 
 impl ToolDispatcher {
@@ -95,6 +97,7 @@ impl ToolDispatcher {
             read_guard: safety::FileReadGuard::new(),
             plan_mode: AtomicBool::new(false),
             db: std::sync::RwLock::new(None),
+            theme_studio: None,
         }
     }
 
@@ -118,6 +121,20 @@ impl ToolDispatcher {
             read_guard: self.read_guard.clone(),
             plan_mode: AtomicBool::new(self.plan_mode.load(Ordering::Relaxed)),
             db: std::sync::RwLock::new(self.db.read().ok().and_then(|g| g.clone())),
+            theme_studio: None,
+        })
+    }
+
+    pub fn for_theme_studio(&self, app_handle: tauri::AppHandle, theme_id: &str) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            pty_manager: self.pty_manager.clone(),
+            cdp_controller: self.cdp_controller.clone(),
+            github_client: self.github_client.clone(),
+            allowed_roots: vec![crate::state::AppState::resolve_data_dir().join("themes")],
+            read_guard: self.read_guard.clone(),
+            plan_mode: AtomicBool::new(false),
+            db: std::sync::RwLock::new(None),
+            theme_studio: Some((app_handle, theme_id.to_string())),
         })
     }
 
@@ -168,6 +185,49 @@ impl ToolDispatcher {
                 },
             }
         };
+
+        if self.theme_studio.is_some() {
+            return vec![
+                make_decl(
+                    "theme_get_dom_spec",
+                    "Get all data-omni-* selectors, CSS variables, icon names, and text override keys.",
+                    &[],
+                    &[],
+                ),
+                make_decl(
+                    "theme_read_current",
+                    "Read the current theme CSS, iconOverrides, textOverrides, and assets.",
+                    &[],
+                    &[],
+                ),
+                make_decl(
+                    "theme_apply_css",
+                    "Set, append, or patch the theme CSS and immediately live-update the preview.",
+                    &[
+                        ("css", "string", "Full CSS replacement"),
+                        ("append", "string", "CSS snippet to append"),
+                        ("old_str", "string", "Substring to replace"),
+                        ("new_str", "string", "Replacement substring"),
+                    ],
+                    &[],
+                ),
+                make_decl(
+                    "theme_set_icon",
+                    "Override or reset an SVG icon by name.",
+                    &[
+                        ("name", "string", "Icon name"),
+                        ("svg", "string", "SVG markup or path d attribute (empty to reset)"),
+                    ],
+                    &["name", "svg"],
+                ),
+                make_decl(
+                    "theme_set_texts",
+                    "Override UI labels or language strings.",
+                    &[("overrides", "object", "Map of text key to replacement string")],
+                    &["overrides"],
+                ),
+            ];
+        }
 
         declarations.push(make_decl(
             "read_file",
@@ -493,6 +553,19 @@ impl ToolDispatcher {
         chat_id: Option<&str>,
     ) -> ToolExecutionResult {
         let start = std::time::Instant::now();
+        if let Some((ref app, ref tid)) = self.theme_studio {
+            let (output, error, success) = match theme_tools::execute_theme_tool(app, tid, name, args).await {
+                Ok(msg) => (json!({ "result": msg }), None, true),
+                Err(e) => (Value::Null, Some(e), false),
+            };
+            return ToolExecutionResult {
+                tool_name: name.to_string(),
+                success,
+                output,
+                error,
+                elapsed_ms: start.elapsed().as_millis(),
+            };
+        }
         if let Err(verr) = self.validate_tool_args(name, args) {
             return ToolExecutionResult {
                 tool_name: name.to_string(),

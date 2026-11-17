@@ -40,12 +40,24 @@ interface OAuthAccountItem {
   expiresAtMs: number;
   cooldownUntilMs?: number | null;
   lastError?: string | null;
+  quota5hRemaining?: number | null;
+  quota5hResetAtMs?: number | null;
+  quotaWeeklyRemaining?: number | null;
+  quotaWeeklyResetAtMs?: number | null;
+  quotaLabel?: string | null;
+  quotaUpdatedAtMs?: number | null;
 }
 
+const OAUTH_PROTOCOLS = ['antigravity', 'openai_codex', 'claude_oauth', 'kimi_oauth', 'xai_oauth', 'zcode_oauth', 'perplexity_oauth'] as const;
+
 const OAUTH_PROVIDERS = [
-  { id: 'antigravity', title: 'Antigravity (Google)', subtitle: 'Gemini, Claude & GPT-OSS via Google OAuth' },
-  { id: 'openai_codex', title: 'ChatGPT Codex (OpenAI)', subtitle: 'Plus/Pro/Team subscription via OAuth' },
-  { id: 'claude_oauth', title: 'Claude (Anthropic)', subtitle: 'Pro/Max subscription via Claude Code OAuth' }
+  { id: 'antigravity', title: 'Antigravity (Google)', subtitle: 'Gemini, Claude & GPT-OSS via Google OAuth', kind: 'oauth' },
+  { id: 'openai_codex', title: 'ChatGPT Codex (OpenAI)', subtitle: 'Plus/Pro/Team subscription via OAuth', kind: 'oauth' },
+  { id: 'claude_oauth', title: 'Claude (Anthropic)', subtitle: 'Pro/Max subscription via Claude Code OAuth', kind: 'oauth' },
+  { id: 'kimi_oauth', title: 'Kimi (Moonshot)', subtitle: 'Kimi Code subscription via Device Flow', kind: 'device' },
+  { id: 'xai_oauth', title: 'Grok (xAI)', subtitle: 'SuperGrok / X Premium+ via Device Flow', kind: 'device' },
+  { id: 'zcode_oauth', title: 'ZCode (Z.ai)', subtitle: 'GLM Coding / Start Plan via OAuth JWT', kind: 'oauth' },
+  { id: 'perplexity_oauth', title: 'Perplexity', subtitle: 'API Key / Session pool (no public LLM OAuth)', kind: 'token' }
 ] as const;
 
 let oauthAccounts = $state<OAuthAccountItem[]>([]);
@@ -53,24 +65,74 @@ let oauthStatus = $state<string | null>(null);
 let oauthManualInputs = $state<Record<string, string>>({});
 let oauthPendingMode = $state<Record<string, string>>({});
 let oauthBusy = $state<Record<string, boolean>>({});
+let accCheckStatus = $state<Record<string, { state: 'idle' | 'testing' | 'ok' | 'err'; error?: string }>>({});
 let oauthProxyOpen = $state<boolean>(false);
 let oauthProxyEnabled = $state<boolean>(typeof localStorage !== 'undefined' && localStorage.getItem('omni_oauth_proxy_enabled') === '1');
 let oauthProxyUrl = $state<string>(typeof localStorage !== 'undefined' ? (localStorage.getItem('omni_oauth_proxy_url') || '') : '');
+let proxySaveTimer: ReturnType<typeof setTimeout> | null = null;
 
-function saveOAuthProxy() {
+function saveOAuthProxy(silent = false) {
+  const cleanUrl = oauthProxyUrl.trim();
   if (typeof localStorage !== 'undefined') {
     localStorage.setItem('omni_oauth_proxy_enabled', oauthProxyEnabled ? '1' : '0');
-    localStorage.setItem('omni_oauth_proxy_url', oauthProxyUrl.trim());
+    localStorage.setItem('omni_oauth_proxy_url', cleanUrl);
   }
+  invoke('oauth_set_proxy', { enabled: oauthProxyEnabled, url: cleanUrl }).catch(() => {});
   for (const prov of Object.values(settingsStore.data.providers)) {
-    if (prov.apiProtocol === 'antigravity' || prov.apiProtocol === 'openai_codex' || prov.apiProtocol === 'claude_oauth') {
+    if (OAUTH_PROTOCOLS.includes(prov.apiProtocol as any)) {
       settingsStore.updateProvider(prov.id, {
         proxyEnabled: oauthProxyEnabled,
-        proxyUrl: oauthProxyUrl.trim()
+        proxyUrl: cleanUrl
       });
     }
   }
-  oauthStatus = oauthProxyEnabled && oauthProxyUrl.trim() ? `OAuth proxy saved: ${oauthProxyUrl.trim()}` : 'OAuth proxy disabled';
+  if (!silent) {
+    oauthStatus = oauthProxyEnabled && cleanUrl ? `OAuth proxy saved: ${cleanUrl}` : 'OAuth proxy disabled';
+  }
+}
+
+function scheduleAutoSaveProxy() {
+  if (proxySaveTimer) clearTimeout(proxySaveTimer);
+  proxySaveTimer = setTimeout(() => {
+    saveOAuthProxy(true);
+  }, 350);
+}
+
+function formatResetDelta(ms?: number | null): string {
+  if (!ms) return '';
+  const diff = Math.max(0, ms - Date.now());
+  if (diff <= 0) return 'resetting';
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 48) return `${hrs}h ${mins % 60}m`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ${hrs % 24}h`;
+}
+
+function formatAccQuotaTooltip(acc: OAuthAccountItem): string {
+  const parts: string[] = [];
+  if (acc.quotaLabel) parts.push(`Plan: ${acc.quotaLabel}`);
+  if (typeof acc.quota5hRemaining === 'number') {
+    const d = formatResetDelta(acc.quota5hResetAtMs);
+    parts.push(`5h: ${Math.round(acc.quota5hRemaining)}%${d ? ` (resets ${d})` : ''}`);
+  }
+  if (typeof acc.quotaWeeklyRemaining === 'number') {
+    const d = formatResetDelta(acc.quotaWeeklyResetAtMs);
+    parts.push(`Weekly: ${Math.round(acc.quotaWeeklyRemaining)}%${d ? ` (resets ${d})` : ''}`);
+  }
+  if (acc.lastError) parts.push(`Error: ${acc.lastError}`);
+  return parts.join(' · ') || 'Quota not fetched yet';
+}
+
+function aggregateLiveQuota(accs: OAuthAccountItem[]): { q5h: number | null; q7d: number | null; liveCount: number } {
+  const now = Date.now();
+  const live = accs.filter((a) => a.enabled && (!a.cooldownUntilMs || a.cooldownUntilMs <= now));
+  const q5Vals = live.map((a) => a.quota5hRemaining).filter((v): v is number => typeof v === 'number');
+  const q7Vals = live.map((a) => a.quotaWeeklyRemaining).filter((v): v is number => typeof v === 'number');
+  const q5h = q5Vals.length > 0 ? Math.min(100, Math.round(q5Vals.reduce((s, x) => s + x, 0) / q5Vals.length)) : null;
+  const q7d = q7Vals.length > 0 ? Math.min(100, Math.round(q7Vals.reduce((s, x) => s + x, 0) / q7Vals.length)) : null;
+  return { q5h, q7d, liveCount: live.length };
 }
 
 function getOAuthProxyParams(oauthProv?: string): { proxyEnabled: boolean; proxyUrl: string | null } {
@@ -96,6 +158,14 @@ async function loadOAuthAccounts() {
 }
 
 onMount(() => {
+  invoke<{ enabled: boolean; url: string }>('oauth_get_proxy')
+    .then((px) => {
+      if (px && (px.enabled || px.url)) {
+        oauthProxyEnabled = px.enabled;
+        oauthProxyUrl = px.url || '';
+      }
+    })
+    .catch(() => {});
   loadOAuthAccounts();
   let unlisten: (() => void) | null = null;
   listen<{ provider?: string }>('oauth-accounts-updated', async (ev) => {
@@ -112,12 +182,16 @@ onMount(() => {
 async function ensureOAuthProviderRegistered(oauthProv: string) {
   const existing = Object.values(settingsStore.data.providers).find((p) => p.apiProtocol === oauthProv);
   const px = getOAuthProxyParams(oauthProv);
-  const cmdName =
-    oauthProv === 'antigravity'
-      ? 'oauth_fetch_antigravity_models'
-      : oauthProv === 'openai_codex'
-        ? 'oauth_fetch_codex_models'
-        : 'oauth_fetch_claude_models';
+  const cmdMap: Record<string, string> = {
+    antigravity: 'oauth_fetch_antigravity_models',
+    openai_codex: 'oauth_fetch_codex_models',
+    claude_oauth: 'oauth_fetch_claude_models',
+    kimi_oauth: 'oauth_fetch_kimi_models',
+    xai_oauth: 'oauth_fetch_xai_models',
+    zcode_oauth: 'oauth_fetch_zcode_models',
+    perplexity_oauth: 'oauth_fetch_perplexity_models'
+  };
+  const cmdName = cmdMap[oauthProv] || 'oauth_fetch_claude_models';
 
   let models: DetectedModelInfo[] = [];
   try {
@@ -171,12 +245,16 @@ async function ensureOAuthProviderRegistered(oauthProv: string) {
       proxyUrl: px.proxyUrl || ''
     });
   } else {
-    const meta =
-      oauthProv === 'antigravity'
-        ? { id: 'antigravity-oauth', name: 'Antigravity', baseUrl: 'https://daily-cloudcode-pa.googleapis.com' }
-        : oauthProv === 'openai_codex'
-          ? { id: 'openai-codex-oauth', name: 'ChatGPT Codex', baseUrl: 'https://chatgpt.com/backend-api/codex' }
-          : { id: 'claude-oauth', name: 'Claude OAuth', baseUrl: 'https://api.anthropic.com/v1' };
+    const metaMap: Record<string, { id: string; name: string; baseUrl: string }> = {
+      antigravity: { id: 'antigravity-oauth', name: 'Antigravity', baseUrl: 'https://daily-cloudcode-pa.googleapis.com' },
+      openai_codex: { id: 'openai-codex-oauth', name: 'ChatGPT Codex', baseUrl: 'https://chatgpt.com/backend-api/codex' },
+      claude_oauth: { id: 'claude-oauth', name: 'Claude OAuth', baseUrl: 'https://api.anthropic.com/v1' },
+      kimi_oauth: { id: 'kimi-oauth', name: 'Kimi (Moonshot)', baseUrl: 'https://api.kimi.com/coding/v1' },
+      xai_oauth: { id: 'xai-oauth', name: 'Grok (xAI)', baseUrl: 'https://cli-chat-proxy.grok.com/v1' },
+      zcode_oauth: { id: 'zcode-oauth', name: 'ZCode (Z.ai)', baseUrl: 'https://api.z.ai/api/anthropic/v1' },
+      perplexity_oauth: { id: 'perplexity-oauth', name: 'Perplexity', baseUrl: 'https://api.perplexity.ai' }
+    };
+    const meta = metaMap[oauthProv] || { id: oauthProv, name: oauthProv, baseUrl: '' };
     settingsStore.addProvider({
       id: meta.id,
       name: meta.name,
@@ -195,21 +273,62 @@ async function ensureOAuthProviderRegistered(oauthProv: string) {
 }
 
 async function startOAuthLogin(provId: string) {
+  if (provId === 'perplexity_oauth') {
+    oauthPendingMode = { ...oauthPendingMode, [provId]: 'token' };
+    oauthStatus = 'Paste your Perplexity API Key (pplx-...) or session token below.';
+    return;
+  }
   oauthBusy = { ...oauthBusy, [provId]: true };
   oauthStatus = null;
   try {
-    const res = await invoke<{ authUrl: string; mode: string }>('oauth_start_login', {
+    const res = await invoke<{ authUrl: string; mode: string; userCode?: string }>('oauth_start_login', {
       provider: provId,
       ...getOAuthProxyParams(provId)
     });
     oauthPendingMode = { ...oauthPendingMode, [provId]: res.mode || 'manual' };
-    oauthStatus = res.mode === 'callback'
-      ? `Browser opened for ${provId}. Waiting for callback (or paste redirect URL below)...`
-      : `Browser opened for ${provId}. Paste the authorization code or redirect URL below.`;
+    if (res.mode === 'device_code') {
+      oauthStatus = `Browser opened for ${provId}. Enter code ${res.userCode || ''} — waiting for authorization...`;
+    } else if (res.mode === 'callback') {
+      oauthStatus = `Browser opened for ${provId}. Waiting for callback (or paste redirect URL below)...`;
+    } else {
+      oauthStatus = `Browser opened for ${provId}. Paste the authorization code or redirect URL below.`;
+    }
   } catch (err: any) {
     oauthStatus = err instanceof Error ? err.message : String(err);
   } finally {
     oauthBusy = { ...oauthBusy, [provId]: false };
+  }
+}
+
+async function checkAccountLiveness(acc: OAuthAccountItem) {
+  accCheckStatus = { ...accCheckStatus, [acc.id]: { state: 'testing' } };
+  try {
+    await invoke<OAuthAccountItem>('oauth_check_account', {
+      id: acc.id,
+      ...getOAuthProxyParams(acc.provider)
+    });
+    await loadOAuthAccounts();
+    accCheckStatus = { ...accCheckStatus, [acc.id]: { state: 'ok' } };
+  } catch (err: any) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await loadOAuthAccounts();
+    accCheckStatus = { ...accCheckStatus, [acc.id]: { state: 'err', error: msg } };
+  }
+}
+
+async function refreshQuotas(provider?: string) {
+  const key = provider ? `q_${provider}` : 'q_all';
+  oauthBusy = { ...oauthBusy, [key]: true };
+  try {
+    await invoke('oauth_refresh_quotas', {
+      provider: provider || null,
+      ...getOAuthProxyParams(provider)
+    });
+    await loadOAuthAccounts();
+  } catch (err: any) {
+    oauthStatus = err instanceof Error ? err.message : String(err);
+  } finally {
+    oauthBusy = { ...oauthBusy, [key]: false };
   }
 }
 
@@ -219,11 +338,17 @@ async function completeManualOAuth(provId: string) {
   oauthBusy = { ...oauthBusy, [provId]: true };
   oauthStatus = null;
   try {
-    const acc = await invoke<OAuthAccountItem>('oauth_complete_manual_login', {
-      provider: provId,
-      codeOrUrl: code,
-      ...getOAuthProxyParams(provId)
-    });
+    const acc = provId === 'perplexity_oauth'
+      ? await invoke<OAuthAccountItem>('oauth_add_manual_token', {
+          provider: provId,
+          label: 'perplexity',
+          token: code
+        })
+      : await invoke<OAuthAccountItem>('oauth_complete_manual_login', {
+          provider: provId,
+          codeOrUrl: code,
+          ...getOAuthProxyParams(provId)
+        });
     oauthManualInputs = { ...oauthManualInputs, [provId]: '' };
     oauthPendingMode = { ...oauthPendingMode, [provId]: '' };
     await loadOAuthAccounts();
@@ -623,23 +748,36 @@ function handleSaveProvider(e: Event) {
   </div>
 
   {#if oauthProxyOpen}
-    <div class="p-3 rounded-[6px] bg-[#18181B]/70 border border-white/[0.08] flex items-center gap-2.5">
-      <label class="flex items-center gap-1.5 text-xs text-[#D4D4D8] shrink-0 cursor-pointer">
-        <input type="checkbox" bind:checked={oauthProxyEnabled} class="accent-[#8B5CF6]" />
-        <span>Enable Proxy</span>
-      </label>
+    <div class="p-3 rounded-[6px] bg-[#18181B]/70 border border-white/[0.08] flex items-center gap-3" in:slide={{ duration: 140 }}>
+      <div class="flex items-center gap-2 shrink-0">
+        <button
+          type="button"
+          class="w-9 h-5 rounded-full p-0.5 transition-all duration-200 {oauthProxyEnabled ? 'bg-[#8B5CF6]' : 'bg-[#27272A]'}"
+          onclick={() => {
+            oauthProxyEnabled = !oauthProxyEnabled;
+            saveOAuthProxy(false);
+          }}
+          aria-label="Enable OAuth Proxy"
+        >
+          <div class="w-4 h-4 rounded-full transition-transform duration-200 {oauthProxyEnabled ? 'translate-x-4 bg-white shadow-sm' : 'translate-x-0 bg-[#73737A]'}"></div>
+        </button>
+        <span class="text-xs text-[#D4D4D8]">OAuth Proxy</span>
+      </div>
       <input
         type="text"
         bind:value={oauthProxyUrl}
+        oninput={scheduleAutoSaveProxy}
         placeholder="http://127.0.0.1:7890 or socks5://127.0.0.1:1080"
-        class="flex-1 h-7 px-2.5 rounded-[5px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#5C5C64] outline-none"
+        class="flex-1 h-7 px-2.5 rounded-[5px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#5C5C64] outline-none focus:border-[#8B5CF6]/50"
       />
       <button
         type="button"
-        onclick={saveOAuthProxy}
-        class="h-7 px-3 rounded-[5px] bg-[#27272A] hover:bg-[#323236] border border-white/[0.08] text-[11px] text-[#EDEDEF] shrink-0"
+        onclick={() => refreshQuotas()}
+        disabled={oauthBusy.q_all}
+        class="h-7 px-2.5 rounded-[5px] bg-[#27272A] hover:bg-[#323236] border border-white/[0.08] text-[11px] text-[#EDEDEF] shrink-0 disabled:opacity-50"
+        title="Refresh quotas for all OAuth accounts"
       >
-        Apply
+        {oauthBusy.q_all ? 'Checking...' : 'Refresh Quotas'}
       </button>
     </div>
   {/if}
@@ -653,17 +791,45 @@ function handleSaveProvider(e: Event) {
 
     {#each OAUTH_PROVIDERS as op}
       {@const accs = oauthAccounts.filter((a) => a.provider === op.id)}
+      {@const agg = aggregateLiveQuota(accs)}
       <div class="px-3.5 py-2.5 space-y-2">
         <div class="flex items-center justify-between gap-3">
           <div class="flex items-center gap-2.5 min-w-0">
             <span class="text-xs font-medium text-[#E5E5E8] truncate">{op.title}</span>
             <span class="text-[11px] text-[#686870] truncate hidden sm:inline">{op.subtitle}</span>
             {#if accs.length > 0}
-              <span class="px-1.5 py-0.5 rounded-[4px] bg-white/[0.05] font-mono text-[10px] text-[#A3A3AA] shrink-0">{accs.length}</span>
+              <span class="px-1.5 py-0.5 rounded-[4px] bg-white/[0.05] font-mono text-[10px] text-[#A3A3AA] shrink-0">{agg.liveCount}/{accs.length}</span>
+            {/if}
+            {#if agg.q5h !== null}
+              <span class="inline-flex items-center gap-1 text-[10px] font-mono text-[#D4D4D8] shrink-0" title="Combined 5h remaining quota across active accounts">
+                <svg class="w-3.5 h-3.5 -rotate-90" viewBox="0 0 20 20">
+                  <circle cx="10" cy="10" r="7.5" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="2.5" />
+                  <circle cx="10" cy="10" r="7.5" fill="none" stroke={agg.q5h > 25 ? '#8B5CF6' : '#F59E0B'} stroke-width="2.5" stroke-dasharray="47.12" stroke-dashoffset={47.12 * (1 - agg.q5h / 100)} stroke-linecap="round" />
+                </svg>
+                5h {agg.q5h}%
+              </span>
+            {/if}
+            {#if agg.q7d !== null}
+              <span class="inline-flex items-center gap-1 text-[10px] font-mono text-[#A3A3AA] shrink-0" title="Combined weekly remaining quota across active accounts">
+                <svg class="w-3.5 h-3.5 -rotate-90" viewBox="0 0 20 20">
+                  <circle cx="10" cy="10" r="7.5" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="2.5" />
+                  <circle cx="10" cy="10" r="7.5" fill="none" stroke={agg.q7d > 25 ? '#22C55E' : '#F59E0B'} stroke-width="2.5" stroke-dasharray="47.12" stroke-dashoffset={47.12 * (1 - agg.q7d / 100)} stroke-linecap="round" />
+                </svg>
+                7d {agg.q7d}%
+              </span>
             {/if}
           </div>
           <div class="flex items-center gap-1.5 shrink-0">
             {#if accs.length > 0}
+              <button
+                type="button"
+                disabled={oauthBusy[`q_${op.id}`]}
+                onclick={() => refreshQuotas(op.id)}
+                class="h-7 px-2 rounded-[5px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.07] text-[10.5px] text-[#A3A3AA] hover:text-[#E5E5E8] transition-colors disabled:opacity-50"
+                title="Refresh quota for this provider"
+              >
+                {oauthBusy[`q_${op.id}`] ? '...' : 'Quota'}
+              </button>
               <button
                 type="button"
                 onclick={() => ensureOAuthProviderRegistered(op.id)}
@@ -672,21 +838,23 @@ function handleSaveProvider(e: Event) {
                 Sync Models
               </button>
             {/if}
-            <button
-              type="button"
-              onclick={() => (oauthPendingMode = { ...oauthPendingMode, [op.id]: oauthPendingMode[op.id] ? '' : 'manual' })}
-              class="h-7 px-2 rounded-[5px] bg-transparent hover:bg-white/[0.05] border border-white/[0.06] text-[11px] text-[#8E8E95] hover:text-[#D4D4D8] transition-colors"
-              title="Paste callback URL or code manually"
-            >
-              Code
-            </button>
+            {#if op.kind !== 'token'}
+              <button
+                type="button"
+                onclick={() => (oauthPendingMode = { ...oauthPendingMode, [op.id]: oauthPendingMode[op.id] ? '' : 'manual' })}
+                class="h-7 px-2 rounded-[5px] bg-transparent hover:bg-white/[0.05] border border-white/[0.06] text-[11px] text-[#8E8E95] hover:text-[#D4D4D8] transition-colors"
+                title="Paste callback URL or code manually"
+              >
+                Code
+              </button>
+            {/if}
             <button
               type="button"
               disabled={oauthBusy[op.id]}
               onclick={() => startOAuthLogin(op.id)}
               class="h-7 px-2.5 rounded-[5px] bg-[#27272A] hover:bg-[#323236] border border-white/[0.08] text-[11px] text-[#EDEDEF] transition-colors disabled:opacity-50"
             >
-              {oauthBusy[op.id] ? 'Opening...' : '+ Connect'}
+              {oauthBusy[op.id] ? 'Opening...' : op.kind === 'token' ? '+ Add Key' : '+ Connect'}
             </button>
           </div>
         </div>
@@ -696,7 +864,7 @@ function handleSaveProvider(e: Event) {
             <input
               type="text"
               bind:value={oauthManualInputs[op.id]}
-              placeholder="Paste redirect URL or authorization code..."
+              placeholder={op.kind === 'token' ? 'Paste Perplexity API key (pplx-...) or session token...' : 'Paste redirect URL or authorization code...'}
               class="flex-1 h-7 px-2.5 rounded-[5px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#5C5C64] outline-none focus:border-white/[0.2]"
             />
             <button
@@ -705,7 +873,7 @@ function handleSaveProvider(e: Event) {
               onclick={() => completeManualOAuth(op.id)}
               class="h-7 px-2.5 rounded-[5px] bg-[#27272A] hover:bg-[#323236] border border-white/[0.08] text-[11px] text-[#EDEDEF] disabled:opacity-40"
             >
-              Verify
+              {op.kind === 'token' ? 'Save' : 'Verify'}
             </button>
           </div>
         {/if}
@@ -713,18 +881,58 @@ function handleSaveProvider(e: Event) {
         {#if accs.length > 0}
           <div class="space-y-1">
             {#each accs as acc (acc.id)}
-              <div class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[5px] bg-[#121214] border border-white/[0.05] text-[11px]">
+              {@const chk = accCheckStatus[acc.id]}
+              <div
+                class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[5px] bg-[#121214] border border-white/[0.05] text-[11px]"
+                title={formatAccQuotaTooltip(acc)}
+              >
                 <div class="flex items-center gap-2 min-w-0">
                   <span class="w-1.5 h-1.5 rounded-full shrink-0 {acc.enabled ? (acc.cooldownUntilMs && acc.cooldownUntilMs > Date.now() ? 'bg-[#F59E0B]' : 'bg-[#22C55E]') : 'bg-[#52525B]'}"></span>
                   <span class="font-mono text-[#D4D4D8] truncate">{acc.email}</span>
+                  {#if acc.quotaLabel}
+                    <span class="px-1 py-0.5 rounded bg-white/[0.05] font-mono text-[9.5px] text-[#A3A3AA] shrink-0">{acc.quotaLabel}</span>
+                  {/if}
+                  {#if typeof acc.quota5hRemaining === 'number'}
+                    <span class="inline-flex items-center gap-1 font-mono text-[10px] text-[#C4B5FD] shrink-0">
+                      <svg class="w-3 h-3 -rotate-90" viewBox="0 0 20 20">
+                        <circle cx="10" cy="10" r="7" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="2.5" />
+                        <circle cx="10" cy="10" r="7" fill="none" stroke={acc.quota5hRemaining > 20 ? '#8B5CF6' : '#EF4444'} stroke-width="2.5" stroke-dasharray="43.98" stroke-dashoffset={43.98 * (1 - acc.quota5hRemaining / 100)} stroke-linecap="round" />
+                      </svg>
+                      {Math.round(acc.quota5hRemaining)}%
+                    </span>
+                  {/if}
+                  {#if typeof acc.quotaWeeklyRemaining === 'number'}
+                    <span class="inline-flex items-center gap-1 font-mono text-[10px] text-[#86EFAC] shrink-0">
+                      <svg class="w-3 h-3 -rotate-90" viewBox="0 0 20 20">
+                        <circle cx="10" cy="10" r="7" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="2.5" />
+                        <circle cx="10" cy="10" r="7" fill="none" stroke={acc.quotaWeeklyRemaining > 20 ? '#22C55E' : '#EF4444'} stroke-width="2.5" stroke-dasharray="43.98" stroke-dashoffset={43.98 * (1 - acc.quotaWeeklyRemaining / 100)} stroke-linecap="round" />
+                      </svg>
+                      {Math.round(acc.quotaWeeklyRemaining)}%
+                    </span>
+                  {/if}
                   {#if acc.projectId}
                     <span class="font-mono text-[10px] text-[#686870] truncate">{acc.projectId}</span>
                   {/if}
                   {#if acc.lastError}
-                    <span class="text-[10px] text-[#F87171] truncate max-w-[180px]" title={acc.lastError}>{acc.lastError}</span>
+                    <span class="text-[10px] text-[#F87171] truncate max-w-[160px]" title={acc.lastError}>{acc.lastError}</span>
                   {/if}
                 </div>
                 <div class="flex items-center gap-1 shrink-0">
+                  {#if chk?.state === 'testing'}
+                    <span class="font-mono text-[10px] text-[#A3A3AA] px-1">...</span>
+                  {:else if chk?.state === 'ok'}
+                    <span class="font-mono text-[10px] text-[#4ADE80] px-1">OK</span>
+                  {:else if chk?.state === 'err'}
+                    <span class="font-mono text-[10px] text-[#F87171] px-1" title={chk.error || 'Error'}>ERR</span>
+                  {/if}
+                  <button
+                    type="button"
+                    onclick={() => checkAccountLiveness(acc)}
+                    class="px-2 py-0.5 rounded bg-white/[0.06] hover:bg-white/[0.12] text-[10px] text-[#D4D4D8] transition-colors"
+                    title="Check if account is alive & refresh quota"
+                  >
+                    Check
+                  </button>
                   <button
                     type="button"
                     onclick={() => toggleOAuthAcc(acc)}
@@ -857,17 +1065,23 @@ function handleSaveProvider(e: Event) {
 
         <div class="space-y-1.5">
           <span class="text-xs text-[#A3A3AA] block">API Protocol</span>
-          <div class="grid grid-cols-4 gap-1 p-1 rounded-[6px] bg-[#121214] border border-white/[0.06]">
-            {#each [['auto', 'Auto'], ['chat_completions', 'Chat'], ['responses', 'Responses'], ['anthropic_messages', 'Anthropic'], ['google_gemini', 'Google AI'], ['antigravity', 'Antigravity'], ['openai_codex', 'Codex OAuth'], ['claude_oauth', 'Claude OAuth']] as [val, label]}
-              <button
-                type="button"
-                class="py-1.5 px-2 rounded-[4px] font-mono text-[11px] transition-colors {apiProtocol === val ? 'bg-white/[0.12] text-[#EDEDEF] font-medium' : 'text-[#73737A] hover:text-[#D4D4D8]'}"
-                onclick={() => (apiProtocol = val as ApiProtocol)}
-              >
-                {label}
-              </button>
-            {/each}
-          </div>
+          {#if OAUTH_PROTOCOLS.includes(apiProtocol as any)}
+            <div class="px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.06] font-mono text-[11px] text-[#C4B5FD]">
+              OAuth: {apiProtocol} (managed in Subscription OAuth Accounts above)
+            </div>
+          {:else}
+            <div class="grid grid-cols-5 gap-1 p-1 rounded-[6px] bg-[#121214] border border-white/[0.06]">
+              {#each [['auto', 'Auto'], ['chat_completions', 'Chat'], ['responses', 'Responses'], ['anthropic_messages', 'Anthropic'], ['google_gemini', 'Google AI']] as [val, label]}
+                <button
+                  type="button"
+                  class="py-1.5 px-2 rounded-[4px] font-mono text-[11px] transition-colors {apiProtocol === val ? 'bg-white/[0.12] text-[#EDEDEF] font-medium' : 'text-[#73737A] hover:text-[#D4D4D8]'}"
+                  onclick={() => (apiProtocol = val as ApiProtocol)}
+                >
+                  {label}
+                </button>
+              {/each}
+            </div>
+          {/if}
         </div>
 
         <div class="space-y-2">
@@ -875,16 +1089,26 @@ function handleSaveProvider(e: Event) {
             <span class="text-xs text-[#A3A3AA]">Enable Proxy (HTTP / HTTPS / SOCKS5 / SOCKS5h)</span>
             <button
               type="button"
-              class="w-9 h-5 rounded-full p-0.5 transition-colors {proxyEnabled ? 'bg-[#EDEDEF]' : 'bg-[#27272A]'}"
-              onclick={() => (proxyEnabled = !proxyEnabled)}
+              class="w-9 h-5 rounded-full p-0.5 transition-all duration-200 {proxyEnabled ? 'bg-[#8B5CF6]' : 'bg-[#27272A]'}"
+              onclick={() => {
+                proxyEnabled = !proxyEnabled;
+                if (editingId) {
+                  settingsStore.updateProvider(editingId, { proxyEnabled, proxyUrl: proxyUrl.trim() });
+                }
+              }}
               aria-label="Enable Proxy"
             >
-              <div class="w-4 h-4 rounded-full transition-transform {proxyEnabled ? 'translate-x-4 bg-[#111113]' : 'translate-x-0 bg-[#73737A]'}"></div>
+              <div class="w-4 h-4 rounded-full transition-transform duration-200 {proxyEnabled ? 'translate-x-4 bg-white shadow-sm' : 'translate-x-0 bg-[#73737A]'}"></div>
             </button>
           </div>
           {#if proxyEnabled}
             <input
               bind:value={proxyUrl}
+              oninput={() => {
+                if (editingId) {
+                  settingsStore.updateProvider(editingId, { proxyEnabled, proxyUrl: proxyUrl.trim() });
+                }
+              }}
               type="text"
               placeholder="socks5h://127.0.0.1:1080 or http://user:pass@host:port"
               class="w-full px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-white/[0.2]"

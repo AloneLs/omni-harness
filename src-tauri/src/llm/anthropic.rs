@@ -34,6 +34,46 @@ pub async fn stream_anthropic_oauth(
     .await
 }
 
+pub async fn stream_kimi_oauth(
+    client: &reqwest::Client,
+    caps_registry: &CapabilityRegistry,
+    request: ChatRequest,
+    sender: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> Result<(), LlmError> {
+    let empty_pool = KeyPool::new();
+    stream_anthropic_inner(
+        client,
+        "https://api.kimi.com/coding/v1/messages",
+        &empty_pool,
+        "kimi_oauth",
+        caps_registry,
+        request,
+        sender,
+        true,
+    )
+    .await
+}
+
+pub async fn stream_zcode_oauth(
+    client: &reqwest::Client,
+    caps_registry: &CapabilityRegistry,
+    request: ChatRequest,
+    sender: tokio::sync::mpsc::Sender<StreamEvent>,
+) -> Result<(), LlmError> {
+    let empty_pool = KeyPool::new();
+    stream_anthropic_inner(
+        client,
+        "https://api.z.ai/api/anthropic/v1/messages",
+        &empty_pool,
+        "zcode_oauth",
+        caps_registry,
+        request,
+        sender,
+        true,
+    )
+    .await
+}
+
 pub async fn stream_anthropic(
     client: &reqwest::Client,
     base_url: &str,
@@ -81,7 +121,7 @@ async fn stream_anthropic_inner(
     let mut last_oauth_err: Option<LlmError> = None;
     for attempt in 1..=max_attempts {
         let (api_key, oauth_acc) = if use_claude_oauth {
-            let acc = match crate::llm::oauth_accounts::acquire_valid_account(client, "claude_oauth", &excluded_oauth).await {
+            let acc = match crate::llm::oauth_accounts::acquire_valid_account(client, provider_name, &excluded_oauth).await {
                 Ok(a) => a,
                 Err(e) => return Err(last_oauth_err.unwrap_or(LlmError::ProviderError { status: 401, message: e })),
             };
@@ -303,7 +343,35 @@ async fn stream_anthropic_inner(
             payload["tools"] = serde_json::json!(mapped_tools);
         }
 
-        let req_builder = if use_claude_oauth {
+        let req_builder = if use_claude_oauth && provider_name == "kimi_oauth" {
+            let k_url = if let Some(ref acc) = oauth_acc {
+                if acc.account_id.as_deref() == Some("kimi.ai") {
+                    "https://api.kimi.ai/coding/v1/messages"
+                } else {
+                    target_url.as_str()
+                }
+            } else {
+                target_url.as_str()
+            };
+            client
+                .post(k_url)
+                .header("Authorization", format!("Bearer {}", api_key))
+                .header("anthropic-version", "2023-06-01")
+                .header("user-agent", "claude-code/1.0.0")
+                .header("X-Msh-Platform", "kimi_cli")
+                .header("Content-Type", "application/json")
+                .json(&payload)
+        } else if use_claude_oauth && provider_name == "zcode_oauth" {
+            client
+                .post(&target_url)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("user-agent", "ZCode/3.17.1")
+                .header("HTTP-Referer", "https://zcode.z.ai")
+                .header("X-Title", "Z Code@electron")
+                .header("Content-Type", "application/json")
+                .json(&payload)
+        } else if use_claude_oauth {
             client
                 .post(&target_url)
                 .header("Authorization", format!("Bearer {}", api_key))
@@ -344,6 +412,23 @@ async fn stream_anthropic_inner(
 
         let status = response.status();
         if status.is_success() {
+            if let Some(ref acc) = oauth_acc {
+                let u5h = response
+                    .headers()
+                    .get("anthropic-ratelimit-unified-5h-utilization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|u| ((1.0 - u) * 100.0).clamp(0.0, 100.0));
+                let u7d = response
+                    .headers()
+                    .get("anthropic-ratelimit-unified-7d-utilization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|u| ((1.0 - u) * 100.0).clamp(0.0, 100.0));
+                if u5h.is_some() || u7d.is_some() {
+                    crate::llm::oauth_accounts::update_account_quota_partial(&acc.id, u5h, None, u7d, None).await;
+                }
+            }
             key_pool.mark_success(provider_name, base_url, &api_key).await;
 
             let mut byte_stream = response.bytes_stream();
@@ -602,6 +687,9 @@ async fn stream_anthropic_inner(
         let code = status.as_u16();
         if let Some(ref acc) = oauth_acc {
             let cd = if code == 429 { 120 } else { 30 };
+            if code == 429 {
+                crate::llm::oauth_accounts::mark_account_quota_exhausted(&acc.id, Some(0.0), None).await;
+            }
             crate::llm::oauth_accounts::mark_account_cooldown(&acc.id, cd, &error_body).await;
             excluded_oauth.insert(acc.id.clone());
             last_oauth_err = Some(LlmError::ProviderError { status: code, message: error_body.clone() });
