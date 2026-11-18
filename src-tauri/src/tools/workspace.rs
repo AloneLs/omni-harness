@@ -38,95 +38,16 @@ pub struct ReadFileResult {
 
 pub const MAX_PATCH_DIFF_LINES: i64 = 5000;
 
-fn is_reserved_windows_name(path: &Path) -> bool {
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    matches!(
-        stem.as_str(),
-        "CON" | "PRN" | "AUX" | "NUL"
-            | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
-            | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
-    )
-}
-
 pub fn validate_path(path_str: &str, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
-    if path_str.starts_with("\\\\") || path_str.starts_with("//") {
-        return Err(format!("Access denied: UNC network path '{}' is not allowed.", path_str));
-    }
-    let raw = Path::new(path_str);
-    if is_reserved_windows_name(raw) {
-        return Err(format!("Invalid path: '{}' uses a reserved Windows device name.", path_str));
-    }
-    let p = if raw.is_absolute() {
-        raw.to_path_buf()
-    } else if let Some(base) = allowed_roots.first() {
-        base.join(raw)
-    } else {
-        raw.to_path_buf()
-    };
-
-    let resolved = if p.exists() {
-        p.canonicalize().map_err(|e| e.to_string())?
-    } else {
-        let mut ancestor = p.parent();
-        let mut tail_parts: Vec<std::ffi::OsString> = Vec::new();
-        if let Some(fname) = p.file_name() {
-            tail_parts.push(fname.to_os_string());
-        } else {
-            return Err("Invalid file path".to_string());
-        }
-        while let Some(anc) = ancestor {
-            if anc.exists() {
-                let mut can = anc.canonicalize().map_err(|e| e.to_string())?;
-                for part in tail_parts.iter().rev() {
-                    can.push(part);
-                }
-                ancestor = None;
-                let _ = ancestor;
-                return ensure_within_roots(can, path_str, allowed_roots);
-            }
-            if let Some(name) = anc.file_name() {
-                tail_parts.push(name.to_os_string());
-            }
-            ancestor = anc.parent();
-        }
-        p
-    };
-
-    ensure_within_roots(resolved, path_str, allowed_roots)
+    crate::tools::path_norm::validate_path_with_base(path_str, None, allowed_roots)
 }
 
 pub fn normalize_windows_path(path: &Path) -> PathBuf {
-    let s = path.to_string_lossy();
-    let stripped = if s.starts_with(r"\\?\UNC\") {
-        format!(r"\\{}", &s[8..])
-    } else if s.starts_with(r"\\?\") {
-        s[4..].to_string()
-    } else {
-        s.to_string()
-    };
-    PathBuf::from(stripped.replace('/', "\\"))
+    crate::tools::path_norm::strip_verbatim_prefix(path)
 }
 
-fn ensure_within_roots(resolved: PathBuf, raw_str: &str, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
-    let norm_resolved = normalize_windows_path(&resolved);
-    if allowed_roots.is_empty() {
-        return Ok(norm_resolved);
-    }
-    let res_lower = norm_resolved.to_string_lossy().to_lowercase();
-    for root in allowed_roots {
-        let can_root = root.canonicalize().unwrap_or_else(|_| root.clone());
-        let norm_root = normalize_windows_path(&can_root);
-        let root_lower = norm_root.to_string_lossy().to_lowercase();
-        let root_prefix = root_lower.trim_end_matches('\\');
-        if res_lower == root_prefix || res_lower.starts_with(&format!("{}\\", root_prefix)) || res_lower.starts_with(&format!("{}/", root_prefix)) {
-            return Ok(norm_resolved);
-        }
-    }
-    Err(format!("Access denied: path '{}' resolves outside allowed workspace root.", raw_str))
+pub fn validate_read_path(path_str: &str, allowed_roots: &[PathBuf]) -> Result<PathBuf, String> {
+    crate::tools::path_norm::validate_read_path_with_base(path_str, None, allowed_roots)
 }
 
 pub fn record_file_snapshot(
@@ -212,7 +133,21 @@ pub fn read_file(
     if !target.exists() {
         return Err(format!("File does not exist: {}", path_str));
     }
-    let content = fs::read_to_string(&target).map_err(|e| e.to_string())?;
+    let raw_bytes = fs::read(&target).map_err(|e| e.to_string())?;
+    let is_pdf = target
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("pdf"))
+        .unwrap_or(false)
+        || raw_bytes.starts_with(b"%PDF-");
+    let content = if is_pdf {
+        extract_pdf_text(&raw_bytes)
+    } else {
+        match String::from_utf8(raw_bytes) {
+            Ok(txt) => txt,
+            Err(err) => String::from_utf8_lossy(err.as_bytes()).into_owned(),
+        }
+    };
     let all_lines: Vec<&str> = content.lines().collect();
     let total_lines = all_lines.len();
 
@@ -834,7 +769,7 @@ pub fn read_file_smart(
     allowed_roots: &[PathBuf],
     guard: &crate::tools::safety::FileReadGuard,
 ) -> Result<serde_json::Value, String> {
-    let target = validate_path(path_str, allowed_roots)?;
+    let target = validate_read_path(path_str, allowed_roots)?;
     crate::tools::safety::SecretShield::check_path(&target)?;
     if !target.exists() {
         return Err(format!("File does not exist: {}", path_str));
@@ -925,190 +860,7 @@ pub fn read_file_smart(
 }
 
 fn apply_single_edit_cascade(source: &str, old_text: &str, new_text: &str, replace_all: bool) -> Result<(String, usize), String> {
-    if old_text.is_empty() {
-        return Err("old_text cannot be empty".to_string());
-    }
-    if source.contains(old_text) {
-        let match_count = source.matches(old_text).count();
-        if !replace_all && match_count > 1 {
-            return Err(format!(
-                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
-                match_count
-            ));
-        }
-        let out = if replace_all {
-            source.replace(old_text, new_text)
-        } else {
-            source.replacen(old_text, new_text, 1)
-        };
-        return Ok((out, match_count));
-    }
-
-    let is_crlf = source.contains("\r\n");
-    let norm_src = source.replace("\r\n", "\n");
-    let norm_old = old_text.replace("\r\n", "\n");
-    let norm_new = new_text.replace("\r\n", "\n");
-    if norm_src.contains(&norm_old) {
-        let match_count = norm_src.matches(&norm_old).count();
-        if !replace_all && match_count > 1 {
-            return Err(format!(
-                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
-                match_count
-            ));
-        }
-        let out = if replace_all {
-            norm_src.replace(&norm_old, &norm_new)
-        } else {
-            norm_src.replacen(&norm_old, &norm_new, 1)
-        };
-        let restored = if is_crlf { out.replace('\n', "\r\n") } else { out };
-        return Ok((restored, match_count));
-    }
-
-    let clean_s = norm_src.replace('\u{FEFF}', "").replace('\u{00A0}', " ").replace('\u{200B}', "");
-    let clean_o = norm_old.replace('\u{FEFF}', "").replace('\u{00A0}', " ").replace('\u{200B}', "");
-    if clean_s.contains(&clean_o) {
-        let match_count = clean_s.matches(&clean_o).count();
-        if !replace_all && match_count > 1 {
-            return Err(format!(
-                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
-                match_count
-            ));
-        }
-        let out = if replace_all {
-            clean_s.replace(&clean_o, &norm_new)
-        } else {
-            clean_s.replacen(&clean_o, &norm_new, 1)
-        };
-        let restored = if is_crlf { out.replace('\n', "\r\n") } else { out };
-        return Ok((restored, match_count));
-    }
-
-    let esc_o = norm_old.replace("\n", "\\n");
-    if esc_o != norm_old && norm_src.contains(&esc_o) {
-        let match_count = norm_src.matches(&esc_o).count();
-        if !replace_all && match_count > 1 {
-            return Err(format!(
-                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
-                match_count
-            ));
-        }
-        let esc_n = norm_new.replace("\n", "\\n");
-        let out = if replace_all {
-            norm_src.replace(&esc_o, &esc_n)
-        } else {
-            norm_src.replacen(&esc_o, &esc_n, 1)
-        };
-        let restored = if is_crlf { out.replace('\n', "\r\n") } else { out };
-        return Ok((restored, match_count));
-    }
-
-    let trim_lines = |s: &str| -> Vec<String> {
-        s.lines().map(|l| l.trim_end().to_string()).collect()
-    };
-    let src_lines = trim_lines(&norm_src);
-    let old_lines = trim_lines(&norm_old);
-    if !old_lines.is_empty() && src_lines.len() >= old_lines.len() {
-        let mut hits = Vec::new();
-        for i in 0..=src_lines.len() - old_lines.len() {
-            if src_lines[i..i + old_lines.len()] == old_lines[..] {
-                hits.push(i);
-            }
-        }
-        if hits.len() > 1 && !replace_all {
-            return Err(format!("Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.", hits.len()));
-        }
-        if let Some(&i) = hits.first() {
-            let mut out_lines: Vec<String> = norm_src.lines().map(|l| l.to_string()).collect();
-            let new_lines: Vec<String> = norm_new.lines().map(|l| l.to_string()).collect();
-            out_lines.splice(i..i + old_lines.len(), new_lines);
-            return Ok((out_lines.join("\n"), 1));
-        }
-    }
-
-    let trim_all = |s: &str| -> Vec<String> {
-        s.lines().map(|l| l.trim().to_string()).collect()
-    };
-    let src_trim = trim_all(&norm_src);
-    let old_trim = trim_all(&norm_old);
-    if !old_trim.is_empty() && src_trim.len() >= old_trim.len() {
-        for i in 0..=src_trim.len() - old_trim.len() {
-            if src_trim[i..i + old_trim.len()] == old_trim[..] {
-                let mut out_lines: Vec<String> = norm_src.lines().map(|l| l.to_string()).collect();
-                let base_indent: String = out_lines[i]
-                    .chars()
-                    .take_while(|c| c.is_whitespace())
-                    .collect();
-                let old_first_indent = norm_old
-                    .lines()
-                    .next()
-                    .map(|l| l.chars().take_while(|c| c.is_whitespace()).count())
-                    .unwrap_or(0);
-                let new_lines: Vec<String> = norm_new
-                    .lines()
-                    .map(|l| {
-                        let stripped: String = if l.chars().take_while(|c| c.is_whitespace()).count() >= old_first_indent {
-                            l.chars().skip(old_first_indent).collect()
-                        } else {
-                            l.trim_start().to_string()
-                        };
-                        format!("{}{}", base_indent, stripped)
-                    })
-                    .collect();
-                out_lines.splice(i..i + old_lines.len(), new_lines);
-                return Ok((out_lines.join("\n"), 1));
-            }
-        }
-    }
-
-    let strip_ln_prefix = |s: &str| -> String {
-        let trimmed = s.trim_start();
-        if let Some(pos) = trimmed.find('|') {
-            if pos > 0 && pos <= 6 && trimmed[..pos].trim().chars().all(|c| c.is_ascii_digit()) {
-                return trimmed[pos + 1..].trim_start_matches(' ').to_string();
-            }
-        }
-        s.to_string()
-    };
-    let collapse_ws = |s: &str| -> Vec<String> {
-        s.lines()
-            .map(|l| strip_ln_prefix(l).split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect()
-    };
-    let src_ws = collapse_ws(&norm_src);
-    let old_ws = collapse_ws(&norm_old);
-    if !old_ws.is_empty() && old_ws.iter().any(|l| !l.is_empty()) && src_ws.len() >= old_ws.len() {
-        for i in 0..=src_ws.len() - old_ws.len() {
-            if src_ws[i..i + old_ws.len()] == old_ws[..] {
-                let mut out_lines: Vec<String> = norm_src.lines().map(|l| l.to_string()).collect();
-                let base_indent: String = out_lines[i]
-                    .chars()
-                    .take_while(|c| c.is_whitespace())
-                    .collect();
-                let old_first_indent = norm_old
-                    .lines()
-                    .next()
-                    .map(|l| strip_ln_prefix(l).chars().take_while(|c| c.is_whitespace()).count())
-                    .unwrap_or(0);
-                let new_lines: Vec<String> = norm_new
-                    .lines()
-                    .map(|l| {
-                        let clean_l = strip_ln_prefix(l);
-                        let stripped: String = if clean_l.chars().take_while(|c| c.is_whitespace()).count() >= old_first_indent {
-                            clean_l.chars().skip(old_first_indent).collect()
-                        } else {
-                            clean_l.trim_start().to_string()
-                        };
-                        format!("{}{}", base_indent, stripped)
-                    })
-                    .collect();
-                out_lines.splice(i..i + old_ws.len(), new_lines);
-                return Ok((out_lines.join("\n"), 1));
-            }
-        }
-    }
-
-    Err(format!("old_text not found in file (even after whitespace/indent cascade): '{}'. Call read_file around the target lines and pass the exact substring.", old_text.lines().next().unwrap_or("")))
+    crate::tools::edit_cascade::apply_single_edit_cascade(source, old_text, new_text, replace_all)
 }
 
 pub fn edit_file_cascade(
@@ -1412,10 +1164,10 @@ pub fn glob_sorted_by_mtime(
     allowed_roots: &[PathBuf],
 ) -> Result<Vec<String>, String> {
     let raw_root = match root_opt {
-        Some(r) if !r.trim().is_empty() => validate_path(r, allowed_roots)?,
+        Some(r) if !r.trim().is_empty() => validate_read_path(r, allowed_roots)?,
         _ => allowed_roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
     };
-    let root = raw_root.canonicalize().unwrap_or(raw_root);
+    let root = crate::tools::path_norm::strip_verbatim_prefix(&raw_root.canonicalize().unwrap_or(raw_root));
     let root_norm = root
         .to_string_lossy()
         .replace('\\', "/")
@@ -1485,10 +1237,11 @@ pub fn grep_with_context(
     context_lines: usize,
     allowed_roots: &[PathBuf],
 ) -> Result<Vec<serde_json::Value>, String> {
-    let root = match root_opt {
-        Some(r) if !r.trim().is_empty() => validate_path(r, allowed_roots)?,
+    let raw_root = match root_opt {
+        Some(r) if !r.trim().is_empty() => validate_read_path(r, allowed_roots)?,
         _ => allowed_roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
     };
+    let root = crate::tools::path_norm::strip_verbatim_prefix(&raw_root.canonicalize().unwrap_or(raw_root));
     enum LineMatcher {
         Simple(regex::Regex),
         Lookaround {
@@ -1599,4 +1352,130 @@ pub fn grep_with_context(
     }
 
     Ok(results)
+}
+
+fn decode_pdf_literal(bytes: &[u8]) -> String {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 1;
+            match bytes[i] {
+                b'n' => out.push(b'\n'),
+                b'r' => out.push(b'\r'),
+                b't' => out.push(b'\t'),
+                b'b' => out.push(0x08),
+                b'f' => out.push(0x0c),
+                b'(' | b')' | b'\\' => out.push(bytes[i]),
+                b'0'..=b'7' => {
+                    let mut oct = (bytes[i] - b'0') as u8;
+                    for _ in 0..2 {
+                        if i + 1 < bytes.len() && (b'0'..=b'7').contains(&bytes[i + 1]) {
+                            i += 1;
+                            oct = oct.saturating_mul(8).saturating_add(bytes[i] - b'0');
+                        } else {
+                            break;
+                        }
+                    }
+                    out.push(oct);
+                }
+                _ => out.push(bytes[i]),
+            }
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    if out.len() >= 2 && out[0] == 0xFE && out[1] == 0xFF {
+        let u16s: Vec<u16> = out[2..]
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        return String::from_utf16_lossy(&u16s);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn extract_text_from_pdf_stream(data: &[u8], out: &mut String) {
+    let s = String::from_utf8_lossy(data);
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'(' {
+            let start = i + 1;
+            let mut depth = 1usize;
+            i += 1;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'(' {
+                    depth += 1;
+                } else if bytes[i] == b')' {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            let end = i.min(bytes.len());
+            let tail = &bytes[end..bytes.len().min(end + 16)];
+            let tail_str = String::from_utf8_lossy(tail);
+            if tail_str.contains("Tj") || tail_str.contains("'") || tail_str.contains("\"") || tail_str.contains("TJ") {
+                let txt = decode_pdf_literal(&bytes[start..end]);
+                if !txt.trim().is_empty() {
+                    out.push_str(&txt);
+                    out.push(' ');
+                }
+            }
+        } else if i + 2 <= bytes.len() && (&bytes[i..i + 2] == b"ET" || &bytes[i..i + 2] == b"T*" || &bytes[i..i + 2] == b"Td" || &bytes[i..i + 2] == b"TD") {
+            if !out.ends_with('\n') && !out.is_empty() {
+                out.push('\n');
+            }
+        }
+        i += 1;
+    }
+}
+
+fn extract_pdf_text(raw: &[u8]) -> String {
+    use std::io::Read;
+    let mut extracted = String::new();
+    let mut pos = 0usize;
+    while let Some(rel_start) = raw[pos..].windows(6).position(|w| w == b"stream") {
+        let s_pos = pos + rel_start + 6;
+        let stream_start = if s_pos < raw.len() && raw[s_pos] == b'\r' && s_pos + 1 < raw.len() && raw[s_pos + 1] == b'\n' {
+            s_pos + 2
+        } else if s_pos < raw.len() && (raw[s_pos] == b'\n' || raw[s_pos] == b'\r') {
+            s_pos + 1
+        } else {
+            pos = s_pos;
+            continue;
+        };
+        if let Some(rel_end) = raw[stream_start..].windows(9).position(|w| w == b"endstream") {
+            let stream_end = stream_start + rel_end;
+            let chunk = &raw[stream_start..stream_end];
+            let mut decoded = Vec::new();
+            let mut z = flate2::read::ZlibDecoder::new(chunk);
+            if z.read_to_end(&mut decoded).is_ok() && !decoded.is_empty() {
+                extract_text_from_pdf_stream(&decoded, &mut extracted);
+            } else {
+                extract_text_from_pdf_stream(chunk, &mut extracted);
+            }
+            pos = stream_end + 9;
+        } else {
+            break;
+        }
+    }
+    let cleaned: Vec<&str> = extracted
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if cleaned.is_empty() {
+        "[PDF file: no selectable text streams found (may be scanned images)]".to_string()
+    } else {
+        cleaned.join("\n")
+    }
 }

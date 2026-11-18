@@ -135,6 +135,34 @@ function aggregateLiveQuota(accs: OAuthAccountItem[]): { q5h: number | null; q7d
   return { q5h, q7d, liveCount: live.length };
 }
 
+function tierRank(label: string): number {
+  const l = label.toLowerCase();
+  if (l.includes('ultra') || l === 'gpt pro' || l.includes('max')) return 4;
+  if (l.includes('enterprise') || l.includes('business') || l.includes('team') || l.includes('edu')) return 3;
+  if (l.includes('pro') || l.includes('plus')) return 2;
+  if (l.includes('go') || l.includes('standard')) return 1;
+  return 0;
+}
+
+function tierBadgeClass(label?: string | null): string {
+  const l = (label || '').toLowerCase();
+  if (l.includes('ultra') || l === 'gpt pro' || l.includes('max')) {
+    return 'border-[#8B5CF6]/45 bg-[#8B5CF6]/12 text-[#DDD6FE]';
+  }
+  if (l.includes('pro') || l.includes('plus') || l.includes('team') || l.includes('business') || l.includes('enterprise') || l.includes('edu') || l.includes('go')) {
+    return 'border-white/[0.12] bg-white/[0.06] text-[#E5E5E8]';
+  }
+  return 'border-white/[0.06] bg-white/[0.03] text-[#8E8E95]';
+}
+
+function summarizeProviderTiers(accs: OAuthAccountItem[]): string[] {
+  const active = accs.filter((a) => a.enabled && a.quotaLabel);
+  const pool = active.length > 0 ? active : accs.filter((a) => a.quotaLabel);
+  const unique = Array.from(new Set(pool.map((a) => a.quotaLabel!.trim()).filter(Boolean)));
+  unique.sort((a, b) => tierRank(b) - tierRank(a));
+  return unique.slice(0, 2);
+}
+
 function getOAuthProxyParams(oauthProv?: string): { proxyEnabled: boolean; proxyUrl: string | null } {
   const existing = oauthProv
     ? Object.values(settingsStore.data.providers).find((p) => p.apiProtocol === oauthProv)
@@ -166,7 +194,41 @@ onMount(() => {
       }
     })
     .catch(() => {});
-  loadOAuthAccounts();
+  loadOAuthAccounts().then(() => {
+    const missingProviders = Array.from(
+      new Set(
+        oauthAccounts
+          .filter((a) => a.enabled && !a.quotaLabel && (a.provider === 'antigravity' || a.provider === 'openai_codex'))
+          .map((a) => a.provider)
+      )
+    );
+    for (const prov of missingProviders) {
+      refreshQuotas(prov);
+    }
+  });
+  let unlistenZcode: (() => void) | null = null;
+  listen<string>('zcode-oauth-callback', async (ev) => {
+    const cbUrl = ev.payload;
+    if (!cbUrl) return;
+    oauthBusy = { ...oauthBusy, zcode_oauth: true };
+    oauthStatus = 'Completing ZCode login...';
+    try {
+      await invoke('oauth_complete_manual_login', {
+        provider: 'zcode_oauth',
+        codeOrUrl: cbUrl,
+        ...getOAuthProxyParams('zcode_oauth')
+      });
+      await loadOAuthAccounts();
+      await ensureOAuthProviderRegistered('zcode_oauth');
+      oauthPendingMode = { ...oauthPendingMode, zcode_oauth: '' };
+      oauthStatus = 'ZCode account connected.';
+    } catch (err: any) {
+      oauthStatus = err instanceof Error ? err.message : String(err);
+    } finally {
+      oauthBusy = { ...oauthBusy, zcode_oauth: false };
+    }
+  }).then((fn) => (unlistenZcode = fn)).catch(() => {});
+
   let unlisten: (() => void) | null = null;
   listen<{ provider?: string }>('oauth-accounts-updated', async (ev) => {
     await loadOAuthAccounts();
@@ -175,7 +237,7 @@ onMount(() => {
     }
   }).then((fn) => (unlisten = fn)).catch(() => {});
   return () => {
-    if (unlisten) unlisten();
+    if (unlisten) unlisten(); if (unlistenZcode) unlistenZcode();
   };
 });
 
@@ -792,11 +854,18 @@ function handleSaveProvider(e: Event) {
     {#each OAUTH_PROVIDERS as op}
       {@const accs = oauthAccounts.filter((a) => a.provider === op.id)}
       {@const agg = aggregateLiveQuota(accs)}
+      {@const provTiers = summarizeProviderTiers(accs)}
       <div class="px-3.5 py-2.5 space-y-2">
         <div class="flex items-center justify-between gap-3">
           <div class="flex items-center gap-2.5 min-w-0">
             <span class="text-xs font-medium text-[#E5E5E8] truncate">{op.title}</span>
-            <span class="text-[11px] text-[#686870] truncate hidden sm:inline">{op.subtitle}</span>
+            {#if provTiers.length > 0}
+              {#each provTiers as tier}
+                <span class="px-1.5 py-0.5 rounded-[4px] border font-mono text-[9.5px] leading-none shrink-0 {tierBadgeClass(tier)}">{tier}</span>
+              {/each}
+            {:else}
+              <span class="text-[11px] text-[#686870] truncate hidden sm:inline">{op.subtitle}</span>
+            {/if}
             {#if accs.length > 0}
               <span class="px-1.5 py-0.5 rounded-[4px] bg-white/[0.05] font-mono text-[10px] text-[#A3A3AA] shrink-0">{agg.liveCount}/{accs.length}</span>
             {/if}
@@ -890,7 +959,7 @@ function handleSaveProvider(e: Event) {
                   <span class="w-1.5 h-1.5 rounded-full shrink-0 {acc.enabled ? (acc.cooldownUntilMs && acc.cooldownUntilMs > Date.now() ? 'bg-[#F59E0B]' : 'bg-[#22C55E]') : 'bg-[#52525B]'}"></span>
                   <span class="font-mono text-[#D4D4D8] truncate">{acc.email}</span>
                   {#if acc.quotaLabel}
-                    <span class="px-1 py-0.5 rounded bg-white/[0.05] font-mono text-[9.5px] text-[#A3A3AA] shrink-0">{acc.quotaLabel}</span>
+                    <span class="px-1.5 py-0.5 rounded-[4px] border font-mono text-[9.5px] leading-none shrink-0 {tierBadgeClass(acc.quotaLabel)}">{acc.quotaLabel}</span>
                   {/if}
                   {#if typeof acc.quota5hRemaining === 'number'}
                     <span class="inline-flex items-center gap-1 font-mono text-[10px] text-[#C4B5FD] shrink-0">

@@ -15,6 +15,7 @@ let {
   toolCalls = [],
   isStreaming = false,
   paused = false,
+  canResume = true,
   hasFinalContent = false,
   statusText = '',
   retryReason = '',
@@ -29,6 +30,7 @@ let {
   toolCalls?: ToolExecutionRecord[];
   isStreaming?: boolean;
   paused?: boolean;
+  canResume?: boolean;
   hasFinalContent?: boolean;
   statusText?: string;
   retryReason?: string;
@@ -39,7 +41,7 @@ let {
   onContinue?: () => void;
 } = $props();
 
-let pipelineExpanded = $state<boolean>(Boolean(isStreaming || error || paused));
+let pipelineExpanded = $state<boolean>(false);
 let userToggledPipeline = $state<boolean>(false);
 let prevStreamingState = false;
 
@@ -51,7 +53,7 @@ $effect(() => {
   prevStreamingState = isStreaming;
 
   if (!userToggledPipeline) {
-    if (error || paused) {
+    if (canResume && (error || paused)) {
       pipelineExpanded = true;
     } else if (!isStreaming || hasFinalContent) {
       pipelineExpanded = false;
@@ -201,8 +203,23 @@ function formatToolLabel(record: ToolExecutionRecord): { verb: string; target: s
     return { verb: 'Ran', target: cmd ? String(cmd) : record.actionName };
   }
   if (n.includes('computer_use')) {
-    const act = record.args?.action || 'action';
-    return { verb: 'Desktop', target: String(act) };
+    const act = String(record.args?.action || 'action');
+    if (act === 'launch_app') return { verb: 'Launched', target: String(record.args?.app || 'app') };
+    if (act === 'bind_window' || act === 'focus_window') {
+      return { verb: 'Bound', target: String(record.args?.window_title || record.args?.process_name || record.args?.hwnd || 'window') };
+    }
+    if (act === 'screenshot') return { verb: 'Captured', target: String(record.args?.window_title || 'window') };
+    if (act === 'snapshot_ui') return { verb: 'Inspected UI', target: String(record.args?.filter || 'controls') };
+    if (act === 'uia_action' || act === 'click_element' || act === 'set_value') {
+      const el = record.args?.element_id || record.args?.element_name || record.args?.automation_id || 'element';
+      return { verb: 'UIA', target: `${record.args?.uia_op || act} ${el}` };
+    }
+    if (act === 'type') return { verb: 'Typed', target: `${String(record.args?.text || '').slice(0, 36)}` };
+    if (act === 'hotkey') return { verb: 'Hotkey', target: String(record.args?.keys || '') };
+    if (act.includes('click') || act === 'drag' || act === 'scroll') {
+      return { verb: 'Ghost Input', target: `${act} (${record.args?.x ?? 500}, ${record.args?.y ?? 500})` };
+    }
+    return { verb: 'Computer Use', target: act };
   }
   return { verb: record.actionName, target: record.previewArgs || '' };
 }
@@ -354,9 +371,9 @@ function toggleTool(id: string) {
 }
 </script>
 
-{#if isStreaming || paused || normalizedSteps.length > 0 || error}
+{#if isStreaming || (paused && canResume) || normalizedSteps.length > 0 || (error && (canResume || error !== 'User canceled execution'))}
   {@const isCanceled = error === 'User canceled execution'}
-  <div class="w-full my-1.5 text-[13px] select-none">
+  <div data-omni-timeline="" class="w-full my-1.5 text-[13px] select-none">
     {#if isStreaming && normalizedSteps.length === 0 && !error}
       <div class="relative inline-flex items-center gap-2 py-1 group/retry">
         <span class="font-sans text-[12.5px] font-medium shimmer-text">
@@ -371,6 +388,7 @@ function toggleTool(id: string) {
     {:else if normalizedSteps.length > 0}
       <button
         type="button"
+        data-omni-timeline-header=""
         class="flex items-center gap-1.5 py-1 text-[#A3A3AA] hover:text-[#EDEDEF] transition-colors"
         onclick={() => {
           userToggledPipeline = true;
@@ -468,6 +486,7 @@ function toggleTool(id: string) {
               <div>
                 <button
                   type="button"
+                  data-omni-tool-row=""
                   class="w-full flex items-center gap-2 py-0.5 text-left group/step transition-colors"
                   onclick={() => toggleTool(call.toolCallId)}
                 >
@@ -517,7 +536,15 @@ function toggleTool(id: string) {
                 </button>
 
                 {#if expandedTools[call.toolCallId]}
+                  {@const toolImg = extractToolImagePreview(call)}
                   <div transition:slide={{ duration: 150 }} class="mt-1 mb-1.5 pl-3 border-l border-white/[0.08] font-mono text-[11px] text-[#8E8E95] space-y-1.5 select-text">
+                    {#if toolImg}
+                      <img
+                        src={toolImg}
+                        alt="Captured target window"
+                        class="rounded-[6px] border border-white/[0.08] max-h-72 w-auto object-contain bg-[#0B0B0D]"
+                      />
+                    {/if}
                     {#if call.terminalData}
                       <div class="text-[#D4D4D8] whitespace-pre-wrap break-all">$ {call.terminalData.command}</div>
                       {#if call.terminalData.stdout}
@@ -550,7 +577,7 @@ function toggleTool(id: string) {
             {/if}
           {/each}
 
-          {#if paused && !isStreaming && !error}
+          {#if paused && canResume && !isStreaming && !error}
             <div class="pt-1 flex items-center gap-2">
               <span class="font-sans text-[12px] text-[#8E8E95]">Работа на паузе</span>
               <button
@@ -563,18 +590,20 @@ function toggleTool(id: string) {
             </div>
           {/if}
 
-          {#if error}
+          {#if error && (!isCanceled || canResume)}
             <div class="pt-0.5">
               <div class="flex items-center gap-2 py-0.5">
                 {#if isCanceled}
                   <span class="font-sans text-[12.5px] text-[#73737A]">{error}</span>
-                  <button
-                    type="button"
-                    class="px-2 py-0.5 rounded-[5px] bg-white/[0.08] hover:bg-white/[0.14] text-[11px] font-sans font-medium text-[#EDEDEF] transition-colors"
-                    onclick={onContinue}
-                  >
-                    Продолжить
-                  </button>
+                  {#if canResume}
+                    <button
+                      type="button"
+                      class="px-2 py-0.5 rounded-[5px] bg-white/[0.08] hover:bg-white/[0.14] text-[11px] font-sans font-medium text-[#EDEDEF] transition-colors"
+                      onclick={onContinue}
+                    >
+                      Продолжить
+                    </button>
+                  {/if}
                 {:else}
                   <button
                     type="button"
@@ -601,20 +630,22 @@ function toggleTool(id: string) {
                         <Icon name="copy" class="w-3 h-3" strokeWidth={1.6} />
                       {/if}
                     </button>
-                    <button
-                      type="button"
-                      class="px-2 py-0.5 rounded-[5px] bg-[#EDEDEF] hover:bg-white text-[11px] font-sans font-medium text-[#111113] transition-colors"
-                      onclick={onContinue}
-                    >
-                      Продолжить
-                    </button>
-                    <button
-                      type="button"
-                      class="px-2 py-0.5 rounded-[4px] text-[11px] font-sans text-[#A3A3AA] hover:text-[#EDEDEF] hover:bg-white/[0.06] transition-colors"
-                      onclick={onRetry}
-                    >
-                      Retry
-                    </button>
+                    {#if canResume}
+                      <button
+                        type="button"
+                        class="px-2 py-0.5 rounded-[5px] bg-[#EDEDEF] hover:bg-white text-[11px] font-sans font-medium text-[#111113] transition-colors"
+                        onclick={onContinue}
+                      >
+                        Продолжить
+                      </button>
+                      <button
+                        type="button"
+                        class="px-2 py-0.5 rounded-[4px] text-[11px] font-sans text-[#A3A3AA] hover:text-[#EDEDEF] hover:bg-white/[0.06] transition-colors"
+                        onclick={onRetry}
+                      >
+                        Retry
+                      </button>
+                    {/if}
                   </div>
                 {/if}
               </div>
@@ -630,7 +661,7 @@ function toggleTool(id: string) {
           {/if}
         </div>
       {/if}
-    {:else if paused && !isStreaming && !error}
+    {:else if paused && canResume && !isStreaming && !error}
       <div class="flex items-center gap-2 py-1">
         <span class="font-sans text-[12.5px] text-[#8E8E95]">Paused · {totalDurationLabel}</span>
         <button
@@ -641,18 +672,20 @@ function toggleTool(id: string) {
           Продолжить
         </button>
       </div>
-    {:else if error}
+    {:else if error && (!isCanceled || canResume)}
       <div>
         <div class="flex items-center gap-2 py-0.5">
           {#if isCanceled}
             <span class="font-sans text-[12.5px] text-[#73737A]">{error}</span>
-            <button
-              type="button"
-              class="px-2 py-0.5 rounded-[5px] bg-white/[0.08] hover:bg-white/[0.14] text-[11px] font-sans font-medium text-[#EDEDEF] transition-colors"
-              onclick={onContinue}
-            >
-              Продолжить
-            </button>
+            {#if canResume}
+              <button
+                type="button"
+                class="px-2 py-0.5 rounded-[5px] bg-white/[0.08] hover:bg-white/[0.14] text-[11px] font-sans font-medium text-[#EDEDEF] transition-colors"
+                onclick={onContinue}
+              >
+                Продолжить
+              </button>
+            {/if}
           {:else}
             <button
               type="button"

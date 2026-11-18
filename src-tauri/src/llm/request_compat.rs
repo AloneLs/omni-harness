@@ -160,6 +160,8 @@ pub fn normalize_request(req: &mut ChatRequest, caps: &ModelCapabilities) {
         || name_lower.starts_with("o3")
         || name_lower.starts_with("o4")
         || name_lower.contains("gpt-5")
+        || name_lower.contains("gpt-6")
+        || name_lower.contains("codex")
         || name_lower.contains("deepseek-reasoner");
 
     if !caps.supports_temperature || is_o_series {
@@ -232,36 +234,46 @@ pub fn handle_provider_error(
     }
 
     let body_low = error_body.to_lowercase();
-    if body_low.contains("tool")
-        || body_low.contains("function")
-        || body_low.contains("tools is not supported")
+    if body_low.contains("tools is not supported")
+        || body_low.contains("does not support tools")
+        || body_low.contains("does not support function")
+        || body_low.contains("tool calling is not supported")
+        || body_low.contains("function calling is not supported")
         || body_low.contains("unrecognized parameter: 'tools'")
+        || body_low.contains("unknown parameter: 'tools'")
+        || body_low.contains("unsupported parameter: 'tools'")
     {
         caps_registry.disable_tools(model);
         return Some(RetryAction::StripTools);
     }
 
     if body_low.contains("reasoning_effort")
-        || body_low.contains("thinking")
-        || body_low.contains("budget_tokens")
         || body_low.contains("reasoning is not supported")
+        || body_low.contains("does not support reasoning")
+        || body_low.contains("does not support thinking")
+        || body_low.contains("thinking is not supported")
+        || body_low.contains("unsupported parameter: 'reasoning'")
+        || body_low.contains("unknown parameter: 'thinking'")
     {
         caps_registry.disable_reasoning(model);
         return Some(RetryAction::StripReasoning);
     }
 
-    if body_low.contains("image")
-        || body_low.contains("multimodal")
-        || body_low.contains("vision")
-        || body_low.contains("image_url")
+    if body_low.contains("does not support image")
+        || body_low.contains("vision is not supported")
+        || body_low.contains("does not support vision")
+        || body_low.contains("image input is not supported")
+        || body_low.contains("multimodal is not supported")
     {
         caps_registry.disable_vision(model);
         return Some(RetryAction::StripVision);
     }
 
-    if body_low.contains("temperature")
-        || body_low.contains("top_p")
-        || body_low.contains("unsupported parameter: 'temperature'")
+    if body_low.contains("unsupported parameter: 'temperature'")
+        || body_low.contains("unsupported value: 'temperature'")
+        || body_low.contains("temperature is not supported")
+        || body_low.contains("does not support temperature")
+        || body_low.contains("unsupported parameter: 'top_p'")
     {
         caps_registry.disable_temperature(model);
         return Some(RetryAction::StripTemperature);

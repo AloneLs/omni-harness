@@ -46,6 +46,9 @@ const TOOL_ICONS: Record<string, string> = {
   file_search: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z M21 21l-4.35-4.35',
   search_files: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z M21 21l-4.35-4.35',
   run_command: 'M4 17l6-6-6-6 M12 19h8',
+  terminal_exec: 'M4 17l6-6-6-6 M12 19h8',
+  manage_task: 'M4 17l6-6-6-6 M12 19h8',
+  terminal_io: 'M4 17l6-6-6-6 M12 19h8',
   pty_spawn: 'M4 17l6-6-6-6 M12 19h8',
   pty_write: 'M4 17l6-6-6-6 M12 19h8',
   git_status: 'M6 3v12 M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6z',
@@ -59,6 +62,7 @@ const TOOL_ICONS: Record<string, string> = {
   memory_save: 'M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z M17 21v-8H7v8 M7 3v5h8',
   memory_search: 'M12 2a9 9 0 0 0-9 9c0 3.87 2.45 7.17 5.92 8.41.45.08.62-.2.62-.43v-1.53c-2.42.53-2.93-1.17-2.93-1.17',
   rollback_snapshot: 'M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8 M3 3v5h5',
+  computer_use: 'M2 4a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V4z M8 21h8 M12 17v4',
   default: 'M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z'
 };
 
@@ -88,6 +92,7 @@ const ACTION_NAMES: Record<string, string> = {
   grep: 'Grep Search',
   code_intel: 'Code Intelligence',
   terminal_exec: 'Run Command',
+  manage_task: 'Manage Task',
   terminal_io: 'Terminal I/O',
   inspect_preview: 'Inspect Preview',
   web_research: 'Web Research',
@@ -127,6 +132,11 @@ export function formatArgPreview(args: any, maxLen = 72): string {
       }
     } else if (args.command || args.CommandLine) {
       preview = String(args.command || args.CommandLine);
+    } else if (args.action && (args.task_id || args.session_id)) {
+      preview = `${args.action} ${args.task_id || args.session_id}`;
+    } else if (args.action && (args.app || args.element_id || args.element_name || args.keys || args.window_title || args.process_name)) {
+      const detail = args.app || args.element_id || args.element_name || args.keys || args.window_title || args.process_name;
+      preview = `${args.action} ${detail}`;
     } else if (args.query || args.pattern) {
       preview = `query: "${args.query || args.pattern}"`;
     } else if (args.url) {
@@ -245,7 +255,13 @@ export function parseDiff(
 }
 
 export function parseTerminalOutput(command: string, rawOutput: string, exitCode = 0): TerminalBlock {
-  const cleanOutput = rawOutput.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '');
+  const cleanOutput = rawOutput
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b[P^_][\s\S]*?\x1b\\/g, '')
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1b[@-_]/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/^.*\r(?!\n)/gm, '');
   const lines = cleanOutput.split('\n');
   const stdoutLines: string[] = [];
   const stderrLines: string[] = [];

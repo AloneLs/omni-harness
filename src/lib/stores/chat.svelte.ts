@@ -61,6 +61,8 @@ export interface ChatSession {
   pinned: boolean;
   archived?: boolean;
   isDraft?: boolean;
+  isThemeStudio?: boolean;
+  themeId?: string;
   projectPath?: string;
   providerId?: string;
   modelId?: string;
@@ -162,6 +164,8 @@ class ChatStore {
   private pendingReasoningByChat: Record<string, string> = {};
   private smoothRafByChat: Record<string, number | null> = {};
   private activeSmoothMsgByChat: Record<string, string | null> = {};
+  private activeStreamMsgIdByChat: Record<string, string | null> = {};
+  private canceledMsgIds = new Set<string>();
 
   messages = $derived.by(() => {
     return this.activeChatId ? this.messagesByChat[this.activeChatId] || [] : [];
@@ -227,21 +231,21 @@ class ChatStore {
   pinnedSessions = $derived.by(() => {
     const q = this.filterSearchQuery.toLowerCase().trim();
     return this.sessions.filter(
-      (s) => !s.isDraft && !s.archived && s.pinned && (!q || s.title.toLowerCase().includes(q) || s.preview.toLowerCase().includes(q))
+      (s) => !s.isDraft && !s.isThemeStudio && !s.archived && s.pinned && (!q || s.title.toLowerCase().includes(q) || s.preview.toLowerCase().includes(q))
     );
   });
 
   recentSessions = $derived.by(() => {
     const q = this.filterSearchQuery.toLowerCase().trim();
     return this.sessions.filter((s) => {
-      if (s.isDraft) return false;
+      if (s.isDraft || s.isThemeStudio) return false;
       const matchArchive = this.showArchived ? Boolean(s.archived) : !s.archived && !s.pinned;
       return matchArchive && (!q || s.title.toLowerCase().includes(q) || s.preview.toLowerCase().includes(q));
     });
   });
 
   archivedCount = $derived.by(() => {
-    return this.sessions.filter((s) => !s.isDraft && Boolean(s.archived)).length;
+    return this.sessions.filter((s) => !s.isDraft && !s.isThemeStudio && Boolean(s.archived)).length;
   });
 
   timelineStats = $derived.by(() => {
@@ -525,7 +529,12 @@ class ChatStore {
 
   private async init(): Promise<void> {
     await this.loadSessions();
-    this.syncAllSessionsToBackend();
+    if (this.sessions.length > 0 && !this.activeChatId) {
+      const firstActive = this.sessions.find((s) => !s.archived && !s.isDraft);
+      if (firstActive) {
+        await this.selectSession(firstActive.id);
+      }
+    }
     await this.pullBackendChats();
     if (this.sessions.length > 0 && !this.activeChatId) {
       const firstActive = this.sessions.find((s) => !s.archived && !s.isDraft);
@@ -538,6 +547,21 @@ class ChatStore {
         listen<{ chatId?: string }>('telegram-chat-updated', (ev) => {
           this.pullBackendChats(ev.payload?.chatId);
         });
+        listen<{ providerId?: string | null; modelId?: string | null; chatId?: string | null }>(
+          'telegram-settings-updated',
+          (ev) => {
+            const p = ev.payload;
+            if (!p) return;
+            const targetCid = p.chatId || this.activeChatId;
+            if (!targetCid) return;
+            const sess = this.sessions.find((s) => s.id === targetCid);
+            if (sess) {
+              if (p.providerId) sess.providerId = p.providerId;
+              if (p.modelId) sess.modelId = p.modelId;
+              this.safeSetStorage('omni_chat_sessions', JSON.stringify(this.sessions.filter((s) => !s.isDraft)));
+            }
+          }
+        );
         listen<{
           chatId?: string;
           type?: string;
@@ -547,6 +571,7 @@ class ChatStore {
           name?: string;
           arguments?: string;
           success?: boolean;
+          output?: string;
           elapsedMs?: number;
           attempt?: number;
           reason?: string;
@@ -560,7 +585,7 @@ class ChatStore {
 
   public syncAllSessionsToBackend(): void {
     for (const sess of this.sessions) {
-      if (sess.isDraft || this.streamingChats[sess.id]) continue;
+      if (sess.isDraft || sess.isThemeStudio || this.streamingChats[sess.id]) continue;
       const rawMsgs = this.messagesByChat[sess.id] || [];
       if (rawMsgs.length === 0) continue;
       const msgs = rawMsgs.map((m) => ({
@@ -587,6 +612,7 @@ class ChatStore {
     name?: string;
     arguments?: string;
     success?: boolean;
+    output?: string;
     elapsedMs?: number;
     attempt?: number;
     reason?: string;
@@ -596,17 +622,29 @@ class ChatStore {
     const evtType = payload?.type;
     if (!chatId || !evtType) return;
 
-    const sess = this.sessions.find((s) => s.id === chatId);
+    let sess = this.sessions.find((s) => s.id === chatId);
     if (evtType === 'start') {
-      if (sess) {
+      const userText = (payload?.userText || '').trim();
+      if (!sess) {
+        sess = {
+          id: chatId,
+          title: (userText || 'Telegram Chat').slice(0, 40),
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          pinned: false,
+          messageCount: 1,
+          preview: userText.slice(0, 80)
+        };
+        this.sessions = [sess, ...this.sessions];
+      } else {
         sess.hasError = false;
         sess.isPaused = false;
         sess.hasUnreadCompletion = false;
         sess.updatedAt = Date.now();
+        if (userText) sess.preview = userText.slice(0, 80);
       }
-      this.streamingChats[chatId] = true;
-      const list = this.messagesByChat[chatId] || [];
-      const userText = (payload?.userText || '').trim();
+      this.streamingChats = { ...this.streamingChats, [chatId]: true };
+      const list = [...(this.messagesByChat[chatId] || [])];
       const lastMsg = list[list.length - 1];
       if (userText && (!lastMsg || lastMsg.role !== 'user' || lastMsg.content !== userText)) {
         list.push({
@@ -634,8 +672,25 @@ class ChatStore {
       } else {
         tail.error = undefined;
       }
-      this.messagesByChat[chatId] = [...list];
-      this.safeSetStorage('omni_chat_sessions', JSON.stringify(this.sessions.filter((s) => !s.isDraft)));
+      this.messagesByChat[chatId] = list;
+      this.safeSetStorage('omni_chat_sessions', JSON.stringify(this.sessions.filter((s) => !s.isDraft && !s.isThemeStudio)));
+      return;
+    }
+
+    if (evtType === 'stopped') {
+      this.streamingChats = { ...this.streamingChats, [chatId]: false };
+      const list = this.messagesByChat[chatId];
+      if (list && list.length > 0) {
+        const msg = list[list.length - 1];
+        if (msg && msg.role === 'assistant') {
+          msg.streaming = false;
+          msg.statusText = undefined;
+          msg.finishedAt = Date.now();
+          this.finalizeRunningTools(msg, 'cancelled', 'Stopped from Telegram');
+          this.messagesByChat[chatId] = [...list];
+          this.saveLocalOnly(chatId);
+        }
+      }
       return;
     }
 
@@ -668,13 +723,40 @@ class ChatStore {
       return;
     }
     if (evtType === 'tool_end' && payload?.id) {
-      const rec = msg.toolCalls?.find((t) => t.toolCallId === payload.id);
-      if (rec) {
-        rec.status = payload.success ? 'success' : 'error';
-        rec.finishedAt = Date.now();
-        rec.elapsedMs = payload.elapsedMs;
-        this.messagesByChat[chatId] = [...list];
+      const nextStatus = payload.success === false ? 'error' : 'success';
+      const now = Date.now();
+      if (msg.toolCalls) {
+        msg.toolCalls = msg.toolCalls.map((t) =>
+          t.toolCallId === payload.id
+            ? {
+                ...t,
+                status: nextStatus,
+                finishedAt: now,
+                elapsedMs: payload.elapsedMs,
+                output: payload.output ?? t.output,
+                error: payload.error ?? t.error
+              }
+            : t
+        );
       }
+      if (msg.steps) {
+        msg.steps = msg.steps.map((s) =>
+          s.kind === 'tool' && s.record.toolCallId === payload.id
+            ? {
+                kind: 'tool',
+                record: {
+                  ...s.record,
+                  status: nextStatus,
+                  finishedAt: now,
+                  elapsedMs: payload.elapsedMs,
+                  output: payload.output ?? s.record.output,
+                  error: payload.error ?? s.record.error
+                }
+              }
+            : s
+        );
+      }
+      this.messagesByChat[chatId] = [...list];
       return;
     }
     if (evtType === 'retry') {
@@ -687,23 +769,22 @@ class ChatStore {
       msg.error = payload?.error || 'Telegram execution failed';
       msg.streaming = false;
       msg.finishedAt = Date.now();
-      this.streamingChats[chatId] = false;
+      this.streamingChats = { ...this.streamingChats, [chatId]: false };
       if (sess) sess.hasError = true;
       this.messagesByChat[chatId] = [...list];
-      this.saveSessions(chatId);
+      this.saveLocalOnly(chatId);
       return;
     }
     if (evtType === 'done') {
       msg.streaming = false;
       msg.statusText = undefined;
       msg.finishedAt = Date.now();
-      this.streamingChats[chatId] = false;
+      this.streamingChats = { ...this.streamingChats, [chatId]: false };
       if (sess && this.activeChatId !== chatId && !msg.error) {
         sess.hasUnreadCompletion = true;
       }
       this.messagesByChat[chatId] = [...list];
-      this.saveChatMessagesToStorage(chatId, list);
-      this.safeSetStorage('omni_chat_sessions', JSON.stringify(this.sessions.filter((s) => !s.isDraft)));
+      this.saveLocalOnly(chatId);
     }
   }
 
@@ -734,28 +815,53 @@ class ChatStore {
         }
       }
 
+      let newChatPullBudget = 3;
       for (const bc of backendChats) {
         const existing = this.sessions.find((s) => s.id === bc.id);
+        const bcUpdatedMs = Date.parse(bc.updatedAt) || Date.now();
+        let isBrandNew = false;
         if (!existing) {
-          const ts = Date.parse(bc.updatedAt) || Date.now();
+          isBrandNew = true;
           const newSess: ChatSession = {
             id: bc.id,
             title: bc.title || 'Telegram Chat',
-            createdAt: Date.parse(bc.createdAt) || ts,
-            updatedAt: ts,
+            createdAt: Date.parse(bc.createdAt) || bcUpdatedMs,
+            updatedAt: bcUpdatedMs,
             pinned: Boolean(bc.isPinned),
             projectPath: bc.projectId || undefined,
+            modelId: bc.modelId || undefined,
             messageCount: 0,
             preview: ''
           };
           this.sessions = [newSess, ...this.sessions];
           sessionsChanged = true;
-        } else if (bc.title && existing.title !== bc.title && targetChatId === bc.id) {
-          existing.title = bc.title;
-          sessionsChanged = true;
+        } else {
+          if (bc.title && existing.title !== bc.title) {
+            existing.title = bc.title;
+            sessionsChanged = true;
+          }
+          if (Boolean(bc.isPinned) !== Boolean(existing.pinned)) {
+            existing.pinned = Boolean(bc.isPinned);
+            sessionsChanged = true;
+          }
+          const nextProj = bc.projectId || undefined;
+          if (nextProj !== existing.projectPath && (targetChatId === bc.id || bcUpdatedMs > (existing.updatedAt || 0))) {
+            existing.projectPath = nextProj;
+            sessionsChanged = true;
+          }
+          if (bc.modelId && bc.modelId !== existing.modelId && targetChatId === bc.id) {
+            existing.modelId = bc.modelId;
+            sessionsChanged = true;
+          }
         }
 
-        if (!targetChatId || targetChatId === bc.id) {
+        const shouldPullMsgs =
+          targetChatId === bc.id ||
+          (!targetChatId && bc.id === this.activeChatId && (!this.messagesByChat[bc.id] || bcUpdatedMs > ((existing?.updatedAt || 0) + 1000))) ||
+          (!targetChatId && isBrandNew && newChatPullBudget > 0);
+
+        if (shouldPullMsgs) {
+          if (isBrandNew && !targetChatId) newChatPullBudget--;
           const localMsgs = this.messagesByChat[bc.id] || [];
           const lastLocal = localMsgs[localMsgs.length - 1];
           const isTgStreaming = Boolean(this.streamingChats[bc.id]) && Boolean(lastLocal?.id?.startsWith('tg-'));
@@ -784,9 +890,10 @@ class ChatStore {
               Boolean(lastDb.content?.trim()) &&
               (dbMsgs.length > localMsgs.length || lastDb.id !== lastLocal?.id);
             if (isTgDoneInDb) {
-              this.streamingChats[bc.id] = false;
+              this.streamingChats = { ...this.streamingChats, [bc.id]: false };
             }
-            if (!this.streamingChats[bc.id] && ((changed && dbMsgs.length >= localMsgs.length) || isTgDoneInDb)) {
+            const allowReplace = targetChatId === bc.id ? changed : changed && dbMsgs.length >= localMsgs.length;
+            if (!this.streamingChats[bc.id] && (allowReplace || isTgDoneInDb)) {
               const dedupedDb: typeof dbMsgs = [];
               for (const m of dbMsgs) {
                 const tail = dedupedDb[dedupedDb.length - 1];
@@ -827,7 +934,7 @@ class ChatStore {
                 if (lastDb && lastDb.content) {
                   sess.preview = lastDb.content.slice(0, 80);
                 }
-                sess.updatedAt = Date.parse(bc.updatedAt) || Date.now();
+                sess.updatedAt = bcUpdatedMs;
                 sessionsChanged = true;
               }
             }
@@ -836,7 +943,7 @@ class ChatStore {
       }
 
       if (sessionsChanged) {
-        this.safeSetStorage('omni_chat_sessions', JSON.stringify(this.sessions.filter((s) => !s.isDraft)));
+        this.safeSetStorage('omni_chat_sessions', JSON.stringify(this.sessions.filter((s) => !s.isDraft && !s.isThemeStudio)));
       }
     } catch {}
   }
@@ -1012,36 +1119,7 @@ class ChatStore {
         try {
           const parsed = JSON.parse(saved);
           if (Array.isArray(parsed)) {
-            const valid = parsed.filter((s) => !s.isDraft);
-            for (const s of valid) {
-              const rawMsgs = localStorage.getItem(`omni_chat_msgs_${s.id}`);
-              if (rawMsgs) {
-                try {
-                  const msgs = JSON.parse(rawMsgs);
-                  if (Array.isArray(msgs)) {
-                    let changed = false;
-                    let hasPaused = false;
-                    for (const m of msgs) {
-                      if (m.streaming) {
-                        m.streaming = false;
-                        m.paused = true;
-                        m.statusText = 'Paused';
-                        m.finishedAt = m.finishedAt || Date.now();
-                        this.finalizeRunningTools(m, 'paused');
-                        changed = true;
-                      }
-                      if (m.paused) hasPaused = true;
-                    }
-                    s.isPaused = hasPaused;
-                    this.messagesByChat[s.id] = msgs;
-                    if (changed) {
-                      this.saveChatMessagesToStorage(s.id, msgs);
-                    }
-                  }
-                } catch {}
-              }
-            }
-            this.sessions = valid;
+            this.sessions = parsed.filter((s) => !s.isDraft && !s.isThemeStudio);
             return;
           }
         } catch {}
@@ -1050,22 +1128,29 @@ class ChatStore {
     this.sessions = [];
   }
 
-  public async saveSessions(targetChatId?: string): Promise<void> {
+  private saveLocalOnly(targetChatId?: string): void {
     const cid = targetChatId || this.activeChatId;
-    const persistableSessions = this.sessions.filter((s) => !s.isDraft);
+    const persistableSessions = this.sessions.filter((s) => !s.isDraft && !s.isThemeStudio);
     try {
       this.safeSetStorage('omni_chat_sessions', JSON.stringify(persistableSessions), cid || undefined);
       if (cid) {
         const sess = this.sessions.find((s) => s.id === cid);
-        if (sess && !sess.isDraft) {
-          const msgs = this.messagesByChat[cid] || [];
-          this.saveChatMessagesToStorage(cid, msgs);
+        if (sess && !sess.isDraft && !sess.isThemeStudio) {
+          const msgs = this.messagesByChat[cid];
+          if (msgs) {
+            this.saveChatMessagesToStorage(cid, msgs);
+          }
         }
       }
     } catch {}
-    if (cid) {
+  }
+
+  public async saveSessions(targetChatId?: string, syncBackend = true): Promise<void> {
+    const cid = targetChatId || this.activeChatId;
+    this.saveLocalOnly(cid || undefined);
+    if (syncBackend && cid) {
       const sess = this.sessions.find((s) => s.id === cid);
-      if (sess && !sess.isDraft) {
+      if (sess && !sess.isDraft && !sess.isThemeStudio && this.messagesByChat[cid]) {
         const msgs = (this.messagesByChat[cid] || []).map((m) => ({
           role: m.role,
           content: m.content,
@@ -1076,7 +1161,7 @@ class ChatStore {
           title: sess.title || cid,
           messagesJson: JSON.stringify(msgs),
           projectPath: sess.projectPath || null,
-          modelId: settingsStore.data.activeModel || null
+          modelId: sess.modelId || settingsStore.data.activeModel || null
         }).catch(() => {});
       }
     }
@@ -1088,6 +1173,14 @@ class ChatStore {
     errText?: string
   ): void {
     const now = Date.now();
+    if (Array.isArray(msg.steps)) {
+      msg.steps = msg.steps.map((st) => {
+        if (st.kind === 'thought' && !st.finishedAt) {
+          return { ...st, finishedAt: now };
+        }
+        return st;
+      });
+    }
     if (Array.isArray(msg.toolCalls)) {
       msg.toolCalls = msg.toolCalls.map((tc) => {
         if (tc.status !== 'running' && tc.status !== 'pending') return tc;
@@ -1122,8 +1215,8 @@ class ChatStore {
     if (this.streamSaveTimers[chatId]) return;
     this.streamSaveTimers[chatId] = window.setTimeout(() => {
       delete this.streamSaveTimers[chatId];
-      this.saveSessions(chatId);
-    }, 900);
+      this.saveLocalOnly(chatId);
+    }, 2200);
   }
 
   private takeSmoothSlice(buf: string): [string, string] {
@@ -1232,8 +1325,51 @@ class ChatStore {
     this.pendingTextByChat[chatId] = '';
   }
 
+  public ensureThemeStudioSession(themeId: string, themeName: string): string {
+    const id = `theme-studio-${themeId}`;
+    let existing = this.sessions.find((s) => s.id === id);
+    if (!existing) {
+      existing = {
+        id,
+        title: `Theme: ${themeName}`,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        pinned: false,
+        archived: false,
+        isDraft: false,
+        isThemeStudio: true,
+        themeId,
+        providerId: settingsStore.data.activeProvider || undefined,
+        modelId: settingsStore.data.activeModel || undefined,
+        messageCount: 0,
+        preview: ''
+      };
+      this.sessions = [existing, ...this.sessions];
+    } else {
+      existing.themeId = themeId;
+    }
+    if (!this.messagesByChat[id]) {
+      this.messagesByChat[id] = [];
+    }
+    this.activeChatId = id;
+    return id;
+  }
+
+  public setActiveSessionProject(path: string): void {
+    const cid = this.activeChatId;
+    if (!cid) return;
+    const sess = this.sessions.find((s) => s.id === cid);
+    if (!sess || sess.isThemeStudio) return;
+    sess.projectPath = path.trim() ? path.trim() : undefined;
+    this.sessions = [...this.sessions];
+    if (!sess.isDraft) {
+      this.saveSessions(cid).catch(() => {});
+    }
+  }
+
   public async createSession(title = 'New task', projectPath?: string): Promise<string> {
     const id = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const resolvedProject = projectPath !== undefined ? projectPath : (workspaceStore.currentPath || undefined);
     const newSession: ChatSession = {
       id,
       title,
@@ -1244,7 +1380,7 @@ class ChatStore {
       isDraft: true,
       providerId: settingsStore.data.activeProvider || undefined,
       modelId: settingsStore.data.activeModel || undefined,
-      projectPath,
+      projectPath: resolvedProject,
       hasError: false,
       hasUnreadCompletion: false,
       messageCount: 0,
@@ -1267,8 +1403,12 @@ class ChatStore {
   public async selectSession(id: string): Promise<void> {
     this.activeChatId = id;
     const session = this.sessions.find((s) => s.id === id);
-    if (session?.projectPath && workspaceStore.currentPath !== session.projectPath) {
-      workspaceStore.setWorkspaceDir(session.projectPath).catch(() => {});
+    if (session?.projectPath) {
+      if (workspaceStore.currentPath !== session.projectPath) {
+        workspaceStore.setWorkspaceDir(session.projectPath).catch(() => {});
+      }
+    } else if (session && !session.isThemeStudio && workspaceStore.currentPath) {
+      workspaceStore.clearWorkspace().catch(() => {});
     }
     if (session?.providerId && session?.modelId) {
       settingsStore.setActiveModel(session.providerId, session.modelId);
@@ -1295,7 +1435,10 @@ class ChatStore {
                 m.streaming = false;
                 m.paused = true;
                 m.statusText = 'Paused';
-                m.finishedAt = m.finishedAt || Date.now();
+                const lastToolEnd = Array.isArray(m.toolCalls)
+                  ? m.toolCalls.reduce((mx: number, tc: any) => Math.max(mx, tc.finishedAt || tc.startedAt || 0), 0)
+                  : 0;
+                m.finishedAt = m.finishedAt || lastToolEnd || m.startedAt || m.createdAt || Date.now();
                 this.finalizeRunningTools(m, 'paused');
                 changed = true;
               }
@@ -1304,12 +1447,18 @@ class ChatStore {
             if (changed) {
               this.saveChatMessagesToStorage(id, parsedMsgs);
             }
+            if (!session?.isDraft && !session?.isThemeStudio) {
+              this.pullBackendChats(id).catch(() => {});
+            }
             return;
           }
         } catch {}
       }
     }
     this.messagesByChat[id] = [];
+    if (!session?.isDraft && !session?.isThemeStudio) {
+      await this.pullBackendChats(id);
+    }
   }
 
   public async deleteSession(id: string): Promise<void> {
@@ -1400,53 +1549,65 @@ class ChatStore {
     };
 
     this.messagesByChat[chatId] = [...(this.messagesByChat[chatId] || []), assistantMessage];
+    this.activeStreamMsgIdByChat[chatId] = assistantMsgId;
     this.streamingChats = { ...this.streamingChats, [chatId]: true };
     this.streamTokenCountByChat[chatId] = 0;
     this.reasoningElapsedByChat[chatId] = 0;
 
     const startTime = Date.now();
+    if (this.reasoningTimers[chatId]) {
+      clearInterval(this.reasoningTimers[chatId]);
+    }
     this.reasoningTimers[chatId] = window.setInterval(() => {
       this.reasoningElapsedByChat[chatId] = Date.now() - startTime;
-    }, 100);
+    }, 250);
 
     let failed = false;
     try {
       await this.simulateOrExecuteAgentStream(chatId, assistantMsgId, prompt, false, forceExecute);
     } catch (err: any) {
-      failed = true;
-      const s = this.sessions.find((x) => x.id === chatId);
-      if (s) s.hasError = true;
-      const list = this.messagesByChat[chatId] || [];
-      const idx = list.findIndex((m) => m.id === assistantMsgId);
-      if (idx !== -1) {
-        const rawErr = err instanceof Error ? err.message : typeof err === 'string' ? err : 'Connection or streaming error';
-        list[idx].error = rawErr;
-        list[idx].streaming = false;
-        list[idx].paused = false;
-        this.finalizeRunningTools(list[idx], 'error', rawErr);
+      if (!this.canceledMsgIds.has(assistantMsgId)) {
+        failed = true;
+        const s = this.sessions.find((x) => x.id === chatId);
+        if (s) s.hasError = true;
+        const list = this.messagesByChat[chatId] || [];
+        const idx = list.findIndex((m) => m.id === assistantMsgId);
+        if (idx !== -1) {
+          const rawErr = err instanceof Error ? err.message : typeof err === 'string' ? err : 'Connection or streaming error';
+          list[idx].error = rawErr;
+          list[idx].streaming = false;
+          list[idx].paused = false;
+          this.finalizeRunningTools(list[idx], 'error', rawErr);
+        }
       }
     } finally {
-      if (this.reasoningTimers[chatId]) {
-        clearInterval(this.reasoningTimers[chatId]);
-        delete this.reasoningTimers[chatId];
+      const isCurrentStream = this.activeStreamMsgIdByChat[chatId] === assistantMsgId;
+      if (isCurrentStream) {
+        this.activeStreamMsgIdByChat[chatId] = null;
+        if (this.reasoningTimers[chatId]) {
+          clearInterval(this.reasoningTimers[chatId]);
+          delete this.reasoningTimers[chatId];
+        }
+        if (this.streamSaveTimers[chatId]) {
+          clearTimeout(this.streamSaveTimers[chatId]);
+          delete this.streamSaveTimers[chatId];
+        }
+        this.streamingChats = { ...this.streamingChats, [chatId]: false };
       }
-      if (this.streamSaveTimers[chatId]) {
-        clearTimeout(this.streamSaveTimers[chatId]);
-        delete this.streamSaveTimers[chatId];
-      }
-      this.streamingChats = { ...this.streamingChats, [chatId]: false };
       const list = this.messagesByChat[chatId] || [];
       const idx = list.findIndex((m) => m.id === assistantMsgId);
-      if (idx !== -1) {
+      if (idx !== -1 && !this.canceledMsgIds.has(assistantMsgId)) {
         list[idx].streaming = false;
         this.finalizeRunningTools(list[idx], failed ? 'error' : 'success');
       }
-      if (!failed && this.activeChatId !== chatId) {
-        const s = this.sessions.find((x) => x.id === chatId);
-        if (s) s.hasUnreadCompletion = true;
+      if (isCurrentStream) {
+        if (!failed && this.activeChatId !== chatId) {
+          const s = this.sessions.find((x) => x.id === chatId);
+          if (s) s.hasUnreadCompletion = true;
+        }
+        await this.saveSessions(chatId);
+        await this.processNextInQueue(chatId);
       }
-      await this.saveSessions(chatId);
-      await this.processNextInQueue(chatId);
     }
   }
 
@@ -1486,9 +1647,18 @@ class ChatStore {
       modifiedFiles: options.files
     };
 
-    const existingList = (this.messagesByChat[chatId] || []).map((m) =>
-      m.paused ? { ...m, paused: false, statusText: m.statusText === 'Paused' ? undefined : m.statusText } : m
-    );
+    const existingList = (this.messagesByChat[chatId] || []).map((m) => {
+      const wasCanceled = m.error === 'User canceled execution';
+      if (m.paused || wasCanceled) {
+        return {
+          ...m,
+          paused: false,
+          error: wasCanceled ? undefined : m.error,
+          statusText: m.statusText === 'Paused' ? undefined : m.statusText
+        };
+      }
+      return m;
+    });
     this.messagesByChat[chatId] = [...existingList, userMessage];
 
     const currentSession = this.sessions.find((s) => s.id === chatId);
@@ -1534,6 +1704,10 @@ class ChatStore {
 
       const onEvent = new Channel<any>();
       onEvent.onmessage = (event) => {
+        if (this.canceledMsgIds.has(messageId)) {
+          done();
+          return;
+        }
         this.handleStreamEvent(event, chatId, messageId);
         if (event?.type === 'done' || event?.type === 'error') {
           done();
@@ -1558,6 +1732,14 @@ class ChatStore {
           })
           .filter((m) => m.content.length > 0);
 
+        const lastUserMsg = [...list].reverse().find((m) => m.role === 'user');
+        const msgAttachments = (lastUserMsg?.attachments || []).map((a) => ({
+          name: a.name,
+          path: a.path,
+          kind: a.kind,
+          data_url: a.previewUrl || null
+        }));
+
         await invoke('start_chat_stream', {
           chatId,
           prompt,
@@ -1576,6 +1758,8 @@ class ChatStore {
           planMode: !forceExecute && /(?:^|\s)\/plan(?:\s|$)/i.test(prompt.trim()),
           resume,
           history: priorHistory,
+          attachments: msgAttachments,
+          themeId: sess?.themeId || null,
           onEvent
         });
       } catch (err) {
@@ -1588,10 +1772,11 @@ class ChatStore {
     });
   }
 
-  public async stopStreaming(targetChatId?: string): Promise<void> {
+  public async stopStreaming(targetChatId?: string, silentSupersede = false): Promise<void> {
     const cid = targetChatId || this.activeChatId;
     if (!cid) return;
     this.flushSmoothBuffers(cid);
+    this.activeStreamMsgIdByChat[cid] = null;
     this.streamingChats = { ...this.streamingChats, [cid]: false };
     const resFn = this.resolveByChat[cid];
     if (resFn) {
@@ -1604,11 +1789,14 @@ class ChatStore {
     const list = this.messagesByChat[cid] || [];
     for (const msg of list) {
       if (msg.streaming) {
+        this.canceledMsgIds.add(msg.id);
         msg.streaming = false;
         msg.paused = false;
         msg.statusText = undefined;
         msg.finishedAt = Date.now();
-        if (!msg.error) {
+        if (silentSupersede) {
+          msg.error = undefined;
+        } else if (!msg.error) {
           msg.error = 'User canceled execution';
         }
         this.finalizeRunningTools(msg, 'cancelled', 'User canceled execution');
@@ -1651,12 +1839,19 @@ class ChatStore {
     }
     if (!prevUserPrompt) return;
 
+    const prevElapsed =
+      targetMsg.startedAt && targetMsg.finishedAt && targetMsg.finishedAt >= targetMsg.startedAt
+        ? targetMsg.finishedAt - targetMsg.startedAt
+        : 0;
+    const hasPriorWork = Boolean(targetMsg.content?.trim()) || Boolean(targetMsg.toolCalls?.length);
+
     targetMsg.error = undefined;
     targetMsg.paused = false;
     targetMsg.streaming = true;
     targetMsg.statusText = 'Resuming';
     targetMsg.retryReason = undefined;
     targetMsg.modelId = settingsStore.data.activeModel || targetMsg.modelId;
+    targetMsg.startedAt = Date.now() - prevElapsed;
     targetMsg.finishedAt = undefined;
 
     const currentSession = this.sessions.find((s) => s.id === chatId);
@@ -1665,39 +1860,57 @@ class ChatStore {
       currentSession.isPaused = false;
     }
 
+    this.canceledMsgIds.delete(targetMsg.id);
+    this.activeStreamMsgIdByChat[chatId] = targetMsg.id;
     this.streamingChats = { ...this.streamingChats, [chatId]: true };
     this.streamTokenCountByChat[chatId] = 0;
-    const baseElapsed = targetMsg.startedAt ? Date.now() - targetMsg.startedAt : 0;
-    const startTime = Date.now() - baseElapsed;
+    const startTime = targetMsg.startedAt;
+    if (this.reasoningTimers[chatId]) {
+      clearInterval(this.reasoningTimers[chatId]);
+    }
     this.reasoningTimers[chatId] = window.setInterval(() => {
       this.reasoningElapsedByChat[chatId] = Date.now() - startTime;
-    }, 100);
+    }, 250);
+
+    const resumePrompt = hasPriorWork
+      ? 'Continue from where you stopped without repeating already completed steps or tool calls.'
+      : prevUserPrompt;
 
     let failed = false;
     try {
-      await this.simulateOrExecuteAgentStream(chatId, targetMsg.id, prevUserPrompt, true);
+      await this.simulateOrExecuteAgentStream(chatId, targetMsg.id, resumePrompt, true);
     } catch (err: any) {
-      failed = true;
-      if (currentSession) currentSession.hasError = true;
-      const rawErr = err instanceof Error ? err.message : typeof err === 'string' ? err : 'Connection or streaming error';
-      targetMsg.error = rawErr;
-      targetMsg.streaming = false;
-      targetMsg.paused = false;
-      this.finalizeRunningTools(targetMsg, 'error', rawErr);
+      if (!this.canceledMsgIds.has(targetMsg.id)) {
+        failed = true;
+        if (currentSession) currentSession.hasError = true;
+        const rawErr = err instanceof Error ? err.message : typeof err === 'string' ? err : 'Connection or streaming error';
+        targetMsg.error = rawErr;
+        targetMsg.streaming = false;
+        targetMsg.paused = false;
+        this.finalizeRunningTools(targetMsg, 'error', rawErr);
+      }
     } finally {
-      if (this.reasoningTimers[chatId]) {
-        clearInterval(this.reasoningTimers[chatId]);
-        delete this.reasoningTimers[chatId];
+      const isCurrentStream = this.activeStreamMsgIdByChat[chatId] === targetMsg.id;
+      if (isCurrentStream) {
+        this.activeStreamMsgIdByChat[chatId] = null;
+        if (this.reasoningTimers[chatId]) {
+          clearInterval(this.reasoningTimers[chatId]);
+          delete this.reasoningTimers[chatId];
+        }
+        if (this.streamSaveTimers[chatId]) {
+          clearTimeout(this.streamSaveTimers[chatId]);
+          delete this.streamSaveTimers[chatId];
+        }
+        this.streamingChats = { ...this.streamingChats, [chatId]: false };
       }
-      if (this.streamSaveTimers[chatId]) {
-        clearTimeout(this.streamSaveTimers[chatId]);
-        delete this.streamSaveTimers[chatId];
+      if (!this.canceledMsgIds.has(targetMsg.id)) {
+        targetMsg.streaming = false;
+        this.finalizeRunningTools(targetMsg, failed ? 'error' : 'success');
       }
-      this.streamingChats = { ...this.streamingChats, [chatId]: false };
-      targetMsg.streaming = false;
-      this.finalizeRunningTools(targetMsg, failed ? 'error' : 'success');
-      await this.saveSessions(chatId);
-      await this.processNextInQueue(chatId);
+      if (isCurrentStream) {
+        await this.saveSessions(chatId);
+        await this.processNextInQueue(chatId);
+      }
     }
   }
 
@@ -1728,6 +1941,7 @@ class ChatStore {
     if (!prevUserPrompt) return;
 
     this.messagesByChat[chatId] = list.slice(0, targetIdx);
+    this.syncTodosFromMessages(chatId);
     const currentSession = this.sessions.find((s) => s.id === chatId);
     if (currentSession) {
       currentSession.hasError = false;
@@ -1749,12 +1963,30 @@ class ChatStore {
 
     targetMsg.content = newText.trim();
     this.messagesByChat[chatId] = list.slice(0, idx + 1);
+    this.syncTodosFromMessages(chatId);
     const currentSession = this.sessions.find((s) => s.id === chatId);
     if (currentSession) {
       currentSession.hasError = false;
       currentSession.preview = newText.trim().slice(0, 80);
     }
     await this.runAssistantStream(chatId, newText.trim());
+  }
+
+  private syncTodosFromMessages(chatId: string): void {
+    if (this.todoHideTimers[chatId]) {
+      clearTimeout(this.todoHideTimers[chatId]);
+      delete this.todoHideTimers[chatId];
+    }
+    const list = this.messagesByChat[chatId] || [];
+    for (let i = list.length - 1; i >= 0; i--) {
+      const m = list[i];
+      if (Array.isArray(m.todos) && m.todos.length > 0) {
+        const allDone = m.todos.every((t) => t.status === 'completed');
+        this.todosByChat[chatId] = allDone ? [] : m.todos.map((t) => ({ ...t }));
+        return;
+      }
+    }
+    this.todosByChat[chatId] = [];
   }
 
   public async rollbackSnapshot(snapshotId: string): Promise<void> {
@@ -1800,7 +2032,7 @@ class ChatStore {
     const item = (this.pendingQueueByChat[cid] || []).find((i) => i.id === id);
     if (!item) return;
     this.dequeueMessage(id);
-    if (this.streamingChats[cid]) await this.stopStreaming(cid);
+    if (this.streamingChats[cid]) await this.stopStreaming(cid, true);
     await this.sendMessage(item.text, { targetChatId: cid });
   }
 
@@ -1872,8 +2104,8 @@ class ChatStore {
         clearTimeout(this.todoHideTimers[cid]);
         delete this.todoHideTimers[cid];
       }
-      const nextTodos = Array.isArray(event.items) ? event.items : [];
-      currentAssistantMsg.todos = nextTodos;
+      const nextTodos = Array.isArray(event.items) ? event.items.map((t: TodoBoardItem) => ({ ...t })) : [];
+      currentAssistantMsg.todos = nextTodos.map((t: TodoBoardItem) => ({ ...t }));
       this.todosByChat[cid] = nextTodos;
       return;
     }
@@ -1960,7 +2192,7 @@ class ChatStore {
         currentAssistantMsg.toolCalls = [...currentAssistantMsg.toolCalls, record];
         currentAssistantMsg.steps = [...currentAssistantMsg.steps, { kind: 'tool', record }];
       }
-      this.saveSessions(cid);
+      this.scheduleStreamingSave(cid);
     } else if (event.type === 'tool_output_delta') {
       const chunk = event.chunk || '';
       if (!chunk) return;
@@ -2017,7 +2249,7 @@ class ChatStore {
           }
         };
       });
-      this.saveSessions(cid);
+      this.scheduleStreamingSave(cid);
     } else if (event.type === 'done') {
       this.flushSmoothBuffers(cid);
       this.streamingChats = { ...this.streamingChats, [cid]: false };

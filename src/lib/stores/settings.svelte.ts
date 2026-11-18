@@ -159,6 +159,7 @@ class SettingsStore {
               }
             }
             if (changed) {
+              this.data = { ...this.data };
               if (typeof localStorage !== 'undefined') {
                 localStorage.setItem('omni_settings', JSON.stringify(this.data));
               }

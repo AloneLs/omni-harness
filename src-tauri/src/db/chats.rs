@@ -223,6 +223,44 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_chat_project(&self, id: &str, project_id: Option<&str>) -> Result<(), AppError> {
+        let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE chats SET project_id = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![project_id, now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_chat_model(&self, id: &str, model_id: &str) -> Result<(), AppError> {
+        let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE chats SET model_id = ?1, updated_at = ?2 WHERE id = ?3",
+            rusqlite::params![model_id, now, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_chat_messages(&self, chat_id: &str, items: &[(String, String)]) -> Result<(), AppError> {
+        let mut conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM messages WHERE chat_id = ?1", [chat_id])?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for (idx, (role, content)) in items.iter().enumerate() {
+            let id = uuid::Uuid::new_v4().to_string();
+            let seq = (idx + 1) as i64;
+            tx.execute(
+                "INSERT INTO messages (id, chat_id, role, content, reasoning_content, tool_calls, tool_call_id, sequence_num, created_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6)",
+                rusqlite::params![id, chat_id, role, content, seq, now],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_chat(&self, id: &str) -> Result<(), AppError> {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
         conn.execute("DELETE FROM chats WHERE id = ?1", [id])?;

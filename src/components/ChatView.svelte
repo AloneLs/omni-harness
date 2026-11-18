@@ -24,6 +24,14 @@ const scrollBtnSpring = new Spring({ opacity: 0, y: 8, scale: 0.9 }, SPRING_POPU
 const emptyDockSpring = new Spring(chatStore.messages.length === 0 ? 1 : 0, SPRING_PANEL);
 
 let isEmpty = $derived(chatStore.messages.length === 0);
+let lastAssistantMsgId = $derived.by(() => {
+  const list = chatStore.messages;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i].role === 'assistant') return list[i].id;
+    if (list[i].role === 'user') return null;
+  }
+  return null;
+});
 
 $effect(() => {
   if (!isEmpty && emptyDockSpring.current > 0.01 && !chatStore.isStreaming) {
@@ -179,10 +187,11 @@ $effect(() => {
 });
 </script>
 
-<div class="flex-1 flex flex-col h-full relative overflow-hidden select-none">
+<div data-omni-chat-view="" class="flex-1 flex flex-col h-full relative overflow-hidden select-none">
   <TaskBoardWidget />
   <TurnDotsNav messages={chatStore.messages} activeIndex={activeTurnIndex} onSelectTurn={scrollToTurn} />
   <div
+    data-omni-messages=""
     bind:this={scrollContainerEl}
     onscroll={handleScroll}
     onwheel={handleUserWheel}
@@ -203,6 +212,7 @@ $effect(() => {
             >
             <MessageItem
               {message}
+              isLatestAssistant={message.id === lastAssistantMsgId}
               onEditUser={(id: string, newText: string, rollback: boolean) => chatStore.editUserMessage(id, newText, rollback)}
               onRegenerate={(id: string) => chatStore.regenerateAssistantMessage(id)}
               onContinue={(id: string) => chatStore.continueAssistantMessage(id)}

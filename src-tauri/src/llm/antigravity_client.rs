@@ -247,8 +247,11 @@ pub async fn stream_antigravity(
     }
 
     let m_low = model_clean.to_lowercase();
+    let is_gpt_oss = m_low.contains("gpt-oss");
+    let is_claude = m_low.contains("claude");
     if let Some(budget) = request.thinking_budget {
-        if m_low.contains("gemini-3") || m_low.contains("gemini-4") {
+        if is_gpt_oss {
+        } else if (m_low.contains("gemini-3") || m_low.contains("gemini-4")) && !is_claude {
             let lvl = match request.reasoning_effort.as_deref() {
                 Some("low") => "LOW",
                 Some("medium") => "MEDIUM",
@@ -261,7 +264,20 @@ pub async fn stream_antigravity(
                     "thinkingLevel": lvl,
                 }),
             );
-        } else if caps.supports_reasoning || m_low.contains("2.5") || m_low.contains("thinking") || m_low.contains("claude") {
+        } else if caps.supports_reasoning || m_low.contains("2.5") || m_low.contains("thinking") || is_claude {
+            let cur_max = gen_cfg
+                .get("maxOutputTokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            let min_required = budget.saturating_add(4096);
+            if cur_max <= budget {
+                let target_max = budget.saturating_add(8192).max(min_required).min(64000);
+                gen_cfg.insert("maxOutputTokens".to_string(), serde_json::json!(target_max));
+            }
+            if is_claude {
+                gen_cfg.remove("temperature");
+                gen_cfg.remove("topP");
+            }
             gen_cfg.insert(
                 "thinkingConfig".to_string(),
                 serde_json::json!({
@@ -327,12 +343,23 @@ pub async fn stream_antigravity(
             "requestId": format!("agent-{}-{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8]),
         });
 
-        let response = match client
+        crate::logger::info("Antigravity", &format!("POST {} model={} account={} project={}", target_url, model_clean, acc.email, project_id));
+        let trace_id = oauth_accounts::antigravity_trace_id();
+        let mut req_builder = client
             .post(target_url)
             .bearer_auth(&acc.access_token)
             .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
             .header("User-Agent", oauth_accounts::antigravity_hub_ua())
+            .header("X-Goog-Api-Client", oauth_accounts::antigravity_api_client())
+            .header("Client-Metadata", oauth_accounts::antigravity_client_metadata())
             .header("X-Machine-Session-Id", oauth_accounts::machine_session_id())
+            .header("X-Goog-Request-Reason", "user_initiated")
+            .header("x-cloudaicompanion-trace-id", &trace_id);
+        if !project_id.is_empty() {
+            req_builder = req_builder.header("X-Goog-User-Project", &project_id);
+        }
+        let response = match req_builder
             .json(&envelope)
             .send()
             .await
@@ -359,12 +386,23 @@ pub async fn stream_antigravity(
         if status.as_u16() == 401 {
             if let Ok(refreshed) = oauth_accounts::force_refresh_account(client, &acc.id).await {
                 acc = refreshed;
-                if let Ok(r2) = client
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let retry_trace = oauth_accounts::antigravity_trace_id();
+                let mut retry_builder = client
                     .post(target_url)
                     .bearer_auth(&acc.access_token)
                     .header("Content-Type", "application/json")
+                    .header("Accept", "text/event-stream")
                     .header("User-Agent", oauth_accounts::antigravity_hub_ua())
+                    .header("X-Goog-Api-Client", oauth_accounts::antigravity_api_client())
+                    .header("Client-Metadata", oauth_accounts::antigravity_client_metadata())
                     .header("X-Machine-Session-Id", oauth_accounts::machine_session_id())
+                    .header("X-Goog-Request-Reason", "user_initiated")
+                    .header("x-cloudaicompanion-trace-id", &retry_trace);
+                if !project_id.is_empty() {
+                    retry_builder = retry_builder.header("X-Goog-User-Project", &project_id);
+                }
+                if let Ok(r2) = retry_builder
                     .json(&envelope)
                     .send()
                     .await
@@ -391,11 +429,42 @@ pub async fn stream_antigravity(
         }
 
         if status.is_success() {
-            return parse_antigravity_sse(response, sender).await;
+            match parse_antigravity_sse(response, sender.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(LlmError::ProviderError { status: scode, message: smsg }) => {
+                    let cd = if scode == 429 { 120 } else { 30 };
+                    if scode == 429 {
+                        oauth_accounts::mark_account_quota_exhausted(&acc.id, Some(0.0), None).await;
+                    }
+                    oauth_accounts::mark_account_cooldown(&acc.id, cd, &smsg).await;
+                    excluded_ids.insert(acc.id.clone());
+                    last_err = Some(LlmError::ProviderError {
+                        status: scode,
+                        message: format!("{} ({})", smsg, acc.email),
+                    });
+                    if attempt < max_attempts && (scode == 429 || scode >= 500 || scode == 403) {
+                        let _ = sender
+                            .send(StreamEvent::RetryNotice {
+                                reason: format!("Antigravity stream {} ({}): switching account", scode, acc.email),
+                                attempt,
+                                model: request.model.clone(),
+                            })
+                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                        continue;
+                    }
+                    return Err(LlmError::ProviderError {
+                        status: scode,
+                        message: smsg,
+                    });
+                }
+                Err(e) => return Err(e),
+            }
         }
 
         let code = status.as_u16();
         let err_body = response.text().await.unwrap_or_default();
+        crate::logger::record_http("Antigravity", "POST", target_url, code, &err_body);
         let cooldown = if code == 429 { 120 } else { 30 };
         if code == 429 {
             oauth_accounts::mark_account_quota_exhausted(&acc.id, Some(0.0), None).await;
@@ -419,6 +488,7 @@ pub async fn stream_antigravity(
             continue;
         }
 
+        crate::logger::error_with_trace("Antigravity", &format!("HTTP {} for model {}: {}", code, model_clean, err_body));
         return Err(LlmError::ProviderError {
             status: code,
             message: err_body,
@@ -464,6 +534,29 @@ async fn parse_antigravity_sse(
                 continue;
             };
             let v = outer.get("response").unwrap_or(&outer);
+            if let Some(err_obj) = outer.get("error").or_else(|| v.get("error")).filter(|e| !e.is_null()) {
+                let code = err_obj
+                    .get("code")
+                    .and_then(|c| c.as_u64())
+                    .map(|n| n as u16)
+                    .unwrap_or(500);
+                let msg = err_obj
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| err_obj.to_string());
+                if tool_idx == 0 {
+                    return Err(LlmError::ProviderError {
+                        status: code,
+                        message: msg,
+                    });
+                }
+                let _ = sender.send(StreamEvent::Error { error: msg.clone() }).await;
+                return Err(LlmError::ProviderError {
+                    status: code,
+                    message: msg,
+                });
+            }
 
             if let Some(usage) = v.get("usageMetadata") {
                 let prompt = usage.get("promptTokenCount").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
@@ -544,4 +637,110 @@ async fn parse_antigravity_sse(
         })
         .await;
     Ok(())
+}
+
+
+pub async fn generate_antigravity_image(
+    client: &reqwest::Client,
+    requested_model: Option<&str>,
+    prompt: &str,
+    aspect_ratio: Option<&str>,
+) -> Result<(String, Vec<u8>, String), String> {
+    use base64::Engine;
+    let mut chosen_model = requested_model
+        .map(|m| m.trim().strip_prefix("models/").unwrap_or(m.trim()).to_string())
+        .filter(|m| !m.is_empty());
+
+    if chosen_model.is_none() {
+        if let Ok(models) = oauth_accounts::fetch_antigravity_models(client).await {
+            if let Some(found) = models
+                .iter()
+                .find(|m| m.get("supportsImageGen").and_then(|v| v.as_bool()).unwrap_or(false))
+                .and_then(|m| m.get("id").and_then(|v| v.as_str()))
+            {
+                chosen_model = Some(found.to_string());
+            }
+        }
+    }
+    let model_id = chosen_model.unwrap_or_else(|| "gemini-3-pro-image".to_string());
+    let excluded = HashSet::new();
+    let acc = oauth_accounts::acquire_valid_account(client, "antigravity", &excluded).await?;
+    let project_id = match acc.project_id.clone() {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => oauth_accounts::fetch_antigravity_project_id(client, &acc.access_token).await,
+    };
+
+    let mut gen_cfg = serde_json::json!({
+        "responseModalities": ["TEXT", "IMAGE"]
+    });
+    if let Some(ar) = aspect_ratio.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        gen_cfg["imageConfig"] = serde_json::json!({ "aspectRatio": ar });
+    }
+
+    let envelope = serde_json::json!({
+        "project": project_id,
+        "model": model_id,
+        "request": {
+            "contents": [{
+                "role": "user",
+                "parts": [{ "text": prompt }]
+            }],
+            "generationConfig": gen_cfg,
+            "session_id": oauth_accounts::machine_session_id()
+        },
+        "requestType": "agent",
+        "userAgent": "antigravity",
+        "requestId": format!("img-{}-{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8]),
+    });
+
+    let url = "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent";
+    crate::logger::info("AntigravityImage", &format!("Generating image with model={} account={}", model_id, acc.email));
+    let trace_id = oauth_accounts::antigravity_trace_id();
+    let mut req_builder = client
+        .post(url)
+        .bearer_auth(&acc.access_token)
+        .header("Content-Type", "application/json")
+        .header("User-Agent", oauth_accounts::antigravity_hub_ua())
+        .header("X-Goog-Api-Client", oauth_accounts::antigravity_api_client())
+        .header("Client-Metadata", oauth_accounts::antigravity_client_metadata())
+        .header("X-Machine-Session-Id", oauth_accounts::machine_session_id())
+        .header("X-Goog-Request-Reason", "user_initiated")
+        .header("x-cloudaicompanion-trace-id", &trace_id);
+    if let Some(ref pid) = acc.project_id.as_deref().filter(|s| !s.is_empty()) {
+        req_builder = req_builder.header("X-Goog-User-Project", *pid);
+    }
+    let resp = req_builder
+        .json(&envelope)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let status = resp.status().as_u16();
+    let body_text = resp.text().await.map_err(|e| e.to_string())?;
+    crate::logger::record_http("AntigravityImage", "POST", url, status, &body_text[..body_text.len().min(300)]);
+    if !(200..300).contains(&status) {
+        crate::logger::error_with_trace("AntigravityImage", &format!("Image gen failed ({}): {}", status, body_text));
+        return Err(format!("Antigravity image generation failed ({}): {}", status, body_text));
+    }
+
+    let val: serde_json::Value = serde_json::from_str(&body_text).map_err(|e| e.to_string())?;
+    let root = val.get("response").unwrap_or(&val);
+    if let Some(cands) = root.get("candidates").and_then(|c| c.as_array()) {
+        for cand in cands {
+            if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
+                for part in parts {
+                    if let Some(inline) = part.get("inlineData") {
+                        let mime = inline.get("mimeType").and_then(|m| m.as_str()).unwrap_or("image/png").to_string();
+                        if let Some(b64) = inline.get("data").and_then(|d| d.as_str()) {
+                            let bytes = base64::engine::general_purpose::STANDARD
+                                .decode(b64)
+                                .map_err(|e| format!("Invalid image base64: {}", e))?;
+                            return Ok((model_id, bytes, mime));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Err("No image inlineData returned by Antigravity image model".to_string())
 }

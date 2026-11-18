@@ -55,6 +55,18 @@ let uniqueProjectPaths = $derived.by(() => {
   return Array.from(map.values());
 });
 
+let projectChatsByNorm = $derived.by(() => {
+  const grouped = new Map<string, typeof visibleRecent>();
+  for (const c of visibleRecent) {
+    if (!c.projectPath) continue;
+    const k = normProj(c.projectPath);
+    const list = grouped.get(k);
+    if (list) list.push(c);
+    else grouped.set(k, [c]);
+  }
+  return grouped;
+});
+
 let standaloneChats = $derived(visibleRecent.filter((c) => !c.projectPath));
 
 let hasMoreSessions = $derived(
@@ -103,6 +115,7 @@ function formatRelativeAge(timestamp: number): string {
 
 <aside data-omni-sidebar="" class="w-[240px] h-full bg-[#171719] border-r border-white/[0.06] flex flex-col select-none shrink-0 overflow-hidden">
   <div
+    data-omni-sidebar-header=""
     data-tauri-drag-region
     role="presentation"
     class="h-11 px-3 border-b border-white/[0.06] flex items-center justify-between shrink-0"
@@ -122,13 +135,14 @@ function formatRelativeAge(timestamp: number): string {
       {/if}
       <button
         type="button"
+        data-omni-button="new-chat"
         data-tauri-drag-region="false"
         class="flex items-center gap-2 text-[13px] font-sans text-[#D4D4D8] hover:text-white transition-colors"
         onclick={handleNewChat}
         use:attachPressScale
       >
         <Icon name="plus-circle" class="w-4 h-4 text-[#8A8A92] shrink-0" strokeWidth={1.5} />
-        <span>New task</span>
+        <span>{themeStore.t('new_task', 'New task')}</span>
       </button>
     </div>
     <span class="font-mono text-[11px] text-[#5C5C62] shrink-0 pl-2 pointer-events-none">Ctrl+N</span>
@@ -174,11 +188,12 @@ function formatRelativeAge(timestamp: number): string {
     </div>
   {/if}
 
-  <div class="flex-1 overflow-y-auto px-2.5 pb-3 space-y-2">
+  <div data-omni-chat-list="" class="flex-1 overflow-y-auto px-2.5 pb-3 space-y-2">
     {#if !chatStore.showArchived && chatStore.pinnedSessions.length > 0}
       <div class="pb-2 border-b border-white/[0.06] space-y-0.5">
         {#each chatStore.pinnedSessions as chat (chat.id)}
           <div
+            data-omni-chat-item=""
             animate:flip={{ duration: 170 }}
             in:pinReceive={{ key: chat.id }}
             out:pinSend={{ key: chat.id }}
@@ -273,7 +288,7 @@ function formatRelativeAge(timestamp: number): string {
         </div>
         {#each uniqueProjectPaths as projPath (normProj(projPath))}
           {@const projName = projPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || projPath}
-          {@const thisProjChats = visibleRecent.filter((c) => normProj(c.projectPath) === normProj(projPath))}
+          {@const thisProjChats = projectChatsByNorm.get(normProj(projPath)) || []}
           <div class="mb-2">
             <div class="group/proj flex items-center gap-1 mb-0.5 rounded-[4px] hover:bg-white/[0.04] transition-colors pr-1">
               <button
@@ -288,7 +303,7 @@ function formatRelativeAge(timestamp: number): string {
               <button
                 type="button"
                 class="w-6 h-6 rounded-[4px] flex items-center justify-center text-[#73737A] hover:text-[#EDEDEF] hover:bg-white/[0.08] transition-colors shrink-0"
-                onclick={() => chatStore.createSession('New task', projPath)}
+                onclick={() => { workspaceStore.setWorkspaceDir(projPath); chatStore.createSession('New task', projPath); }}
                 title="New task in {projName}"
                 use:attachPressScale
               >
@@ -298,6 +313,7 @@ function formatRelativeAge(timestamp: number): string {
             <div class="pl-2 space-y-0.5">
               {#each thisProjChats as chat (chat.id)}
                 <div
+                  data-omni-chat-item=""
                   animate:flip={{ duration: 170 }}
                   in:pinReceive={{ key: chat.id }}
                   out:pinSend={{ key: chat.id }}
@@ -381,6 +397,7 @@ function formatRelativeAge(timestamp: number): string {
       <div class="space-y-0.5">
         {#each (chatStore.showArchived ? visibleRecent : standaloneChats) as chat (chat.id)}
           <div
+            data-omni-chat-item=""
             animate:flip={{ duration: 170 }}
             in:pinReceive={{ key: chat.id }}
             out:pinSend={{ key: chat.id }}
@@ -482,6 +499,7 @@ function formatRelativeAge(timestamp: number): string {
   <div class="px-4 py-3 flex items-center justify-between shrink-0">
     <button
       type="button"
+      data-omni-button="settings"
       class="p-1.5 rounded-[4px] text-[#73737A] hover:text-[#E5E5E8] hover:bg-white/[0.06] transition-colors"
       onclick={onOpenSettings || (() => settingsStore.openSettings())}
       title="Settings (Ctrl+,)"

@@ -630,6 +630,29 @@ async fn stream_anthropic_inner(
                                         })
                                         .await;
                                 }
+                                "error" => {
+                                    let err_obj = val.get("error");
+                                    let err_type = err_obj
+                                        .and_then(|e| e.get("type"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let msg = err_obj
+                                        .and_then(|e| e.get("message"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| data_str.to_string());
+                                    let code = if err_type.contains("rate_limit") {
+                                        429
+                                    } else if err_type.contains("overloaded") {
+                                        529
+                                    } else {
+                                        500
+                                    };
+                                    return Err(LlmError::ProviderError {
+                                        status: code,
+                                        message: msg,
+                                    });
+                                }
                                 _ => {}
                             }
                         }

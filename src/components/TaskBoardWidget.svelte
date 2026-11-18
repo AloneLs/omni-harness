@@ -92,13 +92,13 @@ $effect(() => {
               </div>
 
               <span
-                class="min-w-0 flex-1 break-words transition-colors {todo.status === 'completed'
-                  ? 'text-[#66666D] line-through'
+                class="min-w-0 flex-1 break-words {todo.status === 'completed'
+                  ? 'text-[#66666D] line-through transition-colors'
                   : todo.status === 'in_progress'
-                  ? 'text-[#EDEDEF] font-medium shimmer-task'
+                  ? 'font-medium shimmer-task'
                   : todo.status === 'failed'
-                  ? 'text-[#F87171]'
-                  : 'text-[#9BA1B0]'}"
+                  ? 'text-[#F87171] transition-colors'
+                  : 'text-[#9BA1B0] transition-colors'}"
               >
                 {todo.text}
               </span>
@@ -115,16 +115,17 @@ $effect(() => {
     background: linear-gradient(
       90deg,
       rgba(212, 212, 216, 0.78) 0%,
-      rgba(212, 212, 216, 0.78) 35%,
+      rgba(212, 212, 216, 0.78) 40%,
       rgba(255, 255, 255, 1) 50%,
-      rgba(212, 212, 216, 0.78) 65%,
+      rgba(212, 212, 216, 0.78) 60%,
       rgba(212, 212, 216, 0.78) 100%
     );
-    background-size: 220% 100%;
+    background-size: 300% 100%;
     -webkit-background-clip: text;
     background-clip: text;
     color: transparent;
-    animation: task-shimmer 1.8s linear infinite;
+    will-change: background-position;
+    animation: task-shimmer 2s linear infinite;
   }
 
   @keyframes task-shimmer {
@@ -132,7 +133,7 @@ $effect(() => {
       background-position: 100% 0;
     }
     100% {
-      background-position: -120% 0;
+      background-position: 0% 0;
     }
   }
 </style>

@@ -2,6 +2,7 @@ pub mod db;
 pub mod engine;
 pub mod error;
 pub mod llm;
+pub mod logger;
 pub mod mcp;
 pub mod skills;
 pub mod speech;
@@ -853,45 +854,59 @@ async fn sync_chat_context(
             updated_at: now.clone(),
         };
         let _ = db.create_chat(&chat);
-    } else if !title.trim().is_empty() {
-        let _ = db.update_chat_title(&chat_id, &title);
+    } else {
+        if !title.trim().is_empty() {
+            let _ = db.update_chat_title(&chat_id, &title);
+        }
+        let next_proj = project_path.as_deref().map(|x| x.trim()).filter(|x| !x.is_empty());
+        let _ = db.update_chat_project(&chat_id, next_proj);
+        if let Some(mid) = model_id.as_deref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+            let _ = db.update_chat_model(&chat_id, mid);
+        }
     }
 
     if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&messages_json) {
-        let existing = db.list_messages(&chat_id).unwrap_or_default();
-        if parsed.len() > existing.len() {
-            let mut seq = existing.last().map(|m| m.sequence_num).unwrap_or(0);
-            for (idx, item) in parsed.iter().enumerate().skip(existing.len()) {
-                let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user").to_string();
+        let clean_pairs: Vec<(String, String)> = parsed
+            .iter()
+            .filter_map(|item| {
+                let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user").trim().to_string();
                 let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 if content.trim().is_empty() {
-                    continue;
+                    None
+                } else {
+                    Some((role, content))
                 }
-                let is_dup = existing
-                    .get(idx)
-                    .map(|e| e.role == role && e.content == content)
-                    .unwrap_or(false)
-                    || existing
-                        .last()
-                        .map(|e| e.role == role && e.content == content)
-                        .unwrap_or(false);
-                if is_dup {
-                    continue;
+            })
+            .collect();
+        let existing = db.list_messages(&chat_id).unwrap_or_default();
+        let prefix_matches = clean_pairs.len() >= existing.len()
+            && existing
+                .iter()
+                .zip(clean_pairs.iter())
+                .all(|(ex, (r, c))| ex.role == *r && ex.content.trim() == c.trim());
+
+        if prefix_matches {
+            if clean_pairs.len() > existing.len() {
+                let mut seq = existing.last().map(|m| m.sequence_num).unwrap_or(0);
+                for (role, content) in clean_pairs.into_iter().skip(existing.len()) {
+                    seq += 1;
+                    let msg = db::chats::Message {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        chat_id: chat_id.clone(),
+                        role,
+                        content,
+                        reasoning_content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        sequence_num: seq,
+                        created_at: now.clone(),
+                    };
+                    let _ = db.create_message(&msg);
                 }
-                seq += 1;
-                let msg = db::chats::Message {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    chat_id: chat_id.clone(),
-                    role,
-                    content,
-                    reasoning_content: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    sequence_num: seq,
-                    created_at: now.clone(),
-                };
-                let _ = db.create_message(&msg);
             }
+        } else {
+            let _ = db.replace_chat_messages(&chat_id, &clean_pairs);
+            let _ = db.delete_checkpoint(&format!("tg_ctx:{}", chat_id));
         }
     }
     Ok(())
@@ -983,9 +998,93 @@ pub struct HistoryInputItem {
     pub content: String,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AttachmentInput {
+    pub name: Option<String>,
+    pub path: Option<String>,
+    pub kind: Option<String>,
+    pub data_url: Option<String>,
+}
+
+fn build_user_msg_with_attachments(prompt: &str, attachments: Option<Vec<AttachmentInput>>) -> Option<llm::request_compat::ChatMessage> {
+    use base64::Engine;
+    let atts = attachments?;
+    if atts.is_empty() {
+        return None;
+    }
+    let mut parts: Vec<llm::request_compat::ContentPart> = vec![
+        llm::request_compat::ContentPart::Text { text: prompt.to_string() },
+    ];
+    let mut has_image = false;
+    let mut extra_notes: Vec<String> = Vec::new();
+    for att in atts {
+        let name = att.name.unwrap_or_else(|| "file".to_string());
+        let path_str = att.path.unwrap_or_default();
+        let kind = att.kind.unwrap_or_default();
+        let low = format!("{} {}", name, path_str).to_lowercase();
+        let is_img = kind == "image"
+            || low.ends_with(".png")
+            || low.ends_with(".jpg")
+            || low.ends_with(".jpeg")
+            || low.ends_with(".webp")
+            || low.ends_with(".gif");
+        if is_img {
+            let url_opt = if let Some(du) = att.data_url.filter(|u| u.starts_with("data:image/")) {
+                Some(du)
+            } else if !path_str.trim().is_empty() {
+                if let Ok(bytes) = std::fs::read(path_str.trim()) {
+                    let mime = if low.ends_with(".jpg") || low.ends_with(".jpeg") {
+                        "image/jpeg"
+                    } else if low.ends_with(".webp") {
+                        "image/webp"
+                    } else if low.ends_with(".gif") {
+                        "image/gif"
+                    } else {
+                        "image/png"
+                    };
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    Some(format!("data:{};base64,{}", mime, b64))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(u) = url_opt {
+                has_image = true;
+                parts.push(llm::request_compat::ContentPart::ImageUrl {
+                    image_url: llm::request_compat::ImageUrlDetail { url: u, detail: None },
+                });
+            }
+        } else if !path_str.trim().is_empty() {
+            extra_notes.push(format!("[Attached file: {} ({})]", name, path_str));
+        }
+    }
+    if !extra_notes.is_empty() {
+        if let Some(llm::request_compat::ContentPart::Text { text }) = parts.first_mut() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&extra_notes.join("\n"));
+        }
+    }
+    if !has_image && extra_notes.is_empty() {
+        return None;
+    }
+    Some(llm::request_compat::ChatMessage {
+        role: "user".to_string(),
+        content: llm::request_compat::MessageContent::Parts(parts),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    })
+}
+
 #[tauri::command]
 async fn start_chat_stream(
     state: State<'_, AppManagedState>,
+    app: tauri::AppHandle,
     chat_id: String,
     prompt: String,
     model_id: String,
@@ -1003,22 +1102,59 @@ async fn start_chat_stream(
     plan_mode: Option<bool>,
     resume: Option<bool>,
     history: Option<Vec<HistoryInputItem>>,
+    attachments: Option<Vec<AttachmentInput>>,
+    theme_id: Option<String>,
     on_event: Channel<serde_json::Value>,
 ) -> Result<String, String> {
     let session = state.stream_mgr.create_session(&chat_id).await;
     let session_id = chat_id.clone();
 
-    let workspace_path = match workspace_dir.as_deref() {
-        Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
-        _ => {
+    let explicit_ws = workspace_dir
+        .as_deref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let fallback_ws = if explicit_ws.is_none() {
+        let ws = state.app_state.get_workspace_dir().await;
+        let s = ws.to_string_lossy().to_string();
+        if s.trim().is_empty() { None } else { Some(s) }
+    } else {
+        explicit_ws.clone()
+    };
+    let (tools_ws_path, workspace_str) = match fallback_ws {
+        Some(ref dir) => (PathBuf::from(dir), dir.clone()),
+        None => {
             let chat_ws = state::AppState::resolve_install_workspace().join(&chat_id);
             let _ = std::fs::create_dir_all(&chat_ws);
-            chat_ws
+            (PathBuf::new(), chat_ws.to_string_lossy().to_string())
         }
     };
-    let workspace_str = workspace_path.to_string_lossy().to_string();
-
-    let tools = state.tool_dispatcher.for_workspace(&workspace_path, &chat_id);
+    let is_theme_mode = theme_id.as_deref().map(|s| !s.trim().is_empty()).unwrap_or(false);
+    if !is_theme_mode && state.app_state.db.get_chat(&chat_id).is_err() {
+        let now = chrono::Utc::now().to_rfc3339();
+        let chat = db::chats::Chat {
+            id: chat_id.clone(),
+            project_id: explicit_ws,
+            title: prompt.chars().take(48).collect::<String>(),
+            model_id: model_id.clone(),
+            system_prompt: String::new(),
+            is_pinned: false,
+            created_at: now.clone(),
+            updated_at: now,
+        };
+        let _ = state.app_state.db.create_chat(&chat);
+    }
+    let tools = if let Some(ref tid) = theme_id.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        state.tool_dispatcher.for_theme_studio(app.clone(), tid)
+    } else {
+        let sandbox_opt = if tools_ws_path.as_os_str().is_empty() {
+            None
+        } else {
+            Some(tools_ws_path.as_path())
+        };
+        state
+            .tool_dispatcher
+            .for_workspace_with_cwd(sandbox_opt, std::path::Path::new(&workspace_str), &chat_id)
+    };
     let combined_plan = plan_mode.unwrap_or(false) || prompt.split_whitespace().any(|t| t.eq_ignore_ascii_case("/plan"));
     tools.set_plan_mode(combined_plan);
     let key_pool = (*state.key_pool).clone();
@@ -1211,6 +1347,7 @@ async fn start_chat_stream(
             .load_checkpoint(&chat_id)
             .ok()
             .flatten()
+            .or_else(|| db_arc.load_checkpoint(&format!("tg_ctx:{}", chat_id)).ok().flatten())
             .and_then(|j| serde_json::from_str(&j).ok())
     } else {
         None
@@ -1230,14 +1367,20 @@ async fn start_chat_stream(
         })
         .collect();
 
+    let pending_user_msg = build_user_msg_with_attachments(&prompt, attachments);
     let api_proto = api_protocol.clone();
+    logger::info("ChatStream", &format!("start chat_id={} model={} provider={:?} theme={:?} has_attachments={}", chat_id, model_id, provider_name, theme_id, pending_user_msg.is_some()));
     tokio::spawn(async move {
         let mut contract_lock = contract_mutex.lock().await;
         let mut history = if let Some(rh) = resumed_history {
             rh
         } else {
             let mut h = Vec::new();
-            if !initial_history.is_empty() {
+            if is_theme_mode {
+                let sys_prompt = "You are OmniHarness Theme Designer, a specialized UI/CSS/SVG engineer. Customize the OmniHarness interface theme in real time using ONLY your theme_* tools. Always call theme_get_dom_spec and theme_read_current first, then apply clean valid CSS (using [data-omni-*] selectors, CSS variables, @keyframes, @font-face, omni-asset:// URLs), SVG icons via theme_set_icon, and UI text/language overrides via theme_set_texts.".to_string();
+                h.push(llm::request_compat::ChatMessage::system(sys_prompt));
+                h.extend(initial_history);
+            } else if !initial_history.is_empty() {
                 let sys_prompt = engine::prompt_builder::PromptBuilder::build_system_prompt(
                     &engine::role_permissions::AgentRole::Main,
                     &workspace_str,
@@ -1247,6 +1390,9 @@ async fn start_chat_stream(
                 );
                 h.push(llm::request_compat::ChatMessage::system(sys_prompt));
                 h.extend(initial_history);
+            }
+            if let Some(att_msg) = pending_user_msg {
+                h.push(att_msg);
             }
             h
         };
@@ -1571,7 +1717,7 @@ async fn start_chat_stream(
             }
         }
 
-        stream_mgr.remove_session(&chat_id_str).await;
+        stream_mgr.remove_session_if_current(&chat_id_str, &session).await;
     });
 
     Ok(session_id)
@@ -2409,7 +2555,7 @@ async fn list_skills(
     state: State<'_, AppManagedState>,
 ) -> Result<Vec<skills::SkillPackage>, String> {
     let ws = state.app_state.get_workspace_dir().await;
-    Ok(skills::discover_all_skills(&ws.to_string_lossy()).into_iter().filter(|sk| !sk.metadata.name.starts_with("system:")).collect())
+    Ok(skills::discover_all_skills(&ws.to_string_lossy()).into_iter().filter(|sk| !sk.metadata.name.starts_with("system:") && !sk.metadata.name.eq_ignore_ascii_case("skill-creator")).collect())
 }
 
 #[tauri::command]
@@ -2418,6 +2564,9 @@ async fn delete_skill(
     skill_path: String,
     skill_name: String,
 ) -> Result<(), String> {
+    if skill_name.trim().eq_ignore_ascii_case("skill-creator") || skill_name.trim().starts_with("system:") {
+        return Err("System skills cannot be deleted".to_string());
+    }
     let ws = state.app_state.get_workspace_dir().await;
     let ws_str = ws.to_string_lossy().to_string();
     let target = if !skill_path.trim().is_empty() {
@@ -2723,6 +2872,7 @@ pub fn run() {
                     "quit" => {
                         let st = app.state::<AppManagedState>();
                         let _ = st.tool_dispatcher.pty_manager.kill_all();
+                        let _ = tools::phantom_session::restore_all_staged_windows(true);
                         app.exit(0);
                     }
                     "show" => {
@@ -2750,6 +2900,9 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            logger::init(state::AppState::resolve_data_dir());
+            logger::info("App", "OmniHarness started");
+            tools::phantom_session::recover_orphaned_staged_windows();
             if let (Some(win), Some(icon)) = (app.get_webview_window("main"), app.default_window_icon()) {
                 let _ = win.set_icon(icon.clone());
             }
@@ -2763,6 +2916,8 @@ pub fn run() {
                 if state.has_active_tasks() {
                     api.prevent_close();
                     let _ = window.hide();
+                } else {
+                    let _ = tools::phantom_session::restore_all_staged_windows(true);
                 }
             }
         })
@@ -2872,6 +3027,8 @@ pub fn run() {
             get_active_theme_id,
             set_active_theme_id,
             start_theme_agent_stream,
+            open_zcode_oauth_window,
+            get_debug_log_path,
             list_subagents,
             save_custom_subagent,
             delete_custom_subagent,
@@ -2892,6 +3049,12 @@ pub fn run() {
             set_telegram_running,
             generate_pairing_code,
             verify_pairing_code,
+            cu_get_status,
+            cu_set_policy,
+            cu_stage_window,
+            cu_restore_all_windows,
+            cu_preview_window,
+            cu_close_window,
         ])
         .run(tauri::generate_context!())
         .expect("Error while running OmniHarness application");
@@ -3004,6 +3167,7 @@ async fn start_theme_agent_stream(
     let cid_clone = chat_id.clone();
 
     tokio::spawn(async move {
+        let mut contract: Option<TaskContract> = None;
         let res = engine::single_agent::SingleAgentRunner::run_turn(
             &http_client,
             &cid_clone,
@@ -3021,7 +3185,7 @@ async fn start_theme_agent_stream(
             Some(&app_state.db),
             false,
             &session,
-            &mut None,
+            &mut contract,
             &mut msgs,
             tx.clone(),
         )
@@ -3029,8 +3193,96 @@ async fn start_theme_agent_stream(
         if let Err(e) = res {
             let _ = tx.send(llm::StreamEvent::Error { error: e }).await;
         }
-        stream_mgr.remove_session(&cid_clone).await;
+        stream_mgr.remove_session_if_current(&cid_clone, &session).await;
     });
 
     Ok(chat_id)
+}
+
+
+#[tauri::command]
+async fn get_debug_log_path() -> String {
+    logger::get_log_path()
+}
+
+#[tauri::command]
+async fn open_zcode_oauth_window(app: tauri::AppHandle, auth_url: String) -> Result<(), String> {
+    use tauri::Emitter;
+    let parsed: tauri::Url = auth_url.parse().map_err(|e| format!("Invalid auth URL: {}", e))?;
+    if let Some(existing) = app.get_webview_window("zcode-oauth") {
+        let _ = existing.close();
+    }
+    let app_for_nav = app.clone();
+    let app_for_close = app.clone();
+    let win = tauri::WebviewWindowBuilder::new(&app, "zcode-oauth", tauri::WebviewUrl::External(parsed))
+        .title("ZCode OAuth Login")
+        .inner_size(520.0, 700.0)
+        .center()
+        .on_navigation(move |nav_url| {
+            let s = nav_url.as_str();
+            if s.starts_with("zcode://") || (s.contains("code=") && s.contains("state=")) {
+                let _ = app_for_nav.emit("zcode-oauth-callback", s.to_string());
+                if let Some(w) = app_for_close.get_webview_window("zcode-oauth") {
+                    let _ = w.close();
+                }
+                return false;
+            }
+            true
+        })
+        .build()
+        .map_err(|e| e.to_string())?;
+    let _ = win.set_focus();
+    Ok(())
+}
+
+#[tauri::command]
+async fn cu_get_status() -> Result<serde_json::Value, String> {
+    tokio::task::spawn_blocking(tools::phantom_session::get_status_snapshot)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cu_set_policy(
+    policy: tools::phantom_session::ComputerUsePolicy,
+) -> Result<tools::phantom_session::ComputerUsePolicy, String> {
+    tokio::task::spawn_blocking(move || tools::phantom_session::set_policy(policy))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cu_stage_window(hwnd: usize, offscreen: bool) -> Result<tools::desktop_uia::WindowInfo, String> {
+    tokio::task::spawn_blocking(move || {
+        if offscreen {
+            tools::phantom_session::stage_window_offscreen(hwnd, false, None, None)
+        } else {
+            tools::phantom_session::restore_staged_window(hwnd)
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn cu_restore_all_windows() -> Result<usize, String> {
+    tokio::task::spawn_blocking(|| tools::phantom_session::restore_all_staged_windows(false))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn cu_preview_window(hwnd: usize) -> Result<serde_json::Value, String> {
+    tokio::task::spawn_blocking(move || {
+        tools::desktop_uia::capture_window_or_desktop_png(Some(hwnd), None, None)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn cu_close_window(hwnd: usize) -> Result<serde_json::Value, String> {
+    tokio::task::spawn_blocking(move || tools::desktop_uia::close_window_background(hwnd))
+        .await
+        .map_err(|e| e.to_string())?
 }

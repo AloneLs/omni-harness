@@ -74,7 +74,15 @@ impl SingleAgentRunner {
         event_sender: &mpsc::Sender<StreamEvent>,
     ) -> (bool, String, Option<String>) {
         if let Some(obj) = args.as_object() {
-            let allowed = ["command", "description", "cwd", "timeout_secs", "background"];
+            let allowed = [
+                "command",
+                "description",
+                "cwd",
+                "wait_ms_before_async",
+                "timeout_secs",
+                "background",
+                "is_daemon",
+            ];
             let unknown: Vec<&str> = obj.keys().map(|k| k.as_str()).filter(|k| !allowed.contains(k)).collect();
             if !unknown.is_empty() {
                 let err_msg = format!("Invalid argument: unknown parameter(s): {}", unknown.join(", "));
@@ -89,403 +97,141 @@ impl SingleAgentRunner {
             return (false, serde_json::json!({ "error": e }).to_string(), Some(e));
         }
 
-        let timeout_secs = match args.get("timeout_secs") {
-            Some(v) => match v.as_u64() {
-                Some(n) if (5..=600).contains(&n) => n,
-                _ => {
-                    let err_msg = "Invalid argument: timeout_secs must be an integer between 5 and 600".to_string();
-                    return (false, serde_json::json!({ "error": err_msg }).to_string(), Some(err_msg));
-                }
-            },
-            None => 120,
+        let base_wd = if !workspace_root.trim().is_empty() {
+            std::path::Path::new(workspace_root)
+        } else {
+            tools.working_dir.as_path()
         };
 
-        let cwd_raw = match args.get("cwd") {
+        let cwd_validated = match args.get("cwd") {
             Some(v) => match v.as_str() {
-                Some(s) if !s.trim().is_empty() => s,
+                Some(s) if !s.trim().is_empty() => {
+                    match crate::tools::path_norm::validate_path_with_base(s, Some(base_wd), &tools.allowed_roots) {
+                        Ok(p) => p,
+                        Err(e) => return (false, serde_json::json!({ "error": e }).to_string(), Some(e)),
+                    }
+                }
                 _ => {
                     let err_msg = "Invalid argument: cwd must be a non-empty string".to_string();
                     return (false, serde_json::json!({ "error": err_msg }).to_string(), Some(err_msg));
                 }
             },
-            None => workspace_root,
+            None => crate::tools::path_norm::strip_verbatim_prefix(base_wd),
         };
-        if !std::path::Path::new(cwd_raw).is_dir() {
-            let err_msg = format!("Invalid cwd: directory '{}' does not exist", cwd_raw);
+        if !cwd_validated.is_dir() {
+            let err_msg = format!("Invalid cwd: directory '{}' does not exist", cwd_validated.display());
             return (false, serde_json::json!({ "error": err_msg }).to_string(), Some(err_msg));
         }
-        let cwd_validated = match crate::tools::workspace::validate_path(cwd_raw, &tools.allowed_roots) {
-            Ok(p) => p,
-            Err(e) => return (false, serde_json::json!({ "error": e }).to_string(), Some(e)),
-        };
         let cwd_str = cwd_validated.to_string_lossy().to_string();
-        let cwd = cwd_str.as_str();
-        let background = args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
-        let started = std::time::Instant::now();
 
-        let encoded_ps = if cfg!(target_os = "windows") {
-            use base64::Engine;
-            let full_script = format!(
-                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::InputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8;\n{}",
-                command
-            );
-            let utf16_bytes: Vec<u8> = full_script
-                .encode_utf16()
-                .flat_map(|u| u.to_le_bytes())
-                .collect();
-            base64::engine::general_purpose::STANDARD.encode(&utf16_bytes)
+        let background = args
+            .get("background")
+            .or_else(|| args.get("is_daemon"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let wait_ms = if background {
+            500
+        } else if let Some(ms) = args.get("wait_ms_before_async").and_then(|v| v.as_u64()) {
+            ms.clamp(200, 30_000)
+        } else if let Some(secs) = args.get("timeout_secs").and_then(|v| v.as_u64()) {
+            (secs.saturating_mul(1000)).clamp(500, 10_000)
         } else {
-            String::new()
+            8_000
         };
 
-        if !background {
-            use tokio::io::AsyncReadExt;
-            let mut cmd = if cfg!(target_os = "windows") {
-                let mut c = tokio::process::Command::new("powershell.exe");
-                c.args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded_ps]);
-                c
-            } else {
-                let mut c = tokio::process::Command::new("sh");
-                c.args(["-c", command]);
-                c
-            };
-            cmd.current_dir(cwd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .kill_on_drop(true);
-            #[cfg(windows)]
-            {
-                cmd.creation_flags(0x08000000);
-            }
-
-            let mut child = match cmd.spawn() {
-                Ok(c) => c,
-                Err(e) => return (false, serde_json::json!({ "error": e.to_string() }).to_string(), Some(e.to_string())),
-            };
-            let child_pid = child.id();
-
-            #[cfg(windows)]
-            struct WinJobGuard(Option<windows::Win32::Foundation::HANDLE>);
-            #[cfg(windows)]
-            impl WinJobGuard {
-                fn attach(raw_handle: Option<std::os::windows::io::RawHandle>) -> Self {
-                    use windows::Win32::Foundation::HANDLE;
-                    use windows::Win32::System::JobObjects::{
-                        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-                        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-                        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                    };
-                    unsafe {
-                        let Ok(job) = CreateJobObjectW(None, None) else {
-                            return Self(None);
-                        };
-                        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-                        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                        let _ = SetInformationJobObject(
-                            job,
-                            JobObjectExtendedLimitInformation,
-                            &info as *const _ as *const std::ffi::c_void,
-                            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                        );
-                        if let Some(rh) = raw_handle {
-                            let _ = AssignProcessToJobObject(job, HANDLE(rh));
-                        }
-                        Self(Some(job))
-                    }
-                }
-                fn terminate(&mut self) {
-                    use windows::Win32::Foundation::CloseHandle;
-                    use windows::Win32::System::JobObjects::TerminateJobObject;
-                    if let Some(job) = self.0.take() {
-                        unsafe {
-                            let _ = TerminateJobObject(job, 1);
-                            let _ = CloseHandle(job);
-                        }
-                    }
-                }
-            }
-            #[cfg(windows)]
-            impl Drop for WinJobGuard {
-                fn drop(&mut self) {
-                    use windows::Win32::Foundation::CloseHandle;
-                    if let Some(job) = self.0.take() {
-                        unsafe {
-                            let _ = CloseHandle(job);
-                        }
-                    }
-                }
-            }
-            #[cfg(windows)]
-            unsafe impl Send for WinJobGuard {}
-            #[cfg(windows)]
-            unsafe impl Sync for WinJobGuard {}
-            #[cfg(windows)]
-            let mut job_guard = WinJobGuard::attach(child.raw_handle());
-
-            let mut stdout_pipe = child.stdout.take();
-            let mut stderr_pipe = child.stderr.take();
-            let tx_out = event_sender.clone();
-            let tx_err = event_sender.clone();
-            let cid_out = call_id.to_string();
-            let cid_err = call_id.to_string();
-
-            let out_task = tokio::spawn(async move {
-                let mut acc = Vec::new();
-                if let Some(ref mut r) = stdout_pipe {
-                    let mut buf = [0u8; 8192];
-                    while let Ok(n) = r.read(&mut buf).await {
-                        if n == 0 { break; }
-                        acc.extend_from_slice(&buf[..n]);
-                        let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                        if !chunk.is_empty() {
-                            let _ = tx_out.send(StreamEvent::ToolOutputDelta { id: cid_out.clone(), chunk }).await;
-                        }
-                    }
-                }
-                acc
-            });
-
-            let err_task = tokio::spawn(async move {
-                let mut acc = Vec::new();
-                if let Some(ref mut r) = stderr_pipe {
-                    let mut buf = [0u8; 8192];
-                    while let Ok(n) = r.read(&mut buf).await {
-                        if n == 0 { break; }
-                        acc.extend_from_slice(&buf[..n]);
-                        let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                        if !chunk.is_empty() {
-                            let _ = tx_err.send(StreamEvent::ToolOutputDelta { id: cid_err.clone(), chunk }).await;
-                        }
-                    }
-                }
-                acc
-            });
-
-            let kill_tree = |pid_opt: Option<u32>| {
-                #[cfg(windows)]
-                if let Some(pid) = pid_opt {
-                    use std::os::windows::process::CommandExt;
-                    let mut tk = std::process::Command::new("taskkill");
-                    tk.args(["/F", "/T", "/PID", &pid.to_string()]).creation_flags(0x08000000);
-                    let _ = tk.output();
-                }
-                let _ = pid_opt;
-            };
-
-            let mut timed_out = false;
-            let mut canceled = false;
-            let mut status_opt = None;
-
-            tokio::select! {
-                _ = session.cancel_notify.notified() => {
-                    canceled = true;
-                    #[cfg(windows)]
-                    job_guard.terminate();
-                    kill_tree(child_pid);
-                    let _ = child.kill().await;
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
-                    timed_out = true;
-                    #[cfg(windows)]
-                    job_guard.terminate();
-                    kill_tree(child_pid);
-                    let _ = child.kill().await;
-                }
-                res = child.wait() => {
-                    if let Ok(st) = res {
-                        status_opt = Some(st);
-                    }
-                }
-            }
-
-            if canceled {
-                let _ = out_task.await;
-                let _ = err_task.await;
-                return (false, serde_json::json!({ "error": "User canceled execution", "duration_ms": started.elapsed().as_millis() as u64 }).to_string(), Some("User canceled execution".to_string()));
-            }
-
-            let out_bytes = out_task.await.unwrap_or_default();
-            let err_bytes = err_task.await.unwrap_or_default();
-            let stdout_raw = crate::tools::process_pty::strip_ansi(&String::from_utf8_lossy(&out_bytes).replace("\r\n", "\n"));
-            let stderr_raw = crate::tools::process_pty::strip_ansi(&String::from_utf8_lossy(&err_bytes).replace("\r\n", "\n"));
-            let duration_ms = started.elapsed().as_millis() as u64;
-
-            let mut combined = String::new();
-            if !stdout_raw.is_empty() {
-                combined.push_str(&stdout_raw);
-            }
-            if !stderr_raw.is_empty() {
-                if !combined.is_empty() && !combined.ends_with('\n') {
-                    combined.push('\n');
-                }
-                combined.push_str(&stderr_raw);
-            }
-
-            let (bounded_out, spill_file) = spill_tool_output_with_path(workspace_root, call_id, &combined);
-            let (bounded_stdout, _) = spill_tool_output_with_path(workspace_root, &format!("{}_out", call_id), &stdout_raw);
-            let (bounded_stderr, _) = spill_tool_output_with_path(workspace_root, &format!("{}_err", call_id), &stderr_raw);
-
-            if timed_out {
-                let err_msg = format!("Command timed out after {}s and was terminated", timeout_secs);
-                let out_json = serde_json::json!({
-                    "stdout": bounded_stdout,
-                    "stderr": bounded_stderr,
-                    "output": bounded_out,
-                    "exit_code": serde_json::Value::Null,
-                    "duration_ms": duration_ms,
-                    "running": false,
-                    "timed_out": true,
-                    "spill_file": spill_file,
-                    "error": err_msg,
-                });
-                return (false, out_json.to_string(), Some(err_msg));
-            }
-
-            let exit_code = status_opt.and_then(|s| s.code()).unwrap_or(-1);
-            if exit_code != 0 {
-                let err_msg = format!("Command exited with non-zero code {}", exit_code);
-                let out_json = serde_json::json!({
-                    "stdout": bounded_stdout,
-                    "stderr": bounded_stderr,
-                    "output": bounded_out,
-                    "exit_code": exit_code,
-                    "duration_ms": duration_ms,
-                    "running": false,
-                    "timed_out": false,
-                    "spill_file": spill_file,
-                    "error": err_msg,
-                });
-                return (false, out_json.to_string(), Some(err_msg));
-            }
-
-            let out_json = serde_json::json!({
-                "stdout": bounded_stdout,
-                "stderr": bounded_stderr,
-                "output": bounded_out,
-                "exit_code": 0,
-                "duration_ms": duration_ms,
-                "running": false,
-                "timed_out": false,
-                "spill_file": spill_file,
-            });
-            return (true, out_json.to_string(), None);
-        }
-
-        let (shell_bin, shell_args): (&str, Vec<&str>) = if cfg!(target_os = "windows") {
-            ("powershell.exe", vec!["-NoProfile", "-NonInteractive", "-EncodedCommand", &encoded_ps])
-        } else {
-            ("sh", vec!["-c", command])
-        };
-
-        let sid = match tools.pty_manager.spawn_pty_for_chat(120, 32, shell_bin, &shell_args, Some(cwd), None, Some(chat_id)) {
+        let task_id = match tools.pty_manager.spawn_managed_task(
+            command,
+            &cwd_str,
+            Some(chat_id),
+            Some((event_sender.clone(), call_id.to_string())),
+        ) {
             Ok(id) => id,
             Err(e) => return (false, serde_json::json!({ "error": e }).to_string(), Some(e)),
         };
 
-        let mut collected = String::new();
-        let mut pending_utf8: Vec<u8> = Vec::new();
-        let max_dur = std::time::Duration::from_millis(1200);
-
-        let decode_utf8_stream = |buf: &mut Vec<u8>, incoming: &[u8], flush_all: bool| -> String {
-            buf.extend_from_slice(incoming);
-            if flush_all {
-                let out = String::from_utf8_lossy(buf).to_string();
-                buf.clear();
-                return out;
-            }
-            match std::str::from_utf8(buf) {
-                Ok(s) => {
-                    let out = s.to_string();
-                    buf.clear();
-                    out
-                }
-                Err(e) => {
-                    let valid_up_to = e.valid_up_to();
-                    let out = String::from_utf8_lossy(&buf[..valid_up_to]).to_string();
-                    if e.error_len().is_none() {
-                        *buf = buf[valid_up_to..].to_vec();
-                    } else {
-                        let skip = valid_up_to + e.error_len().unwrap_or(1);
-                        *buf = buf[skip..].to_vec();
-                    }
-                    out
-                }
-            }
+        let outcome = match tools
+            .pty_manager
+            .wait_or_background(&task_id, wait_ms, Some(&session.cancel_notify))
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => return (false, serde_json::json!({ "error": e }).to_string(), Some(e)),
         };
 
-        loop {
-            if !session.is_active() {
-                let _ = tools.pty_manager.kill_pty(&sid);
-                return (false, serde_json::json!({ "error": "User canceled execution" }).to_string(), Some("User canceled execution".to_string()));
+        match outcome {
+            crate::tools::process_pty::TaskExecOutcome::Canceled { duration_ms } => {
+                let err_msg = "User canceled execution".to_string();
+                (
+                    false,
+                    serde_json::json!({ "error": err_msg, "duration_ms": duration_ms }).to_string(),
+                    Some(err_msg),
+                )
             }
-            if let Ok(chunk_bytes) = tools.pty_manager.read_pty(&sid, 65536) {
-                if !chunk_bytes.is_empty() {
-                    let text = decode_utf8_stream(&mut pending_utf8, &chunk_bytes, false).replace("\r\n", "\n");
-                    if !text.is_empty() {
-                        collected.push_str(&text);
-                        let _ = event_sender
-                            .send(StreamEvent::ToolOutputDelta {
-                                id: call_id.to_string(),
-                                chunk: text,
-                            })
-                            .await;
-                    }
-                }
+            crate::tools::process_pty::TaskExecOutcome::Backgrounded {
+                task_id,
+                output_so_far,
+                duration_ms,
+            } => {
+                let (bounded, spill_file) = spill_tool_output_with_path(workspace_root, call_id, &output_so_far);
+                let out_json = serde_json::json!({
+                    "task_id": task_id,
+                    "session_id": task_id,
+                    "status": "running",
+                    "running": true,
+                    "background": true,
+                    "duration_ms": duration_ms,
+                    "output": bounded,
+                    "spill_file": spill_file,
+                    "hint": "Command is still running in background. Use manage_task(action='status'|'send_input'|'kill', task_id=...) to inspect output, send input, or stop it.",
+                });
+                (true, out_json.to_string(), None)
             }
-            let alive = tools.pty_manager.is_session_alive(&sid);
-            if !alive || started.elapsed() >= max_dur {
-                if !alive {
-                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            crate::tools::process_pty::TaskExecOutcome::Completed {
+                task_id,
+                exit_code,
+                stdout,
+                stderr,
+                output,
+                duration_ms,
+            } => {
+                let (bounded_out, spill_file) = spill_tool_output_with_path(workspace_root, call_id, &output);
+                let (bounded_stdout, _) = spill_tool_output_with_path(workspace_root, &format!("{}_out", call_id), &stdout);
+                let (bounded_stderr, _) = spill_tool_output_with_path(workspace_root, &format!("{}_err", call_id), &stderr);
+
+                if exit_code != 0 {
+                    let err_msg = format!("Command exited with non-zero code {}", exit_code);
+                    let out_json = serde_json::json!({
+                        "task_id": task_id,
+                        "status": "completed",
+                        "stdout": bounded_stdout,
+                        "stderr": bounded_stderr,
+                        "output": bounded_out,
+                        "exit_code": exit_code,
+                        "duration_ms": duration_ms,
+                        "running": false,
+                        "timed_out": false,
+                        "spill_file": spill_file,
+                        "error": err_msg,
+                    });
+                    return (false, out_json.to_string(), Some(err_msg));
                 }
-                break;
-            }
-            tokio::select! {
-                _ = session.cancel_notify.notified() => {
-                    let _ = tools.pty_manager.kill_pty(&sid);
-                    return (false, serde_json::json!({ "error": "User canceled execution" }).to_string(), Some("User canceled execution".to_string()));
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(120)) => {}
+
+                let out_json = serde_json::json!({
+                    "task_id": task_id,
+                    "status": "completed",
+                    "stdout": bounded_stdout,
+                    "stderr": bounded_stderr,
+                    "output": bounded_out,
+                    "exit_code": 0,
+                    "duration_ms": duration_ms,
+                    "running": false,
+                    "timed_out": false,
+                    "spill_file": spill_file,
+                });
+                (true, out_json.to_string(), None)
             }
         }
-
-        let tail_bytes = tools.pty_manager.read_pty(&sid, 65536).unwrap_or_default();
-        if !tail_bytes.is_empty() || !pending_utf8.is_empty() {
-            let text = decode_utf8_stream(&mut pending_utf8, &tail_bytes, true).replace("\r\n", "\n");
-            if !text.is_empty() {
-                collected.push_str(&text);
-            }
-        }
-
-        let still_running = tools.pty_manager.is_session_alive(&sid);
-        let exit_code = if still_running { None } else { tools.pty_manager.get_exit_code(&sid) };
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let (bounded, spill_file) = spill_tool_output_with_path(workspace_root, call_id, &collected);
-
-        if !still_running && exit_code.unwrap_or(0) != 0 {
-            let code = exit_code.unwrap_or(-1);
-            let err_msg = format!("Command exited with non-zero code {}", code);
-            let out_json = serde_json::json!({
-                "session_id": sid,
-                "running": false,
-                "exit_code": code,
-                "duration_ms": duration_ms,
-                "output": bounded,
-                "spill_file": spill_file,
-                "error": err_msg,
-            });
-            return (false, out_json.to_string(), Some(err_msg));
-        }
-
-        let out_json = serde_json::json!({
-            "session_id": sid,
-            "running": still_running,
-            "exit_code": exit_code,
-            "duration_ms": duration_ms,
-            "output": bounded,
-            "spill_file": spill_file,
-        });
-        (true, out_json.to_string(), None)
     }
 
     fn handle_task_board(
@@ -705,43 +451,82 @@ impl SingleAgentRunner {
     }
 
     fn sanitize_resumed_history(history: &mut Vec<ChatMessage>) {
-        let mut i = 0;
-        while i < history.len() {
-            if history[i].role == "assistant" {
-                if let Some(tcs) = history[i].tool_calls.clone() {
+        let mut active_valid_ids = std::collections::HashSet::<String>::new();
+        let mut cleaned: Vec<ChatMessage> = Vec::with_capacity(history.len());
+        let mut idx = 0usize;
+
+        while idx < history.len() {
+            let msg = &history[idx];
+            if msg.role == "tool" {
+                let valid = msg
+                    .tool_call_id
+                    .as_ref()
+                    .map(|tid| active_valid_ids.remove(tid))
+                    .unwrap_or(false);
+                if valid {
+                    cleaned.push(msg.clone());
+                }
+                idx += 1;
+                continue;
+            }
+
+            if !active_valid_ids.is_empty() {
+                active_valid_ids.clear();
+            }
+
+            if msg.role == "assistant" {
+                cleaned.push(msg.clone());
+                if let Some(ref tcs) = msg.tool_calls {
                     if !tcs.is_empty() {
                         let mut existing_ids = std::collections::HashSet::new();
-                        let mut j = i + 1;
+                        let mut j = idx + 1;
                         while j < history.len() && history[j].role == "tool" {
                             if let Some(ref tid) = history[j].tool_call_id {
                                 existing_ids.insert(tid.clone());
                             }
                             j += 1;
                         }
-                        let mut insert_pos = j;
+                        for tc in tcs {
+                            active_valid_ids.insert(tc.id.clone());
+                        }
+                        idx += 1;
+                        while idx < j {
+                            let tmsg = &history[idx];
+                            if tmsg
+                                .tool_call_id
+                                .as_ref()
+                                .map(|tid| active_valid_ids.remove(tid))
+                                .unwrap_or(false)
+                            {
+                                cleaned.push(tmsg.clone());
+                            }
+                            idx += 1;
+                        }
                         for tc in tcs {
                             if !existing_ids.contains(&tc.id) {
-                                history.insert(
-                                    insert_pos,
-                                    ChatMessage {
-                                        role: "tool".to_string(),
-                                        content: MessageContent::Text("[Interrupted before tool finished]".to_string()),
-                                        name: Some(tc.function.name.clone()),
-                                        tool_calls: None,
-                                        tool_call_id: Some(tc.id.clone()),
-                                        reasoning_content: None,
-                                    },
-                                );
-                                insert_pos += 1;
+                                active_valid_ids.remove(&tc.id);
+                                cleaned.push(ChatMessage {
+                                    role: "tool".to_string(),
+                                    content: MessageContent::Text("[Interrupted before tool finished]".to_string()),
+                                    name: Some(tc.function.name.clone()),
+                                    tool_calls: None,
+                                    tool_call_id: Some(tc.id.clone()),
+                                    reasoning_content: None,
+                                });
                             }
                         }
-                        i = insert_pos;
                         continue;
                     }
                 }
+                idx += 1;
+                continue;
             }
-            i += 1;
+
+            cleaned.push(msg.clone());
+            idx += 1;
         }
+
+        *history = cleaned;
     }
 
     pub async fn run_turn(
@@ -907,9 +692,10 @@ impl SingleAgentRunner {
             return Ok(TaskStateEnum::Completed);
         }
 
-        if resume && !history.is_empty() {
+        if !history.is_empty() {
             Self::sanitize_resumed_history(history);
-        } else {
+        }
+        if !resume {
             let mut final_prompt = user_prompt.to_string();
             let all_skills = crate::skills::discover_all_skills(workspace_root);
             let mut injected_blocks: Vec<String> = Vec::new();
@@ -972,7 +758,26 @@ impl SingleAgentRunner {
             if !injected_blocks.is_empty() {
                 final_prompt = format!("{}\n\n{}", injected_blocks.join("\n\n"), final_prompt);
             }
-            history.push(ChatMessage::user(final_prompt));
+            let has_pending_parts = history
+                .last()
+                .map(|m| m.role == "user" && matches!(m.content, MessageContent::Parts(_)))
+                .unwrap_or(false);
+            if has_pending_parts {
+                if let Some(last_u) = history.last_mut() {
+                    if let MessageContent::Parts(ref mut parts) = last_u.content {
+                        if let Some(crate::llm::request_compat::ContentPart::Text { text }) = parts
+                            .iter_mut()
+                            .find(|pt| matches!(pt, crate::llm::request_compat::ContentPart::Text { .. }))
+                        {
+                            *text = final_prompt;
+                        } else {
+                            parts.insert(0, crate::llm::request_compat::ContentPart::Text { text: final_prompt });
+                        }
+                    }
+                }
+            } else {
+                history.push(ChatMessage::user(final_prompt));
+            }
         }
         Self::save_checkpoint(db, chat_id, history);
 
@@ -984,6 +789,7 @@ impl SingleAgentRunner {
         let mut same_err_streak: u32 = 0;
         let mut consecutive_compact_failures: u32 = 0;
         let mut reactive_compact_count: u32 = 0;
+        let mut empty_retries: u32 = 0;
         let mut turn_seq: i64 = 0;
 
         let _ = state.transition(TaskStateEnum::Executing);
@@ -1152,6 +958,7 @@ impl SingleAgentRunner {
                 "MAX" => (Some("high".to_string()), Some(32768)),
                 _ => (None, None),
             };
+            Self::sanitize_resumed_history(&mut projection);
             let mut chat_req = ChatRequest {
                 model: model_name.to_string(),
                 messages: projection,
@@ -1200,6 +1007,7 @@ impl SingleAgentRunner {
                 assistant_text.clear();
                 assistant_reasoning.clear();
                 active_tool_calls.clear();
+                let mut in_stream_error: Option<String> = None;
 
                 loop {
                     let evt = tokio::select! {
@@ -1218,6 +1026,10 @@ impl SingleAgentRunner {
                             None => break,
                         }
                     };
+                    if let StreamEvent::Error { ref error } = evt {
+                        in_stream_error = Some(error.clone());
+                        continue;
+                    }
                     if let StreamEvent::Finish { ref usage, .. } = evt {
                         if usage.is_some() {
                             turn_usage = usage.clone();
@@ -1252,9 +1064,14 @@ impl SingleAgentRunner {
                     }
                 }
 
-                let stream_res = match stream_join.await {
+                let join_res = match stream_join.await {
                     Ok(r) => r.map_err(|e| e.to_string()),
                     Err(e) => Err(e.to_string()),
+                };
+                let stream_res = match (join_res, in_stream_error) {
+                    (Err(e), _) => Err(e),
+                    (Ok(()), Some(se)) => Err(se),
+                    (Ok(()), None) => Ok(()),
                 };
 
                 match stream_res {
@@ -1265,7 +1082,8 @@ impl SingleAgentRunner {
                             || lower.contains("prompt_too_long")
                             || lower.contains("maximum context length")
                             || lower.contains("too many tokens")
-                            || lower.contains("413");
+                            || lower.contains("http 413")
+                            || lower.contains("status 413");
                         if is_ctx_overflow && reactive_compact_count < 2 {
                             reactive_compact_count += 1;
                             let before_tokens = count_context_tokens(model_name, caps.family, history, &available_tools, db);
@@ -1294,7 +1112,7 @@ impl SingleAgentRunner {
                             });
                             let plan_state = Self::load_plan_tuple(db, chat_id);
                             let restored_files = Self::collect_restored_files(db, workspace_root, chat_id);
-                            let rehydrated = ContextBuilder::rehydrate_after_compaction(
+                            let mut rehydrated = ContextBuilder::rehydrate_after_compaction(
                                 history,
                                 &summary,
                                 workspace_root,
@@ -1303,6 +1121,7 @@ impl SingleAgentRunner {
                                 plan_state,
                                 restored_files,
                             );
+                            Self::sanitize_resumed_history(&mut rehydrated);
                             let after_tokens = count_context_tokens(model_name, caps.family, &rehydrated, &available_tools, db);
                             if let Some(d) = db {
                                 let _ = d.record_compaction_event(chat_id, "tier4_reactive", before_tokens, after_tokens, "Reactive overflow compaction");
@@ -1320,16 +1139,36 @@ impl SingleAgentRunner {
                             attempt = 0;
                             continue;
                         }
-                        let is_fatal = lower.contains("400")
-                            || lower.contains("401")
-                            || lower.contains("403")
-                            || lower.contains("404")
-                            || lower.contains("invalid_request")
-                            || lower.contains("no available api keys");
+                        let is_oauth_proto = matches!(
+                            api_protocol.unwrap_or(""),
+                            "antigravity"
+                                | "openai_codex"
+                                | "claude_oauth"
+                                | "kimi_oauth"
+                                | "xai_oauth"
+                                | "zcode_oauth"
+                                | "perplexity_oauth"
+                        );
+                        let is_http_400 = lower.contains("http 400")
+                            || lower.contains("status 400")
+                            || lower.contains("400 bad request")
+                            || lower.contains("(400)");
+                        let is_http_404 = lower.contains("http 404")
+                            || lower.contains("status 404")
+                            || lower.contains("404 not found")
+                            || lower.contains("model_not_found");
+                        let is_auth_err = lower.contains("http 401")
+                            || lower.contains("status 401")
+                            || lower.contains("http 403")
+                            || lower.contains("status 403")
+                            || lower.contains("invalid api key");
+                        let is_fatal = is_http_400
+                            || is_http_404
+                            || (is_auth_err && (!is_oauth_proto || attempt >= 2))
+                            || lower.contains("no available api keys")
+                            || lower.contains("no enabled ") && lower.contains("oauth account");
 
-                        let has_partial = !assistant_text.is_empty()
-                            || !assistant_reasoning.is_empty()
-                            || !active_tool_calls.is_empty();
+                        let has_partial = !assistant_text.is_empty() || !active_tool_calls.is_empty();
 
                         if is_fatal || has_partial || attempt >= max_attempts || !session.is_active() {
                             Self::save_checkpoint(db, chat_id, history);
@@ -1389,14 +1228,36 @@ impl SingleAgentRunner {
 
             if active_tool_calls.is_empty() {
                 if history.last().map(|m| m.content.as_text_lossy().trim().is_empty()).unwrap_or(true) {
+                    if empty_retries < 2 {
+                        empty_retries += 1;
+                        history.pop();
+                        crate::logger::warn(
+                            "SingleAgent",
+                            &format!("Empty response on turn {}, auto-retrying ({}/2) model={}", turn_seq, empty_retries, model_name),
+                        );
+                        if empty_retries == 2 {
+                            history.push(ChatMessage::user("Continue and provide your final response or next tool call."));
+                        }
+                        let _ = event_sender
+                            .send(StreamEvent::RetryNotice {
+                                reason: format!("Model returned empty response, retrying ({}/2)...", empty_retries),
+                                attempt: empty_retries,
+                                model: model_name.to_string(),
+                            })
+                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                        continue;
+                    }
                     Self::save_checkpoint(db, chat_id, history);
                     let msg = "Model finished turn with empty response".to_string();
+                    crate::logger::error_with_trace("SingleAgent", &format!("{} (model={}, turn={})", msg, model_name, turn_seq));
                     let _ = event_sender.send(StreamEvent::Error { error: msg.clone() }).await;
                     return Err(msg);
                 }
                 let _ = state.transition(TaskStateEnum::Reviewing);
                 break;
             }
+            empty_retries = 0;
 
             let _ = state.transition(TaskStateEnum::WaitingTool);
 
@@ -1815,7 +1676,13 @@ impl SingleAgentRunner {
                     last_call_sig = call_sig;
                     same_call_streak = 1;
                 }
-                let streak_limit = if tool_name == "terminal_io" { 20 } else { 3 };
+                let streak_limit = if tool_name == "terminal_io" || tool_name == "manage_task" {
+                    20
+                } else if tool_name == "computer_use" {
+                    12
+                } else {
+                    3
+                };
                 if same_call_streak >= streak_limit {
                     Self::save_checkpoint(db, chat_id, history);
                     let msg = format!("Anti-Loop Circuit Breaker: '{}' called {} times identically. Pausing.", tool_name, streak_limit);
@@ -2027,11 +1894,25 @@ impl SingleAgentRunner {
                 }
                 if let Some(du) = vision_data_url {
                     if caps.supports_vision {
+                        let win_title = exec_result
+                            .output
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("desktop");
+                        let offscreen_flag = exec_result
+                            .output
+                            .get("offscreen")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         history.push(ChatMessage {
                             role: "user".to_string(),
                             content: MessageContent::Parts(vec![
                                 ContentPart::Text {
-                                    text: "Here is the captured screen from computer_use (normalized coordinates 0..1000).".to_string(),
+                                    text: format!(
+                                        "Captured target '{}' (offscreen={}) via computer_use. Coordinates 0..1000 map directly to this image's width and height.",
+                                        win_title, offscreen_flag
+                                    ),
                                 },
                                 ContentPart::ImageUrl {
                                     image_url: ImageUrlDetail {

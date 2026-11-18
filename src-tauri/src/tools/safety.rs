@@ -5,13 +5,14 @@ use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone)]
 pub struct FileReadStamp {
+    pub path: PathBuf,
     pub mtime_nanos: u128,
     pub hash: String,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct FileReadGuard {
-    stamps: Arc<RwLock<HashMap<PathBuf, FileReadStamp>>>,
+    stamps: Arc<RwLock<HashMap<String, FileReadStamp>>>,
 }
 
 impl FileReadGuard {
@@ -24,7 +25,8 @@ impl FileReadGuard {
     }
 
     pub fn get_last_hash(&self, path: &Path) -> Option<String> {
-        self.stamps.read().ok().and_then(|g| g.get(path).map(|s| s.hash.clone()))
+        let key = crate::tools::path_norm::path_key(path);
+        self.stamps.read().ok().and_then(|g| g.get(&key).map(|s| s.hash.clone()))
     }
 
     pub fn file_mtime_nanos(path: &Path) -> u128 {
@@ -37,12 +39,15 @@ impl FileReadGuard {
     }
 
     pub fn record_read(&self, path: &Path, content_bytes: &[u8]) {
+        let clean_path = crate::tools::path_norm::strip_verbatim_prefix(path);
+        let key = crate::tools::path_norm::path_key(&clean_path);
         let stamp = FileReadStamp {
+            path: clean_path,
             mtime_nanos: Self::file_mtime_nanos(path),
             hash: Self::hash_bytes(content_bytes),
         };
         if let Ok(mut guard) = self.stamps.write() {
-            guard.insert(path.to_path_buf(), stamp);
+            guard.insert(key, stamp);
         }
     }
 
@@ -50,9 +55,10 @@ impl FileReadGuard {
         if !path.exists() {
             return Ok(());
         }
+        let key = crate::tools::path_norm::path_key(path);
         let stamp = {
             let guard = self.stamps.read().map_err(|_| "FileReadGuard lock poisoned".to_string())?;
-            guard.get(path).cloned()
+            guard.get(&key).cloned()
         };
         let Some(prev) = stamp else {
             return Err(format!(
@@ -79,31 +85,33 @@ impl FileReadGuard {
         let Ok(mut guard) = self.stamps.write() else {
             return changed;
         };
-        let paths: Vec<PathBuf> = guard.keys().cloned().collect();
-        for p in paths {
-            if !p.exists() {
-                continue;
-            }
-            let Some(prev) = guard.get(&p).cloned() else {
+        let keys: Vec<String> = guard.keys().cloned().collect();
+        for k in keys {
+            let Some(prev) = guard.get(&k).cloned() else {
                 continue;
             };
-            let current_mtime = Self::file_mtime_nanos(&p);
+            if !prev.path.exists() {
+                continue;
+            }
+            let current_mtime = Self::file_mtime_nanos(&prev.path);
             if current_mtime != prev.mtime_nanos {
-                if let Ok(bytes) = std::fs::read(&p) {
+                if let Ok(bytes) = std::fs::read(&prev.path) {
                     let current_hash = Self::hash_bytes(&bytes);
                     if current_hash != prev.hash {
-                        changed.push(p.to_string_lossy().to_string());
+                        changed.push(prev.path.to_string_lossy().to_string());
                         guard.insert(
-                            p,
+                            k,
                             FileReadStamp {
+                                path: prev.path,
                                 mtime_nanos: current_mtime,
                                 hash: current_hash,
                             },
                         );
                     } else {
                         guard.insert(
-                            p,
+                            k,
                             FileReadStamp {
+                                path: prev.path,
                                 mtime_nanos: current_mtime,
                                 hash: prev.hash,
                             },

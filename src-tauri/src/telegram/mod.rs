@@ -541,15 +541,18 @@ impl TelegramBotManager {
             (cp, cm)
         };
         if changed_prov.is_some() || changed_model.is_some() {
-            let mut sess = self.chat_sessions.write().await;
-            for entry in sess.values_mut() {
-                if let Some(ref cp) = changed_prov {
-                    entry.provider_id = Some(cp.clone());
-                }
-                if let Some(ref cm) = changed_model {
-                    entry.model_id = Some(cm.clone());
+            {
+                let mut sess = self.chat_sessions.write().await;
+                for entry in sess.values_mut() {
+                    if let Some(ref cp) = changed_prov {
+                        entry.provider_id = Some(cp.clone());
+                    }
+                    if let Some(ref cm) = changed_model {
+                        entry.model_id = Some(cm.clone());
+                    }
                 }
             }
+            persist_session_snapshot(&self.config, &self.config_path, &self.chat_sessions, None).await;
         }
         let path_opt = self.providers_path.read().await.clone();
         if let Some(path) = path_opt {
@@ -812,6 +815,7 @@ impl TelegramBotManager {
 
                                     let authorized = allowed_chats.read().await.contains(&chat_id);
                                     if !authorized {
+                                        let ctx_opt_unauth = runtime_ctx_arc.read().await.clone();
                                         handle_unauthorized_message(
                                             &tg_client,
                                             chat_id,
@@ -821,6 +825,7 @@ impl TelegramBotManager {
                                             &pairing_code_lock,
                                             &config_arc,
                                             &config_path_arc,
+                                            ctx_opt_unauth.as_ref(),
                                         )
                                         .await;
                                         continue;
@@ -1024,6 +1029,7 @@ async fn handle_unauthorized_message(
     pairing_code_lock: &Arc<RwLock<Option<String>>>,
     config_arc: &Arc<RwLock<TelegramConfigFile>>,
     config_path_arc: &Arc<RwLock<Option<PathBuf>>>,
+    ctx_opt: Option<&TelegramRuntimeContext>,
 ) {
     let entered_code = if let Some(rest) = text.strip_prefix("/pair") {
         rest.trim()
@@ -1066,6 +1072,11 @@ async fn handle_unauthorized_message(
                 if let Ok(data) = serde_json::to_vec_pretty(&*cfg) {
                     let _ = crate::db::atomic_write(path, &data);
                 }
+            }
+        }
+        if let Some(ctx) = ctx_opt {
+            if let Some(ref app) = *ctx.app_handle.read().await {
+                let _ = app.emit("telegram-config-updated", json!({ "chatId": chat_id.to_string() }));
             }
         }
         let rm = serde_json::to_value(TelegramMenuBuilder::main_menu()).ok();
@@ -1343,10 +1354,21 @@ async fn emit_chat_updated(ctx: &TelegramRuntimeContext, chat_id: &str) {
 
 async fn emit_settings_updated(
     ctx: &TelegramRuntimeContext,
+    providers_snap: &Arc<RwLock<ProvidersSnapshotFile>>,
     provider_id: Option<&str>,
     model_id: Option<&str>,
     reasoning_effort: Option<&str>,
+    chat_id: Option<&str>,
 ) {
+    if provider_id.is_some() || model_id.is_some() {
+        let mut snap = providers_snap.write().await;
+        if let Some(pid) = provider_id {
+            snap.active_provider = pid.to_string();
+        }
+        if let Some(mid) = model_id {
+            snap.active_model = mid.to_string();
+        }
+    }
     let app_opt = ctx.app_handle.read().await.clone();
     if let Some(app) = app_opt {
         let _ = app.emit(
@@ -1355,6 +1377,7 @@ async fn emit_settings_updated(
                 "providerId": provider_id,
                 "modelId": model_id,
                 "reasoningEffort": reasoning_effort,
+                "chatId": chat_id,
             }),
         );
     }
@@ -1896,9 +1919,14 @@ async fn handle_authorized_message(
             }
             let chats = ctx.app_state.db.list_chats(None).unwrap_or_default();
             if let Some(found) = chats.into_iter().find(|c| c.id == arg || c.id.starts_with(arg)) {
-                sessions.write().await.entry(tg_chat_id).or_default().active_chat_id =
-                    Some(found.id.clone());
+                {
+                    let mut map = sessions.write().await;
+                    let entry = map.entry(tg_chat_id).or_default();
+                    entry.active_chat_id = Some(found.id.clone());
+                    entry.project_path = found.project_id.clone().filter(|s| !s.trim().is_empty());
+                }
                 persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
+                emit_chat_updated(ctx, &found.id).await;
                 let (html, running, has_chat) =
                     build_status_html(ctx, providers_snap, sessions, tg_chat_id).await;
                 let rm = serde_json::to_value(TelegramMenuBuilder::session_menu(running, has_chat)).ok();
@@ -1923,6 +1951,7 @@ async fn handle_authorized_message(
                     .send_html(tg_chat_id, "Отправьте новое название сессии следующим сообщением.", None)
                     .await;
             } else if ctx.app_state.db.update_chat_title(&cid, &compact_text(arg, 60)).is_ok() {
+                emit_chat_updated(ctx, &cid).await;
                 let (html, running, has_chat) =
                     build_status_html(ctx, providers_snap, sessions, tg_chat_id).await;
                 let rm = serde_json::to_value(TelegramMenuBuilder::session_menu(running, has_chat)).ok();
@@ -2008,6 +2037,15 @@ async fn handle_authorized_message(
                 .and_then(|s| s.active_chat_id.clone());
             if let Some(cid) = active_id {
                 let stopped = ctx.stream_mgr.cancel_session(&cid).await;
+                let _ = ctx.tool_dispatcher.pty_manager.kill_all_for_chat(&cid);
+                if stopped {
+                    if let Some(ref app) = *ctx.app_handle.read().await {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({ "chatId": cid, "type": "stopped" }),
+                        );
+                    }
+                }
                 let msg = if stopped {
                     "Работа агента остановлена."
                 } else {
@@ -2266,7 +2304,17 @@ async fn handle_callback_query(
                 .get(&tg_chat_id)
                 .and_then(|s| s.active_chat_id.clone());
             let stopped = if let Some(cid) = active_id {
-                ctx.stream_mgr.cancel_session(&cid).await
+                let s = ctx.stream_mgr.cancel_session(&cid).await;
+                let _ = ctx.tool_dispatcher.pty_manager.kill_all_for_chat(&cid);
+                if s {
+                    if let Some(ref app) = *ctx.app_handle.read().await {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({ "chatId": cid, "type": "stopped" }),
+                        );
+                    }
+                }
+                s
             } else {
                 false
             };
@@ -2283,6 +2331,13 @@ async fn handle_callback_query(
             let count = active.len();
             for cid in active {
                 ctx.stream_mgr.cancel_session(&cid).await;
+                let _ = ctx.tool_dispatcher.pty_manager.kill_all_for_chat(&cid);
+                if let Some(ref app) = *ctx.app_handle.read().await {
+                    let _ = app.emit(
+                        "telegram-chat-stream",
+                        json!({ "chatId": cid, "type": "stopped" }),
+                    );
+                }
             }
             let rm = serde_json::to_value(TelegramMenuBuilder::main_menu()).ok();
             send_or_edit(
@@ -2319,7 +2374,8 @@ async fn handle_callback_query(
                     sessions.write().await.entry(tg_chat_id).or_default().reasoning_effort =
                         lvl.to_string();
                     persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
-                    emit_settings_updated(ctx, None, None, Some(lvl)).await;
+                    let ac = sessions.read().await.get(&tg_chat_id).and_then(|s| s.active_chat_id.clone());
+                    emit_settings_updated(ctx, providers_snap, None, None, Some(lvl), ac.as_deref()).await;
                     let (html, _, _) =
                         build_status_html(ctx, providers_snap, sessions, tg_chat_id).await;
                     let rm = serde_json::to_value(TelegramMenuBuilder::settings_menu(lvl)).ok();
@@ -2393,9 +2449,21 @@ async fn handle_callback_query(
                 if let (Some(tok), Some(idx_s)) = (parts.next(), parts.next()) {
                     if let Ok(idx) = idx_s.parse::<usize>() {
                         if let Some(cid) = resolve_choice(choices_arc, tg_chat_id, "chat", tok, idx).await {
-                            sessions.write().await.entry(tg_chat_id).or_default().active_chat_id =
-                                Some(cid);
+                            let proj_opt = ctx
+                                .app_state
+                                .db
+                                .get_chat(&cid)
+                                .ok()
+                                .and_then(|c| c.project_id)
+                                .filter(|s| !s.trim().is_empty());
+                            {
+                                let mut map = sessions.write().await;
+                                let entry = map.entry(tg_chat_id).or_default();
+                                entry.active_chat_id = Some(cid.clone());
+                                entry.project_path = proj_opt;
+                            }
                             persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
+                            emit_chat_updated(ctx, &cid).await;
                             render_chat_history(tg_client, ctx, sessions, tg_chat_id, None, Some(msg_id)).await;
                         }
                     }
@@ -2427,7 +2495,8 @@ async fn handle_callback_query(
                                 let e = map.get(&tg_chat_id);
                                 (e.and_then(|s| s.provider_id.clone()), e.and_then(|s| s.model_id.clone()))
                             };
-                            emit_settings_updated(ctx, sel_pid.as_deref(), sel_mid.as_deref(), None).await;
+                            let ac = sessions.read().await.get(&tg_chat_id).and_then(|s| s.active_chat_id.clone());
+                            emit_settings_updated(ctx, providers_snap, sel_pid.as_deref(), sel_mid.as_deref(), None, ac.as_deref()).await;
                             persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
                             render_models_page(
                                 tg_client,
@@ -2466,11 +2535,14 @@ async fn handle_callback_query(
                                     entry.reasoning_effort.clone()
                                 }
                             };
+                            let ac = sessions.read().await.get(&tg_chat_id).and_then(|s| s.active_chat_id.clone());
                             emit_settings_updated(
                                 ctx,
+                                providers_snap,
                                 if pid.is_empty() { None } else { Some(pid.as_str()) },
                                 if mid.is_empty() { None } else { Some(mid.as_str()) },
                                 None,
+                                ac.as_deref(),
                             ).await;
                             persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
                             let (providers, _, _) =
@@ -2584,14 +2656,20 @@ async fn run_telegram_agent_turn(
         .and_then(|c| c.project_id)
         .filter(|s| !s.trim().is_empty());
     let bootstrap_cfg = ctx.app_state.get_bootstrap_config().await;
-    let workspace_path = match chat_proj {
-        Some(dir) => PathBuf::from(dir),
+    let (sandbox_root_opt, workspace_path) = match chat_proj {
+        Some(dir) => {
+            let p = PathBuf::from(dir);
+            (Some(p.clone()), p)
+        }
         None => match &bootstrap_cfg.workspace_dir {
-            Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+            Some(dir) if !dir.trim().is_empty() => {
+                let p = PathBuf::from(dir);
+                (Some(p.clone()), p)
+            }
             _ => {
                 let chat_ws = crate::state::AppState::resolve_install_workspace().join(&chat_id);
                 let _ = std::fs::create_dir_all(&chat_ws);
-                chat_ws
+                (None, chat_ws)
             }
         },
     };
@@ -2784,13 +2862,23 @@ async fn run_telegram_agent_turn(
                 crate::llm::StreamEvent::ToolExecEnd {
                     id,
                     success,
+                    output,
+                    error,
                     elapsed_ms,
                     ..
                 } => {
                     if let Some(ref app) = stream_app_ev {
                         let _ = app.emit(
                             "telegram-chat-stream",
-                            json!({ "chatId": stream_chat_id, "type": "tool_end", "id": id, "success": success, "elapsedMs": elapsed_ms }),
+                            json!({
+                                "chatId": stream_chat_id,
+                                "type": "tool_end",
+                                "id": id,
+                                "success": success,
+                                "output": output,
+                                "error": error,
+                                "elapsedMs": elapsed_ms
+                            }),
                         );
                     }
                     tool_stream.on_tool_end(&id, success, elapsed_ms);
@@ -2926,7 +3014,9 @@ async fn run_telegram_agent_turn(
     let is_plan_req = full_prompt
         .split_whitespace()
         .any(|t| t.eq_ignore_ascii_case("/plan"));
-    let ws_tools = ctx.tool_dispatcher.for_workspace(std::path::Path::new(&workspace_str), &chat_id);
+    let ws_tools = ctx
+        .tool_dispatcher
+        .for_workspace_with_cwd(sandbox_root_opt.as_deref(), &workspace_path, &chat_id);
     ws_tools.set_plan_mode(is_plan_req);
 
     let goal_cmd = crate::engine::goal_loop::parse_goal_command(&full_prompt);
@@ -3098,7 +3188,7 @@ async fn run_telegram_agent_turn(
     ws_tools.set_plan_mode(false);
     drop(tx);
 
-    ctx.stream_mgr.remove_session(&chat_id).await;
+    ctx.stream_mgr.remove_session_if_current(&chat_id, &session).await;
     drop(contract_lock);
     typing_active.store(false, Ordering::SeqCst);
     typing_task.abort();
@@ -3174,6 +3264,16 @@ async fn run_telegram_agent_turn(
         let err_msg = error_text
             .or_else(|| run_res.err())
             .unwrap_or_else(|| "Задача завершена без текстового ответа.".to_string());
+        if err_msg == "User canceled execution" {
+            if let Some(ref app) = stream_app_handle {
+                let _ = app.emit(
+                    "telegram-chat-stream",
+                    json!({ "chatId": chat_id, "type": "stopped" }),
+                );
+            }
+            emit_chat_updated(&ctx, &chat_id).await;
+            return;
+        }
         let asst_msg = crate::db::chats::Message {
             id: uuid::Uuid::new_v4().to_string(),
             chat_id: chat_id.clone(),

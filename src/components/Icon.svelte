@@ -1,5 +1,7 @@
 <script lang="ts">
+import { getContext } from 'svelte';
 import { themeStore } from '../lib/stores/theme.svelte';
+
 export type IconName =
   | 'plus-circle'
   | 'search'
@@ -12,6 +14,7 @@ export type IconName =
   | 'close'
   | 'plus'
   | 'enter'
+  | 'send'
   | 'archive'
   | 'chevron-down'
   | 'chevron-right'
@@ -28,18 +31,38 @@ let {
   name,
   class: className = 'w-4 h-4',
   filled = false,
-  strokeWidth = 1.6
+  strokeWidth = 1.6,
+  previewOnly = false
 }: {
   name: IconName;
   class?: string;
   filled?: boolean;
   strokeWidth?: number;
+  previewOnly?: boolean;
 } = $props();
-let overrideSvg = $derived(themeStore.resolveIconOverride(name));
+
+const inPreviewContext = getContext<boolean>('omni-preview-only') || false;
+let isPreview = $derived(previewOnly || inPreviewContext);
+let override = $derived(themeStore.resolveIconOverride(name, isPreview));
+let isRawSvg = $derived(Boolean(override && override.trim().startsWith('<svg')));
+let isHtmlTag = $derived(Boolean(override && /^<[a-z]+/i.test(override.trim()) && !isRawSvg));
+let isImageUrl = $derived(
+  Boolean(
+    override &&
+      (override.startsWith('data:image/') ||
+        override.startsWith('http://') ||
+        override.startsWith('https://') ||
+        override.startsWith('blob:') ||
+        override.startsWith('asset://') ||
+        /\.(png|jpg|jpeg|webp|gif|svg|ico)$/i.test(override))
+  )
+);
 </script>
 
-{#if overrideSvg && overrideSvg.startsWith('<svg')}
-  <span class="inline-flex items-center justify-center {className}" data-omni-icon={name}>{@html overrideSvg}</span>
+{#if isRawSvg || isHtmlTag}
+  <span class="inline-flex items-center justify-center shrink-0 {className}" data-omni-icon={name}>{@html override}</span>
+{:else if isImageUrl && override}
+  <img src={override} alt={name} class="inline-block object-contain shrink-0 {className}" data-omni-icon={name} />
 {:else}
 <svg
   data-omni-icon={name}
@@ -52,8 +75,8 @@ let overrideSvg = $derived(themeStore.resolveIconOverride(name));
   stroke-linejoin="round"
   aria-hidden="true"
 >
-  {#if overrideSvg}
-    <path d={overrideSvg}></path>
+  {#if override}
+    <path d={override}></path>
   {:else if name === 'plus-circle'}
     <circle cx="12" cy="12" r="9"></circle>
     <line x1="12" y1="8.5" x2="12" y2="15.5"></line>
@@ -83,7 +106,7 @@ let overrideSvg = $derived(themeStore.resolveIconOverride(name));
   {:else if name === 'plus'}
     <line x1="12" y1="5" x2="12" y2="19"></line>
     <line x1="5" y1="12" x2="19" y2="12"></line>
-  {:else if name === 'enter'}
+  {:else if name === 'enter' || name === 'send'}
     <polyline points="9 10 4 15 9 20"></polyline>
     <path d="M20 4v7a4 4 0 0 1-4 4H4"></path>
   {:else if name === 'archive'}
@@ -119,5 +142,4 @@ let overrideSvg = $derived(themeStore.resolveIconOverride(name));
     <polyline points="20 6 9 17 4 12"></polyline>
   {/if}
 </svg>
-
 {/if}

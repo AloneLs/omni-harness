@@ -12,6 +12,16 @@ import { workspaceStore } from '../lib/stores/workspace.svelte';
 import { VoiceCapture } from '../lib/voiceCapture';
 import { SPRING_POPUP, SPRING_KEYCAP, SPRING_SLIDER, attachPressScale } from '../lib/motion';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import type { ProviderConfig } from '../lib/stores/settings.svelte';
+
+interface ComposerOAuthAccount {
+  id: string;
+  provider: string;
+  enabled: boolean;
+  cooldownUntilMs?: number | null;
+  quotaLabel?: string | null;
+}
 
 let inputText = $state<string>('');
 let lastSyncedDraftChatId = $state<string | null | undefined>(undefined);
@@ -33,6 +43,50 @@ let planExpanded = $state<boolean>(true);
 let sideQuestionMaxHeight = $state<number>(224);
 let isResizingSideQuestion = $state<boolean>(false);
 let loadedSkills = $state<{ name: string; command: string; desc: string }[]>([]);
+let oauthAccounts = $state<ComposerOAuthAccount[]>([]);
+
+async function refreshOAuthTiers() {
+  try {
+    const res = await invoke<ComposerOAuthAccount[]>('oauth_list_accounts', { provider: null });
+    if (Array.isArray(res)) {
+      oauthAccounts = res;
+    }
+  } catch {}
+}
+
+function tierRank(label: string): number {
+  const l = label.toLowerCase();
+  if (l.includes('ultra') || l === 'gpt pro' || l.includes('max')) return 4;
+  if (l.includes('enterprise') || l.includes('business') || l.includes('team') || l.includes('edu')) return 3;
+  if (l.includes('pro') || l.includes('plus')) return 2;
+  if (l.includes('go') || l.includes('standard')) return 1;
+  return 0;
+}
+
+function providerTierLabel(prov?: ProviderConfig | null): string {
+  if (!prov?.apiProtocol) return '';
+  const matching = oauthAccounts.filter((a) => a.provider === prov.apiProtocol && a.quotaLabel);
+  if (matching.length === 0) return '';
+  const active = matching.filter((a) => a.enabled);
+  const pool = active.length > 0 ? active : matching;
+  let best = pool[0].quotaLabel || '';
+  for (const acc of pool) {
+    const lbl = acc.quotaLabel || '';
+    if (tierRank(lbl) > tierRank(best)) best = lbl;
+  }
+  return best;
+}
+
+function tierBadgeClass(label: string): string {
+  const l = label.toLowerCase();
+  if (l.includes('ultra') || l === 'gpt pro' || l.includes('max')) {
+    return 'border-[#8B5CF6]/45 bg-[#8B5CF6]/12 text-[#DDD6FE]';
+  }
+  if (l.includes('pro') || l.includes('plus') || l.includes('team') || l.includes('business') || l.includes('enterprise') || l.includes('edu') || l.includes('go')) {
+    return 'border-white/[0.12] bg-white/[0.06] text-[#E5E5E8]';
+  }
+  return 'border-white/[0.06] bg-white/[0.03] text-[#8E8E95]';
+}
 
 async function refreshLoadedSkills() {
   try {
@@ -197,7 +251,12 @@ function handleHtmlDrop(e: DragEvent) {
 
 onMount(() => {
   refreshLoadedSkills();
+  refreshOAuthTiers();
   let unlisten: (() => void) | null = null;
+  let unlistenOAuth: (() => void) | null = null;
+  listen('oauth-accounts-updated', () => {
+    refreshOAuthTiers();
+  }).then((fn) => (unlistenOAuth = fn)).catch(() => {});
   import('@tauri-apps/api/webview')
     .then(async ({ getCurrentWebview }) => {
       unlisten = await getCurrentWebview().onDragDropEvent((event) => {
@@ -216,6 +275,7 @@ onMount(() => {
     .catch(() => {});
   return () => {
     if (unlisten) unlisten();
+    if (unlistenOAuth) unlistenOAuth();
   };
 });
 
@@ -1024,6 +1084,7 @@ async function stopAndSendVoice() {
     {/if}
 
     <div
+      data-omni-composer-box=""
       class="rounded-[10px] border p-3 transition-colors duration-150 {isDraggingOver ? 'border-white/[0.35] bg-[#222227]' : 'border-white/[0.07] bg-[#1C1C1F]/95'}"
       ondragover={(e) => { e.preventDefault(); isDraggingOver = true; }}
       ondragleave={() => (isDraggingOver = false)}
@@ -1115,6 +1176,7 @@ async function stopAndSendVoice() {
                 <span class="font-mono text-[10.5px] text-[#66666D]">FILE</span>
               </button>
 
+              {#if !chatStore.activeSession?.isThemeStudio}
               <div class="border-t border-white/[0.06] pt-1.5 mt-1">
                 <div class="px-2 pb-1 font-mono text-[10px] text-[#66666D] uppercase tracking-wider">Project</div>
                 <button
@@ -1122,6 +1184,7 @@ async function stopAndSendVoice() {
                   class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {!workspaceStore.currentPath ? 'bg-white/[0.08] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.05] hover:text-white'}"
                   onclick={() => {
                     workspaceStore.clearWorkspace();
+                    chatStore.setActiveSessionProject('');
                     closeAllPopups();
                   }}
                 >
@@ -1136,6 +1199,7 @@ async function stopAndSendVoice() {
                         class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] truncate transition-colors {workspaceStore.currentPath === path ? 'bg-white/[0.08] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.05] hover:text-white'}"
                         onclick={() => {
                           workspaceStore.setWorkspaceDir(path);
+                          chatStore.setActiveSessionProject(path);
                           closeAllPopups();
                         }}
                         title={path}
@@ -1149,15 +1213,17 @@ async function stopAndSendVoice() {
                 <button
                   type="button"
                   class="w-full px-2.5 py-1.5 mt-0.5 rounded-[4px] text-left text-xs text-[#D4D4D8] hover:bg-white/[0.05] flex items-center justify-between transition-colors"
-                  onclick={() => {
+                  onclick={async () => {
                     closeAllPopups();
-                    workspaceStore.openDirectoryPicker();
+                    const picked = await workspaceStore.openDirectoryPicker();
+                    if (picked) chatStore.setActiveSessionProject(picked);
                   }}
                 >
                   <span>Open folder...</span>
                   <Icon name="chevron-right" class="w-3.5 h-3.5 text-[#73737A]" strokeWidth={1.8} />
                 </button>
               </div>
+              {/if}
             </div>
           {/if}
         </div>
@@ -1196,6 +1262,7 @@ async function stopAndSendVoice() {
                 const next = !showModelPopup;
                 closeAllPopups();
                 showModelPopup = next;
+                if (next) refreshOAuthTiers();
               }}
               title="Model & Reasoning"
               use:attachPressScale
@@ -1206,16 +1273,23 @@ async function stopAndSendVoice() {
             </button>
 
             {#if showModelPopup || modelMenuSpring.current.opacity > 0.02}
+              {@const popupProv = settingsStore.data.providers[popupProviderId] || enabledProviders[0]}
+              {@const popupTier = providerTierLabel(popupProv)}
               <div
                 class="absolute bottom-full mb-2 right-0 w-72 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-3 z-50 text-xs space-y-3 {showModelPopup ? 'pointer-events-auto' : 'pointer-events-none'}"
                 style="opacity: {modelMenuSpring.current.opacity}; transform: translateY({modelMenuSpring.current.y}px) scale({modelMenuSpring.current.scale});"
               >
                 <div class="space-y-2">
-                  <div class="flex items-center justify-between px-1">
+                  <div class="flex items-center justify-between gap-2 px-1">
                     <span class="font-mono text-[10px] text-[#66666D] uppercase tracking-wider">Model</span>
-                    {#if enabledProviders.length === 1}
-                      <span class="font-mono text-[10px] text-[#73737A] truncate max-w-[140px]">{enabledProviders[0].name}</span>
-                    {/if}
+                    <div class="flex items-center gap-1.5 min-w-0">
+                      {#if enabledProviders.length === 1}
+                        <span class="font-mono text-[10px] text-[#73737A] truncate max-w-[110px]">{enabledProviders[0].name}</span>
+                      {/if}
+                      {#if popupTier}
+                        <span class="px-1.5 py-0.5 rounded-[4px] border font-mono text-[9.5px] leading-none shrink-0 {tierBadgeClass(popupTier)}">{popupTier}</span>
+                      {/if}
+                    </div>
                   </div>
 
                   {#if enabledProviders.length > 1}
@@ -1229,11 +1303,12 @@ async function stopAndSendVoice() {
                       }}
                     >
                       {#each enabledProviders as prov (prov.id)}
+                        {@const provTier = providerTierLabel(prov)}
                         <button
                           type="button"
                           class="shrink-0 h-full px-2.5 rounded-[3px] font-mono text-[10px] whitespace-nowrap transition-colors {popupProviderId === prov.id ? 'bg-white/[0.12] border-t border-white/[0.18] text-[#EDEDEF] font-semibold' : 'text-[#73737A] hover:text-[#D4D4D8]'}"
                           onclick={() => settingsStore.setProvider(prov.id)}
-                          title={prov.name}
+                          title={provTier ? `${prov.name} · ${provTier}` : prov.name}
                         >
                           {prov.name}
                         </button>
@@ -1311,6 +1386,7 @@ async function stopAndSendVoice() {
               {#if dynamicButtonState === 'queue'}
                 <button
                   type="button"
+                  data-omni-button="send"
                   class="w-7 h-7 rounded-[4px] bg-[#EDEDEF] hover:bg-white text-[#111113] border-b-2 border-[#A8A8B0] flex items-center justify-center transition-colors"
                   onclick={handleSubmit}
                   title="Queue message (Enter)"
@@ -1332,6 +1408,7 @@ async function stopAndSendVoice() {
           {:else}
             <button
               type="button"
+              data-omni-button="send"
               class="w-7 h-7 rounded-[4px] flex items-center justify-center transition-colors {inputText.trim() || attachments.length > 0 || dynamicButtonState === 'continue' ? 'bg-[#EDEDEF] hover:bg-white text-[#111113] border-b-2 border-[#A8A8B0]' : 'bg-[#28282C] text-[#73737A] border-b-2 border-[#1B1B1E] cursor-not-allowed'}"
               style="transform: translateY({keycapSpring.current.y}px) scale({keycapSpring.current.scale});"
               onpointerdown={() => { if (inputText.trim() || attachments.length > 0 || dynamicButtonState === 'continue') keycapSpring.target = { scale: 0.94, y: 1.5 }; }}

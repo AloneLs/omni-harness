@@ -277,6 +277,22 @@ pub async fn stream_openai_chat(
                         }
 
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_str) {
+                            if let Some(err_obj) = val.get("error").filter(|e| !e.is_null()) {
+                                let msg = err_obj
+                                    .get("message")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|| err_obj.to_string());
+                                let code = err_obj
+                                    .get("code")
+                                    .and_then(|v| v.as_u64())
+                                    .map(|n| n as u16)
+                                    .unwrap_or(502);
+                                return Err(LlmError::ProviderError {
+                                    status: code,
+                                    message: msg,
+                                });
+                            }
                             if let Some(choices) = val.get("choices").and_then(|v| v.as_array()) {
                                 if let Some(first) = choices.first() {
                                     if let Some(delta) = first.get("delta") {

@@ -10,11 +10,13 @@ import { attachPressScale } from '../lib/motion';
 
 let {
   message,
+  isLatestAssistant = true,
   onEditUser = () => {},
   onRegenerate = () => {},
   onContinue = () => {}
 }: {
   message: ChatMessage;
+  isLatestAssistant?: boolean;
   onEditUser?: (messageId: string, newText: string, rollbackFiles: boolean) => void;
   onRegenerate?: (messageId: string) => void;
   onContinue?: (messageId: string) => void;
@@ -73,7 +75,7 @@ let splitPipeline = $derived.by(() => {
   if (!hasWork) {
     return { timelineSteps: [], finalContent: message.content };
   }
-  if (last && last.kind === 'message') {
+  if (!message.streaming && last && last.kind === 'message') {
     return { timelineSteps: allSteps.slice(0, -1), finalContent: last.text };
   }
   return { timelineSteps: allSteps, finalContent: '' };
@@ -280,7 +282,7 @@ function handleContainerClick(event: MouseEvent) {
       <div class="flex-1 h-px bg-white/[0.16]"></div>
     </div>
   {:else if message.role === 'user'}
-    <div class="flex flex-col items-end">
+    <div data-omni-message="user" class="flex flex-col items-end">
       {#if isEditing}
         <div class="w-full max-w-[85%] space-y-2.5 p-3.5 rounded-[8px] border border-white/[0.1] bg-[#1C1C1F]">
           <textarea
@@ -342,7 +344,9 @@ function handleContainerClick(event: MouseEvent) {
         {/if}
 
         {#if message.content}
-          <div bind:this={userBoxEl}
+          <div
+            data-omni-message-bubble=""
+            bind:this={userBoxEl}
             style={isLongUserMessage ? `max-height: ${isUserExpanded ? userFullHeight : 132}px;` : undefined}
             class="max-w-[78%] rounded-[12px] bg-[#1E1E22] border border-white/[0.07] px-3.5 py-2 font-sans text-[13.5px] text-[#EDEDEF] leading-relaxed select-text relative transition-[max-height] duration-200 ease-out overflow-hidden {isLongUserMessage && !isUserExpanded ? 'pb-6' : isLongUserMessage ? 'pb-7' : ''}">
             <span class="whitespace-pre-wrap">{message.content}</span>
@@ -397,6 +401,7 @@ function handleContainerClick(event: MouseEvent) {
           toolCalls={message.toolCalls}
           isStreaming={message.streaming}
           paused={message.paused}
+          canResume={isLatestAssistant && !chatStore.isStreaming}
           hasFinalContent={Boolean(splitPipeline.finalContent)}
           statusText={message.statusText}
           retryReason={message.retryReason}

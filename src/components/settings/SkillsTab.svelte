@@ -23,7 +23,12 @@ async function loadSkills() {
   try {
     const res = await invoke<any[]>('list_skills');
     if (Array.isArray(res)) {
-      skills = res.map((r, i) => {
+      skills = res
+        .filter((r) => {
+          const n = String(r?.metadata?.name || r?.name || '').trim().toLowerCase();
+          return n !== 'skill-creator' && !n.startsWith('system:');
+        })
+        .map((r, i) => {
         const meta = r.metadata || r;
         const rootDir = r.root_dir || r.filePath || r.path || '';
         const scope = rootDir.includes('.claude')

@@ -19,6 +19,7 @@ import TelegramTab from './components/settings/TelegramTab.svelte';
 import SpeechTab from './components/settings/SpeechTab.svelte';
 import MemorySystemTab from './components/settings/MemorySystemTab.svelte';
 import AppearanceTab from './components/settings/AppearanceTab.svelte';
+import ComputerUseTab from './components/settings/ComputerUseTab.svelte';
 import ThemeStudio from './components/themes/ThemeStudio.svelte';
 import MockHarnessPreview from './components/themes/MockHarnessPreview.svelte';
 import { themeStore, compileThemeCss } from './lib/stores/theme.svelte';
@@ -29,7 +30,7 @@ import { SPRING_LAUNCH, SPRING_PANEL, SPRING_POPUP, attachPressScale } from './l
 let sidebarOpen = $state<boolean>(true);
 let contractsPanelOpen = $state<boolean>(false);
 let activeSettingsTab = $state<
-  'providers' | 'appearance' | 'skills' | 'subagents' | 'mcp' | 'telegram' | 'speech' | 'memory'
+  'providers' | 'appearance' | 'computer_use' | 'skills' | 'subagents' | 'mcp' | 'telegram' | 'speech' | 'memory'
 >('providers');
 
 const launchSpring = new Spring({ opacity: 0, scale: 0.96, y: 10 }, SPRING_LAUNCH);
@@ -41,6 +42,7 @@ const navIndicator = new Spring({ y: 0, height: 34 }, { stiffness: 0.28, damping
 const SETTINGS_TABS: { id: typeof activeSettingsTab; label: string; icon: string }[] = [
   { id: 'providers', label: 'Models & Providers', icon: 'M13 10V3L4 14h7v7l9-11h-7z' },
   { id: 'appearance', label: 'Appearance & CSS', icon: 'M12 2L2 7l10 5 10-5-10-5z M2 17l10 5 10-5 M2 12l10 5 10-5' },
+  { id: 'computer_use', label: 'Computer Use', icon: 'M2 4a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V4z M8 21h8 M12 17v4' },
   { id: 'skills', label: 'Skills', icon: 'M4 19.5A2.5 2.5 0 0 1 6.5 17H20 M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15z' },
   { id: 'subagents', label: 'Subagents', icon: 'M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2 M9 7a4 4 0 1 0 0-8 4 4 0 0 0 0 8z M23 21v-2a4 4 0 0 0-3-3.87 M16 3.13a4 4 0 0 1 0 7.75' },
   { id: 'mcp', label: 'MCP Servers', icon: 'M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z M6 12h4 M14 12h4 M10 8v8' },
@@ -142,20 +144,106 @@ function handleGlobalKeydown(e: KeyboardEvent) {
     }
   }
 }
+let ctxMenu = $state<{
+  open: boolean;
+  x: number;
+  y: number;
+  selectedText: string;
+  isEditable: boolean;
+  targetEl: HTMLElement | null;
+}>({ open: false, x: 0, y: 0, selectedText: '', isEditable: false, targetEl: null });
+
+function handleGlobalContextMenu(e: MouseEvent) {
+  e.preventDefault();
+  const target = e.target as HTMLElement | null;
+  const isEditable = Boolean(
+    target &&
+      (target.tagName === 'INPUT' ||
+        target.tagName === 'TEXTAREA' ||
+        target.isContentEditable ||
+        target.closest('.cm-editor'))
+  );
+  const selectedText = window.getSelection()?.toString() || '';
+  const menuW = 200;
+  const menuH = 210;
+  const x = Math.min(e.clientX, Math.max(8, window.innerWidth - menuW - 8));
+  const y = Math.min(e.clientY, Math.max(8, window.innerHeight - menuH - 8));
+  ctxMenu = { open: true, x, y, selectedText, isEditable, targetEl: target };
+}
+
+function closeCtxMenu() {
+  if (ctxMenu.open) {
+    ctxMenu = { ...ctxMenu, open: false };
+  }
+}
+
+async function ctxAction(action: string) {
+  const { selectedText, isEditable, targetEl } = ctxMenu;
+  closeCtxMenu();
+  if (action === 'copy') {
+    if (selectedText) {
+      await navigator.clipboard.writeText(selectedText).catch(() => {});
+    } else if (isEditable) {
+      document.execCommand('copy');
+    }
+  } else if (action === 'cut') {
+    document.execCommand('cut');
+  } else if (action === 'paste') {
+    try {
+      const clip = await navigator.clipboard.readText();
+      if (clip && targetEl && (targetEl instanceof HTMLInputElement || targetEl instanceof HTMLTextAreaElement)) {
+        const start = targetEl.selectionStart ?? targetEl.value.length;
+        const end = targetEl.selectionEnd ?? targetEl.value.length;
+        targetEl.setRangeText(clip, start, end, 'end');
+        targetEl.dispatchEvent(new Event('input', { bubbles: true }));
+      } else {
+        document.execCommand('paste');
+      }
+    } catch {
+      document.execCommand('paste');
+    }
+  } else if (action === 'select_all') {
+    if (targetEl && (targetEl instanceof HTMLInputElement || targetEl instanceof HTMLTextAreaElement)) {
+      targetEl.select();
+    } else {
+      document.execCommand('selectAll');
+    }
+  } else if (action === 'ask_omni' && selectedText.trim()) {
+    await chatStore.sendMessage(selectedText.trim());
+  } else if (action === 'new_chat') {
+    await chatStore.createSession();
+  } else if (action === 'toggle_sidebar') {
+    toggleSidebar();
+  } else if (action === 'open_settings') {
+    settingsStore.openSettings();
+  } else if (action === 'reload') {
+    window.location.reload();
+  }
+}
+
 function handleGlobalKeyup(e: KeyboardEvent) {
   if (e.key === 'Alt') {
     e.preventDefault();
   }
 }
+
+$effect(() => {
+  const css = compileThemeCss(themeStore.effectiveAppTheme, '[data-omni-app]');
+  themeStore.syncDomStylesheet(css);
+});
 </script>
 
-<svelte:window onkeydown={handleGlobalKeydown} onkeyup={handleGlobalKeyup} />
+<svelte:window
+  onkeydown={(e) => { if (e.key === 'Escape' && ctxMenu.open) closeCtxMenu(); handleGlobalKeydown(e); }}
+  onkeyup={handleGlobalKeyup}
+  oncontextmenu={handleGlobalContextMenu}
+  onclick={closeCtxMenu}
+/>
 
-{@html themeStore.activeTheme ? `<style id="omni-active-theme">${compileThemeCss(themeStore.activeTheme, '[data-omni-app]')}</style>` : ''}
-
+<div data-omni-theme-root="" class="w-screen h-screen overflow-hidden">
 <div
   data-omni-app=""
-  class="w-screen h-screen flex bg-[#101012] text-[#E5E5E8] overflow-hidden select-none font-sans"
+  class="w-full h-full flex bg-[#101012] text-[#E5E5E8] overflow-hidden select-none font-sans"
   style="opacity: {launchSpring.current.opacity}; transform: translateY({launchSpring.current.y}px) scale({launchSpring.current.scale});"
 >
   {#if sidebarWidth.current > 0.5}
@@ -167,7 +255,7 @@ function handleGlobalKeyup(e: KeyboardEvent) {
     </div>
   {/if}
 
-  <section class="flex-1 flex flex-col h-full min-w-0 relative bg-[#101012]">
+  <section class="flex-1 flex flex-col h-full min-w-0 relative">
     <DotGridCanvas active={chatStore.isStreaming} />
 
     <div
@@ -257,16 +345,17 @@ function handleGlobalKeyup(e: KeyboardEvent) {
 
   <FilePreviewDrawer />
 </div>
+</div>
 
 {#if settingsStore.isSettingsOpen || settingsModalSpring.current.opacity > 0.02}
   <div
-    class="fixed inset-0 bg-black/65 backdrop-blur-[6px] z-[200] flex items-center justify-center select-none transition-[padding] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] {themeStore.isStudioOpen ? 'p-0' : 'p-8'} {settingsStore.isSettingsOpen ? 'pointer-events-auto' : 'pointer-events-none'}"
+    class="fixed inset-x-0 top-11 bottom-0 bg-black/65 backdrop-blur-[6px] z-[200] flex items-center justify-center select-none transition-[padding] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] {themeStore.isStudioOpen ? 'p-0' : 'p-6'} {settingsStore.isSettingsOpen ? 'pointer-events-auto' : 'pointer-events-none'}"
     style="opacity: {settingsModalSpring.current.opacity};"
     onclick={() => { if (!themeStore.isStudioOpen) settingsStore.closeSettings(); }}
     role="presentation"
   >
     <div
-      class="bg-[#161618] border border-white/[0.08] flex flex-col overflow-hidden transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] {themeStore.isStudioOpen ? 'w-screen h-screen max-w-none rounded-none border-0' : 'w-full max-w-[920px] h-[650px] rounded-[6px]'}"
+      class="bg-[#161618] border border-white/[0.08] flex flex-col overflow-hidden transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] {themeStore.isStudioOpen ? 'w-full h-full max-w-none rounded-none border-0 border-t border-white/[0.06]' : 'w-full max-w-[920px] h-[630px] rounded-[6px]'}"
       style="transform: translateY({themeStore.isStudioOpen ? 0 : settingsModalSpring.current.y}px) scale({themeStore.isStudioOpen ? 1 : settingsModalSpring.current.scale});"
       onclick={(e) => e.stopPropagation()}
       onkeydown={(e) => { if (e.key === 'Escape') { if (themeStore.isStudioOpen) themeStore.closeStudio(); else settingsStore.closeSettings(); } }}
@@ -277,18 +366,7 @@ function handleGlobalKeyup(e: KeyboardEvent) {
       {#if themeStore.isStudioOpen}
         <ThemeStudio />
       {:else}
-      <div class="h-11 px-5 bg-[#121214] border-b border-white/[0.06] flex items-center justify-between shrink-0">
-        <span class="font-mono text-xs text-[#D4D4D8] tracking-wide">OMNIHARNESS // SETTINGS</span>
-        <button
-          type="button"
-          class="p-1.5 rounded-[4px] text-[#73737A] hover:text-[#E5E5E8] hover:bg-white/[0.06]"
-          onclick={() => settingsStore.closeSettings()}
-          title="Close (Escape)"
-          use:attachPressScale
-        >
-          <Icon name="close" class="w-4 h-4" strokeWidth={1.6} />
-        </button>
-      </div>
+
 
       <div class="flex-1 flex overflow-hidden">
         <aside class="w-52 bg-[#121214] border-r border-white/[0.06] p-2.5 overflow-y-auto shrink-0 text-xs">
@@ -332,6 +410,8 @@ function handleGlobalKeyup(e: KeyboardEvent) {
                 <SpeechTab />
               {:else if activeSettingsTab === 'appearance'}
                 <AppearanceTab />
+              {:else if activeSettingsTab === 'computer_use'}
+                <ComputerUseTab />
               {:else if activeSettingsTab === 'memory'}
                 <MemorySystemTab />
               {/if}
@@ -345,17 +425,17 @@ function handleGlobalKeyup(e: KeyboardEvent) {
 {/if}
 
 {#if themeStore.isFullscreenPreview}
-  <div class="fixed inset-0 z-[300] bg-[#08080B]">
+  <div class="fixed inset-x-0 top-11 bottom-0 z-[300] bg-[#101012] border-t border-white/[0.06]">
     <MockHarnessPreview theme={themeStore.editingTheme} fullscreen={true} />
     <div
       data-omni-preview-bar=""
-      class="fixed top-3 left-1/2 -translate-x-1/2 z-[350] flex items-center gap-2.5 px-3.5 py-1.5 rounded-full bg-[#0C0C10]/90 backdrop-blur-md border border-white/[0.14] shadow-2xl text-xs text-[#EDEDEF] select-none"
+      class="fixed top-14 left-1/2 -translate-x-1/2 z-[350] flex items-center gap-2 px-3 py-1 rounded-[6px] bg-[#161618]/95 backdrop-blur-md border border-white/[0.12] text-xs text-[#EDEDEF] select-none"
     >
-      <span class="font-mono text-[11px] text-[#C4B5FD]">Preview: {themeStore.editingTheme?.name || 'Custom'}</span>
+      <span class="font-mono text-[11px] text-[#A3A3AA]">Preview: {themeStore.editingTheme?.name || 'Custom'}</span>
       <button
         type="button"
         onclick={() => (themeStore.isFullscreenPreview = false)}
-        class="px-2.5 py-0.5 rounded-full bg-white/[0.1] hover:bg-white/[0.2] text-[11px] text-white transition-colors"
+        class="px-2 py-0.5 rounded-[4px] bg-[#242428] hover:bg-[#2C2C32] text-[11px] text-[#EDEDEF] transition-colors"
       >
         Exit Preview
       </button>
@@ -368,7 +448,7 @@ function handleGlobalKeyup(e: KeyboardEvent) {
           }
           themeStore.isFullscreenPreview = false;
         }}
-        class="px-2.5 py-0.5 rounded-full bg-[#8B5CF6] hover:bg-[#7C3AED] text-[11px] text-white font-medium transition-colors"
+        class="px-2 py-0.5 rounded-[4px] bg-[#EDEDEF] hover:bg-white text-[11px] text-[#111113] font-medium transition-colors"
       >
         Apply
       </button>
@@ -378,9 +458,48 @@ function handleGlobalKeyup(e: KeyboardEvent) {
           themeStore.setActiveTheme(null);
           themeStore.isFullscreenPreview = false;
         }}
-        class="px-2 py-0.5 rounded-full bg-white/[0.06] hover:bg-[#EF4444]/30 text-[11px] text-[#A3A3AA] hover:text-white transition-colors"
+        class="px-2 py-0.5 rounded-[4px] bg-white/[0.06] hover:bg-[#EF4444]/25 text-[11px] text-[#A3A3AA] hover:text-white transition-colors"
       >
         Off
+      </button>
+    </div>
+  </div>
+{/if}
+
+{#if settingsStore.isSettingsOpen || themeStore.isStudioOpen || themeStore.isFullscreenPreview}
+  <div
+    data-omni-window-bar=""
+    data-tauri-drag-region
+    role="presentation"
+    class="fixed top-0 left-0 right-0 h-11 z-[500] bg-[#101012] border-b border-white/[0.06] flex items-center justify-between pl-4 pr-2 select-none"
+  >
+    <span class="font-mono text-[11px] font-medium tracking-wider text-[#A3A3AA] pointer-events-none leading-none">
+      {themeStore.isFullscreenPreview ? 'OMNIHARNESS // PREVIEW' : themeStore.isStudioOpen ? 'OMNIHARNESS // THEME STUDIO' : 'OMNIHARNESS // SETTINGS'}
+    </span>
+    <div data-tauri-drag-region="false" class="flex items-center gap-1">
+      <button
+        type="button"
+        class="w-7 h-7 rounded-[4px] flex items-center justify-center text-[#7A7A82] hover:text-[#E5E5E8] hover:bg-white/[0.06] transition-colors"
+        onclick={handleMinimize}
+        title="Minimize"
+      >
+        <Icon name="minimize" class="w-3.5 h-3.5" strokeWidth={1.6} />
+      </button>
+      <button
+        type="button"
+        class="w-7 h-7 rounded-[4px] flex items-center justify-center text-[#7A7A82] hover:text-[#E5E5E8] hover:bg-white/[0.06] transition-colors"
+        onclick={handleToggleMaximize}
+        title="Maximize"
+      >
+        <Icon name="maximize" class="w-3.5 h-3.5" strokeWidth={1.6} />
+      </button>
+      <button
+        type="button"
+        class="w-7 h-7 rounded-[4px] flex items-center justify-center text-[#7A7A82] hover:text-white hover:bg-[#EF4444]/85 transition-colors"
+        onclick={handleClose}
+        title="Close"
+      >
+        <Icon name="close" class="w-3.5 h-3.5" strokeWidth={1.6} />
       </button>
     </div>
   </div>
@@ -390,3 +509,53 @@ function handleGlobalKeyup(e: KeyboardEvent) {
   isOpen={settingsStore.isFirstRunOpen}
   onComplete={() => settingsStore.closeFirstRun()}
 />
+
+
+{#if ctxMenu.open}
+  <div
+    data-omni-context-menu=""
+    role="menu"
+    tabindex="-1"
+    onclick={(e) => e.stopPropagation()}
+    onkeydown={(e) => { if (e.key === 'Escape') closeCtxMenu(); }}
+    class="fixed z-[900] w-[196px] py-1 rounded-[8px] bg-[#161618]/98 backdrop-blur-md border border-white/[0.1] shadow-2xl text-xs text-[#E5E5E8] select-none"
+    style="left: {ctxMenu.x}px; top: {ctxMenu.y}px;"
+  >
+    {#if ctxMenu.isEditable}
+      <button type="button" onclick={() => ctxAction('cut')} class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07] flex items-center justify-between">
+        <span>Cut</span><span class="font-mono text-[10px] text-[#66666D]">Ctrl+X</span>
+      </button>
+      <button type="button" onclick={() => ctxAction('copy')} class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07] flex items-center justify-between">
+        <span>Copy</span><span class="font-mono text-[10px] text-[#66666D]">Ctrl+C</span>
+      </button>
+      <button type="button" onclick={() => ctxAction('paste')} class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07] flex items-center justify-between">
+        <span>Paste</span><span class="font-mono text-[10px] text-[#66666D]">Ctrl+V</span>
+      </button>
+      <button type="button" onclick={() => ctxAction('select_all')} class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07] flex items-center justify-between">
+        <span>Select All</span><span class="font-mono text-[10px] text-[#66666D]">Ctrl+A</span>
+      </button>
+      <div class="my-1 border-t border-white/[0.06]"></div>
+    {:else if ctxMenu.selectedText}
+      <button type="button" onclick={() => ctxAction('copy')} class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07] flex items-center justify-between">
+        <span>Copy</span><span class="font-mono text-[10px] text-[#66666D]">Ctrl+C</span>
+      </button>
+      <button type="button" onclick={() => ctxAction('ask_omni')} class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07] text-[#EDEDEF]">
+        Ask OmniHarness
+      </button>
+      <div class="my-1 border-t border-white/[0.06]"></div>
+    {/if}
+    <button type="button" onclick={() => ctxAction('new_chat')} class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07] flex items-center justify-between">
+      <span>New Chat</span><span class="font-mono text-[10px] text-[#66666D]">Ctrl+N</span>
+    </button>
+    <button type="button" onclick={() => ctxAction('toggle_sidebar')} class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07] flex items-center justify-between">
+      <span>Toggle Sidebar</span><span class="font-mono text-[10px] text-[#66666D]">Ctrl+B</span>
+    </button>
+    <button type="button" onclick={() => ctxAction('open_settings')} class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07] flex items-center justify-between">
+      <span>Settings</span><span class="font-mono text-[10px] text-[#66666D]">Ctrl+,</span>
+    </button>
+    <div class="my-1 border-t border-white/[0.06]"></div>
+    <button type="button" onclick={() => ctxAction('reload')} class="w-full px-3 py-1.5 text-left text-[#A3A3AA] hover:text-white hover:bg-white/[0.07]">
+      Reload Window
+    </button>
+  </div>
+{/if}

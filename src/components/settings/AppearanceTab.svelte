@@ -1,5 +1,5 @@
 <script lang="ts">
-import { themeStore } from '../../lib/stores/theme.svelte';
+import { themeStore, createEmptyTheme } from '../../lib/stores/theme.svelte';
 
 let importEl: HTMLInputElement | undefined = $state();
 let statusMsg = $state<string | null>(null);
@@ -59,8 +59,18 @@ function exportActive() {
       {/if}
       <button
         type="button"
+        onclick={async () => {
+          const created = await themeStore.saveTheme(createEmptyTheme(`Theme ${themeStore.themes.length + 1}`));
+          themeStore.openStudio(created.id);
+        }}
+        class="h-8 px-3 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.08] text-xs text-[#E5E5E8] transition-colors"
+      >
+        + New Theme
+      </button>
+      <button
+        type="button"
         onclick={() => themeStore.openStudio()}
-        class="h-8 px-3.5 rounded-[6px] bg-[#8B5CF6] hover:bg-[#7C3AED] text-xs font-medium text-white transition-colors"
+        class="h-8 px-3.5 rounded-[6px] bg-[#EDEDEF] hover:bg-white text-xs font-medium text-[#111113] transition-colors"
       >
         Open Theme Studio
       </button>
@@ -83,7 +93,7 @@ function exportActive() {
         <div class="text-xs font-medium text-[#EDEDEF]">Off (Default OmniHarness)</div>
         <div class="text-[11px] text-[#686870]">Standard built-in dark theme with zero overrides</div>
       </div>
-      <span class="px-2 py-0.5 rounded-[4px] font-mono text-[10px] {themeStore.activeThemeId === null ? 'bg-[#8B5CF6]/20 text-[#C4B5FD]' : 'bg-white/[0.05] text-[#73737A]'}">
+      <span class="px-2 py-0.5 rounded-[4px] font-mono text-[10px] {themeStore.activeThemeId === null ? 'bg-white/[0.12] text-[#EDEDEF]' : 'bg-white/[0.05] text-[#73737A]'}">
         {themeStore.activeThemeId === null ? 'ACTIVE' : 'Select'}
       </span>
     </button>
@@ -111,9 +121,16 @@ function exportActive() {
           <button
             type="button"
             onclick={() => themeStore.setActiveTheme(t.id)}
-            class="h-7 px-2.5 rounded-[5px] text-[11px] font-mono {themeStore.activeThemeId === t.id ? 'bg-[#8B5CF6]/20 text-[#C4B5FD]' : 'bg-white/[0.05] text-[#A3A3AA] hover:text-white'}"
+            class="h-7 px-2.5 rounded-[5px] text-[11px] font-mono {themeStore.activeThemeId === t.id ? 'bg-white/[0.12] text-[#EDEDEF]' : 'bg-white/[0.05] text-[#A3A3AA] hover:text-white'}"
           >
             {themeStore.activeThemeId === t.id ? 'ACTIVE' : 'Apply'}
+          </button>
+          <button
+            type="button"
+            onclick={() => themeStore.deleteTheme(t.id)}
+            class="h-7 px-2 rounded-[5px] bg-[#1E1E22] hover:bg-[#EF4444]/20 border border-white/[0.07] text-[11px] text-[#73737A] hover:text-[#FCA5A5]"
+          >
+            Delete
           </button>
         </div>
       </div>

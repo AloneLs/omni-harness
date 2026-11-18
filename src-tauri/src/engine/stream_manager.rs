@@ -79,7 +79,11 @@ impl StreamManager {
     pub async fn create_session(&self, chat_id: &str) -> SessionHandle {
         let handle = SessionHandle::new(chat_id);
         let mut map = self.sessions.write().await;
-        map.insert(chat_id.to_string(), handle.clone());
+        if let Some(prev) = map.insert(chat_id.to_string(), handle.clone()) {
+            if prev.is_active() {
+                prev.cancel();
+            }
+        }
         handle
     }
 
@@ -116,6 +120,17 @@ impl StreamManager {
     pub async fn remove_session(&self, chat_id: &str) {
         let mut map = self.sessions.write().await;
         map.remove(chat_id);
+    }
+
+    pub async fn remove_session_if_current(&self, chat_id: &str, handle: &SessionHandle) {
+        let mut map = self.sessions.write().await;
+        let is_same = map
+            .get(chat_id)
+            .map(|cur| Arc::ptr_eq(&cur.is_cancelled, &handle.is_cancelled))
+            .unwrap_or(false);
+        if is_same {
+            map.remove(chat_id);
+        }
     }
 
     pub async fn list_active_sessions(&self) -> Vec<String> {

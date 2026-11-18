@@ -1,6 +1,7 @@
 <script lang="ts">
 import { onMount } from 'svelte';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 
 interface PairedChat {
   chatId: string;
@@ -31,7 +32,7 @@ let autoStart = $state<boolean>(false);
 let proxyUrl = $state<string>('');
 let feedbackMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
 
-async function refreshTelegramConfig() {
+async function refreshTelegramConfig(syncForm = false) {
   try {
     const cfg = await invoke<{
       botToken?: string;
@@ -44,25 +45,34 @@ async function refreshTelegramConfig() {
       autoStart?: boolean;
       proxyUrl?: string;
     }>('get_telegram_config');
-    if (!botToken && cfg.botToken) botToken = cfg.botToken;
     if (cfg.pairingCode) pairingCode = cfg.pairingCode;
     if (Array.isArray(cfg.pairedChats)) pairedChats = cfg.pairedChats;
-    if (typeof cfg.notifyOnComplete === 'boolean') notifyOnComplete = cfg.notifyOnComplete;
-    if (typeof cfg.notifyOnApproval === 'boolean') notifyOnApproval = cfg.notifyOnApproval;
-    if (typeof cfg.notifyOnError === 'boolean') notifyOnError = cfg.notifyOnError;
-    if (typeof cfg.autoStart === 'boolean') autoStart = cfg.autoStart;
-    if (!proxyUrl && cfg.proxyUrl) proxyUrl = cfg.proxyUrl;
+    if (syncForm) {
+      if (typeof cfg.botToken === 'string' && (!botToken || cfg.botToken)) botToken = cfg.botToken;
+      if (typeof cfg.notifyOnComplete === 'boolean') notifyOnComplete = cfg.notifyOnComplete;
+      if (typeof cfg.notifyOnApproval === 'boolean') notifyOnApproval = cfg.notifyOnApproval;
+      if (typeof cfg.notifyOnError === 'boolean') notifyOnError = cfg.notifyOnError;
+      if (typeof cfg.autoStart === 'boolean') autoStart = cfg.autoStart;
+      if (typeof cfg.proxyUrl === 'string' && (!proxyUrl || cfg.proxyUrl)) proxyUrl = cfg.proxyUrl;
+    }
     botRunning = Boolean(cfg.isRunning);
     botStatus = botRunning ? 'online' : 'stopped';
   } catch {}
 }
 
 onMount(() => {
-  refreshTelegramConfig();
+  refreshTelegramConfig(true);
+  let unlistenCfg: (() => void) | null = null;
+  listen('telegram-config-updated', () => {
+    refreshTelegramConfig(false);
+  }).then((fn) => (unlistenCfg = fn)).catch(() => {});
   const poll = setInterval(() => {
-    if (botRunning) refreshTelegramConfig();
+    if (botRunning) refreshTelegramConfig(false);
   }, 2500);
-  return () => clearInterval(poll);
+  return () => {
+    clearInterval(poll);
+    if (unlistenCfg) unlistenCfg();
+  };
 });
 
 $effect(() => {
@@ -143,6 +153,7 @@ async function toggleBot() {
     }
     botStatus = 'connecting';
     try {
+      await refreshTelegramConfig(false);
       await invoke('save_telegram_config', {
         token: botToken.trim(),
         pairedChats,
@@ -168,6 +179,7 @@ async function toggleBot() {
 
 async function saveBotSettings() {
   try {
+    await refreshTelegramConfig(false);
     await invoke('save_telegram_config', {
       token: botToken.trim(),
       pairedChats,
@@ -177,7 +189,7 @@ async function saveBotSettings() {
       autoStart,
       proxyUrl: proxyUrl.trim()
     });
-    await refreshTelegramConfig();
+    await refreshTelegramConfig(true);
     feedbackMessage = { type: 'success', text: 'Configuration saved' };
   } catch (err: unknown) {
     feedbackMessage = { type: 'error', text: err instanceof Error ? err.message : String(err) };

@@ -317,29 +317,109 @@ fn decode_jwt_payload(jwt: &str) -> Option<serde_json::Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-fn extract_chatgpt_claims(id_token: Option<&str>, access_token: &str) -> (Option<String>, Option<String>) {
+pub fn format_chatgpt_plan_label(raw: &str) -> Option<String> {
+    let clean = raw.trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let low = clean.to_ascii_lowercase();
+    if low.starts_with("gpt ") {
+        return Some(clean.to_string());
+    }
+    let mapped = match low.as_str() {
+        "pro" | "chatgpt_pro" | "chatgptpro" => "GPT Pro",
+        "prolite" | "pro_lite" | "chatgpt_prolite" => "GPT Pro Lite",
+        "plus" | "chatgpt_plus" | "chatgptplus" => "GPT Plus",
+        "go" | "chatgpt_go" => "GPT Go",
+        "team" | "chatgpt_team" => "GPT Team",
+        "business" | "chatgpt_business" => "GPT Business",
+        "enterprise" | "chatgpt_enterprise" => "GPT Enterprise",
+        "edu" | "chatgpt_edu" => "GPT Edu",
+        "free" | "chatgpt_free" => "GPT Free",
+        _ => return Some(format!("GPT {}", clean)),
+    };
+    Some(mapped.to_string())
+}
+
+pub fn format_antigravity_tier_label(tier_id: &str, tier_name: Option<&str>) -> Option<String> {
+    let low = tier_id.trim().to_ascii_lowercase();
+    if low.contains("ultra") {
+        return Some("Gemini Ultra".to_string());
+    }
+    if low.contains("pro") {
+        return Some("Gemini Pro".to_string());
+    }
+    if low.contains("enterprise") {
+        return Some("Gemini Enterprise".to_string());
+    }
+    if low == "standard-tier" || low.contains("standard") {
+        return Some("Standard".to_string());
+    }
+    if low == "free-tier" || low == "legacy-tier" || low.contains("free") {
+        return Some("Free".to_string());
+    }
+    if let Some(name) = tier_name.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let nlow = name.to_ascii_lowercase();
+        if nlow.contains("ultra") {
+            return Some("Gemini Ultra".to_string());
+        }
+        if nlow.contains("pro") {
+            return Some("Gemini Pro".to_string());
+        }
+        if nlow.contains("free") {
+            return Some("Free".to_string());
+        }
+        return Some(name.to_string());
+    }
+    None
+}
+
+fn extract_chatgpt_claims_full(
+    id_token: Option<&str>,
+    access_token: &str,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let mut email_out: Option<String> = None;
+    let mut acc_out: Option<String> = None;
+    let mut plan_out: Option<String> = None;
+
     for tok in [id_token, Some(access_token)].into_iter().flatten() {
         if let Some(val) = decode_jwt_payload(tok) {
-            let email = val.get("email").and_then(|v| v.as_str()).map(|s| s.to_string());
+            if email_out.is_none() {
+                email_out = val.get("email").and_then(|v| v.as_str()).map(|s| s.to_string());
+            }
             let auth_obj = val.get("https://api.openai.com/auth");
-            let account_id = val
-                .get("chatgpt_account_id")
-                .and_then(|v| v.as_str())
-                .or_else(|| auth_obj.and_then(|o| o.get("chatgpt_account_id")).and_then(|v| v.as_str()))
-                .or_else(|| {
-                    val.get("organizations")
-                        .and_then(|o| o.as_array())
-                        .and_then(|a| a.first())
-                        .and_then(|o| o.get("id"))
-                        .and_then(|v| v.as_str())
-                })
-                .map(|s| s.to_string());
-            if account_id.is_some() || email.is_some() {
-                return (email, account_id);
+            if acc_out.is_none() {
+                acc_out = val
+                    .get("chatgpt_account_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| auth_obj.and_then(|o| o.get("chatgpt_account_id")).and_then(|v| v.as_str()))
+                    .or_else(|| {
+                        val.get("organizations")
+                            .and_then(|o| o.as_array())
+                            .and_then(|a| a.first())
+                            .and_then(|o| o.get("id"))
+                            .and_then(|v| v.as_str())
+                    })
+                    .map(|s| s.to_string());
+            }
+            if plan_out.is_none() {
+                let raw_plan = val
+                    .get("chatgpt_plan_type")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| auth_obj.and_then(|o| o.get("chatgpt_plan_type")).and_then(|v| v.as_str()))
+                    .or_else(|| val.get("plan_type").and_then(|v| v.as_str()));
+                if let Some(rp) = raw_plan {
+                    plan_out = format_chatgpt_plan_label(rp);
+                }
             }
         }
     }
-    (None, None)
+    (email_out, acc_out, plan_out)
+}
+
+fn extract_chatgpt_claims(id_token: Option<&str>, access_token: &str) -> (Option<String>, Option<String>) {
+    let (e, a, _) = extract_chatgpt_claims_full(id_token, access_token);
+    (e, a)
 }
 
 async fn upsert_account(acc: OAuthAccount) -> Result<OAuthAccount, String> {
@@ -359,6 +439,9 @@ async fn upsert_account(acc: OAuthAccount) -> Result<OAuthAccount, String> {
         if acc.account_id.is_some() {
             existing.account_id = acc.account_id.clone();
         }
+        if acc.quota_label.is_some() {
+            existing.quota_label = acc.quota_label.clone();
+        }
         existing.enabled = true;
         existing.cooldown_until_ms = None;
         existing.last_error = None;
@@ -373,8 +456,30 @@ async fn upsert_account(acc: OAuthAccount) -> Result<OAuthAccount, String> {
 
 pub async fn list_accounts(provider: Option<&str>) -> Vec<OAuthAccountPublic> {
     let _guard = store_lock().lock().await;
-    read_accounts_unlocked()
-        .iter()
+    let mut list = read_accounts_unlocked();
+    let mut dirty = false;
+    for acc in list.iter_mut() {
+        if acc.provider == "openai_codex" {
+            if let Some(ref cur) = acc.quota_label.clone() {
+                if let Some(norm) = format_chatgpt_plan_label(cur) {
+                    if &norm != cur {
+                        acc.quota_label = Some(norm);
+                        dirty = true;
+                    }
+                }
+            } else {
+                let (_, _, plan_opt) = extract_chatgpt_claims_full(None, &acc.access_token);
+                if plan_opt.is_some() {
+                    acc.quota_label = plan_opt;
+                    dirty = true;
+                }
+            }
+        }
+    }
+    if dirty {
+        let _ = write_accounts_unlocked(&list);
+    }
+    list.iter()
         .filter(|a| provider.map(|p| a.provider == p).unwrap_or(true))
         .map(OAuthAccountPublic::from)
         .collect()
@@ -479,14 +584,16 @@ async fn refresh_account_tokens(client: &reqwest::Client, acc: &mut OAuthAccount
             ];
             let resp = client
                 .post("https://oauth2.googleapis.com/token")
+                .header("User-Agent", antigravity_hub_ua())
                 .form(&params)
                 .send()
                 .await
                 .map_err(|e| e.to_string())?;
+            let st_code = resp.status().as_u16();
             if !resp.status().is_success() {
-                let status = resp.status();
                 let txt = resp.text().await.unwrap_or_default();
-                return Err(format!("Google refresh failed ({}): {}", status, txt));
+                crate::logger::record_http("OAuthRefresh", "POST", "https://oauth2.googleapis.com/token", st_code, &txt);
+                return Err(format!("Google refresh failed ({}): {}", st_code, txt));
             }
             let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
             let at = data.get("access_token").and_then(|v| v.as_str()).ok_or("No access_token")?;
@@ -497,8 +604,19 @@ async fn refresh_account_tokens(client: &reqwest::Client, acc: &mut OAuthAccount
                     acc.refresh_token = rt.to_string();
                 }
             }
-            acc.expires_at_ms = now + exp_in * 1000 - 60_000;
+            if acc.quota_label.is_none() || acc.project_id.as_deref().map(|p| p.is_empty()).unwrap_or(true) {
+                let (pid, tier) = fetch_antigravity_account_meta(client, &acc.access_token).await;
+                if !pid.is_empty() && acc.project_id.as_deref().map(|p| p.is_empty()).unwrap_or(true) {
+                    acc.project_id = Some(pid);
+                }
+                if tier.is_some() {
+                    acc.quota_label = tier;
+                }
+            }
+            let jitter_ms = (now.abs() % 15_000) + 10_000;
+            acc.expires_at_ms = now + (exp_in * 1000).saturating_sub(jitter_ms);
             acc.last_error = None;
+            crate::logger::record_http("OAuthRefresh", "POST", "https://oauth2.googleapis.com/token", st_code, &format!("refreshed {} exp={}s", acc.email, exp_in));
             Ok(())
         }
         "openai_codex" => {
@@ -520,8 +638,16 @@ async fn refresh_account_tokens(client: &reqwest::Client, acc: &mut OAuthAccount
             }
             let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
             let at = data.get("access_token").and_then(|v| v.as_str()).ok_or("No access_token")?;
+            let id_tok = data.get("id_token").and_then(|v| v.as_str());
             let exp_in = data.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
+            let (_, aid_opt, plan_opt) = extract_chatgpt_claims_full(id_tok, at);
             acc.access_token = at.to_string();
+            if acc.account_id.is_none() && aid_opt.is_some() {
+                acc.account_id = aid_opt;
+            }
+            if plan_opt.is_some() {
+                acc.quota_label = plan_opt;
+            }
             if let Some(rt) = data.get("refresh_token").and_then(|v| v.as_str()) {
                 if !rt.is_empty() {
                     acc.refresh_token = rt.to_string();
@@ -743,7 +869,7 @@ pub async fn acquire_valid_account(
     let chosen_idx = candidates[0];
     let mut chosen = list[chosen_idx].clone();
 
-    if chosen.access_token.is_empty() || (chosen.expires_at_ms > 0 && chosen.expires_at_ms <= now) {
+    if chosen.access_token.is_empty() || (chosen.expires_at_ms > 0 && chosen.expires_at_ms <= now + 10_000) {
         if let Err(e) = refresh_account_tokens(client, &mut chosen).await {
             list[chosen_idx].last_error = Some(e.clone());
             list[chosen_idx].cooldown_until_ms = Some(now + 120_000);
@@ -789,6 +915,7 @@ async fn exchange_code_for_account(
             ];
             let resp = client
                 .post("https://oauth2.googleapis.com/token")
+                .header("User-Agent", antigravity_hub_ua())
                 .form(&params)
                 .send()
                 .await
@@ -803,8 +930,10 @@ async fn exchange_code_for_account(
             let exp_in = data.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
 
             let email = match client
-                .get("https://www.googleapis.com/oauth2/v1/userinfo?alt=json")
+                .get("https://www.googleapis.com/oauth2/v3/userinfo")
                 .bearer_auth(&at)
+                .header("User-Agent", antigravity_hub_ua())
+                .header("X-Goog-Api-Client", antigravity_api_client())
                 .send()
                 .await
             {
@@ -817,14 +946,14 @@ async fn exchange_code_for_account(
                 _ => "antigravity-user".to_string(),
             };
 
-            let project_id = fetch_antigravity_project_id(client, &at).await;
+            let (project_id, tier_label) = fetch_antigravity_account_meta(client, &at).await;
             let acc = OAuthAccount {
                 id: format!("ag-{}", uuid::Uuid::new_v4().simple()),
                 provider: "antigravity".to_string(),
                 email,
                 access_token: at,
                 refresh_token: rt,
-                expires_at_ms: now + exp_in * 1000 - 60_000,
+                expires_at_ms: now + exp_in * 1000 - 10_000,
                 project_id: Some(project_id),
                 account_id: None,
                 enabled: true,
@@ -835,7 +964,7 @@ async fn exchange_code_for_account(
                 quota_5h_reset_at_ms: None,
                 quota_weekly_remaining: None,
                 quota_weekly_reset_at_ms: None,
-                quota_label: None,
+                quota_label: tier_label,
                 quota_updated_at_ms: None,
             };
             upsert_account(acc).await
@@ -863,7 +992,7 @@ async fn exchange_code_for_account(
             let rt = data.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let id_tok = data.get("id_token").and_then(|v| v.as_str());
             let exp_in = data.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
-            let (email_opt, account_id_opt) = extract_chatgpt_claims(id_tok, &at);
+            let (email_opt, account_id_opt, plan_opt) = extract_chatgpt_claims_full(id_tok, &at);
 
             let acc = OAuthAccount {
                 id: format!("codex-{}", uuid::Uuid::new_v4().simple()),
@@ -882,7 +1011,7 @@ async fn exchange_code_for_account(
                 quota_5h_reset_at_ms: None,
                 quota_weekly_remaining: None,
                 quota_weekly_reset_at_ms: None,
-                quota_label: None,
+                quota_label: plan_opt,
                 quota_updated_at_ms: None,
             };
             upsert_account(acc).await
@@ -1022,45 +1151,126 @@ async fn exchange_code_for_account(
 }
 
 pub fn antigravity_hub_ua() -> &'static str {
-    "antigravity/hub/2.31.2 (aidev_client; os_type=windows; arch=amd64; cl=1019359392)"
+    "antigravity/hub/2.32.1 (aidev_client; os_type=windows; arch=amd64; cl=1021296516)"
+}
+
+pub fn persistent_device_id() -> &'static str {
+    static DID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DID.get_or_init(|| {
+        let p = crate::state::AppState::resolve_data_dir().join("oauth_device.json");
+        if let Ok(raw) = std::fs::read_to_string(&p) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(id) = v.get("deviceId").and_then(|x| x.as_str()) {
+                    if !id.trim().is_empty() {
+                        return id.trim().to_string();
+                    }
+                }
+            }
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&p, serde_json::json!({ "deviceId": id }).to_string());
+        id
+    })
 }
 
 pub fn machine_session_id() -> &'static str {
     static SID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    SID.get_or_init(|| format!("{}-{}", uuid::Uuid::new_v4(), chrono::Utc::now().timestamp_millis()))
+    SID.get_or_init(|| format!("{}-{}", persistent_device_id(), chrono::Utc::now().timestamp_millis()))
 }
 
-pub async fn fetch_antigravity_project_id(client: &reqwest::Client, access_token: &str) -> String {
+pub fn antigravity_api_client() -> &'static str {
+    "gl-go/1.22.7 gdcl/20240101"
+}
+
+pub fn antigravity_trace_id() -> String {
+    let bytes = uuid::Uuid::new_v4().as_bytes()[0..8].try_into().unwrap_or([0u8; 8]);
+    let val = u64::from_le_bytes(bytes);
+    format!("0x{:016x}", val)
+}
+
+pub fn antigravity_client_metadata() -> &'static str {
+    r#"{"ideType":"ANTIGRAVITY","platform":"WINDOWS","pluginType":"GEMINI"}"#
+}
+
+pub async fn fetch_antigravity_account_meta(
+    client: &reqwest::Client,
+    access_token: &str,
+) -> (String, Option<String>) {
     let meta = serde_json::json!({
         "metadata": {
-            "ideType": "ANTIGRAVITY"
-        }
+            "ideType": "ANTIGRAVITY",
+            "platform": "WINDOWS",
+            "pluginType": "GEMINI"
+        },
+        "mode": "FULL_ELIGIBILITY_CHECK"
     });
+    let mut found_pid = String::new();
+    let mut found_tier: Option<String> = None;
+
+    let parse_tier_val = |t_val: &serde_json::Value| -> Option<String> {
+        if let Some(s) = t_val.as_str() {
+            return format_antigravity_tier_label(s, None);
+        }
+        let tid = t_val.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let tname = t_val.get("name").and_then(|v| v.as_str());
+        if tid.is_empty() && tname.is_none() {
+            return None;
+        }
+        format_antigravity_tier_label(tid, tname)
+    };
+
     for ep in [
-        "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
         "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
+        "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
     ] {
         if let Ok(resp) = client
             .post(ep)
             .bearer_auth(access_token)
             .header("User-Agent", antigravity_hub_ua())
+            .header("X-Goog-Api-Client", antigravity_api_client())
+            .header("Client-Metadata", antigravity_client_metadata())
             .header("X-Machine-Session-Id", machine_session_id())
+            .header("X-Goog-Request-Reason", "user_initiated")
+            .header("x-cloudaicompanion-trace-id", antigravity_trace_id())
             .json(&meta)
             .send()
             .await
         {
             if resp.status().is_success() {
                 if let Ok(val) = resp.json::<serde_json::Value>().await {
-                    if let Some(pid) = val.get("cloudaicompanionProject").and_then(|v| v.as_str()) {
-                        if !pid.trim().is_empty() {
-                            return pid.trim().to_string();
+                    if let Some(proj_v) = val.get("cloudaicompanionProject") {
+                        let pid = proj_v
+                            .as_str()
+                            .or_else(|| proj_v.get("id").and_then(|v| v.as_str()))
+                            .unwrap_or("")
+                            .trim();
+                        if !pid.is_empty() {
+                            found_pid = pid.to_string();
                         }
+                    }
+                    let paid_lbl = val.get("paidTier").and_then(parse_tier_val);
+                    let cur_lbl = val.get("currentTier").and_then(parse_tier_val);
+                    found_tier = match (paid_lbl, cur_lbl) {
+                        (Some(p), _) if p != "Free" => Some(p),
+                        (_, Some(c)) => Some(c),
+                        (Some(p), None) => Some(p),
+                        (None, None) => None,
+                    };
+                    if !found_pid.is_empty() || found_tier.is_some() {
+                        return (found_pid, found_tier);
                     }
                 }
             }
         }
     }
-    String::new()
+    (found_pid, found_tier)
+}
+
+pub async fn fetch_antigravity_project_id(client: &reqwest::Client, access_token: &str) -> String {
+    fetch_antigravity_account_meta(client, access_token).await.0
 }
 
 pub async fn fetch_antigravity_models(client: &reqwest::Client) -> Result<Vec<serde_json::Value>, String> {
@@ -1070,11 +1280,19 @@ pub async fn fetch_antigravity_models(client: &reqwest::Client) -> Result<Vec<se
         Some(p) if !p.is_empty() => p,
         _ => fetch_antigravity_project_id(client, &acc.access_token).await,
     };
-    let ua = "antigravity/hub/2.31.2 (aidev_client; os_type=windows; arch=amd64; cl=1019359392)";
-    let resp = client
+    let mut req = client
         .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
         .bearer_auth(&acc.access_token)
-        .header("User-Agent", ua)
+        .header("User-Agent", antigravity_hub_ua())
+        .header("X-Goog-Api-Client", antigravity_api_client())
+        .header("Client-Metadata", antigravity_client_metadata())
+        .header("X-Machine-Session-Id", machine_session_id())
+        .header("X-Goog-Request-Reason", "user_initiated")
+        .header("x-cloudaicompanion-trace-id", antigravity_trace_id());
+    if !pid.is_empty() {
+        req = req.header("X-Goog-User-Project", &pid);
+    }
+    let resp = req
         .json(&serde_json::json!({ "project": pid }))
         .send()
         .await
@@ -1122,11 +1340,13 @@ pub async fn fetch_antigravity_models(client: &reqwest::Client) -> Result<Vec<se
             let is_disabled = info.get("disabled").and_then(|v| v.as_bool()).unwrap_or(false);
             let display_name = info.get("displayName").and_then(|v| v.as_str()).unwrap_or("").trim();
             let id_low = id.to_ascii_lowercase();
-            let is_legacy_gemini = id_low.starts_with("gemini-2.5")
-                || id_low.starts_with("gemini-3-")
-                || id_low.starts_with("gemini-3.0")
-                || id_low.starts_with("gemini-3.1")
-                || id_low.starts_with("gemini-3.5");
+            let is_image_gen = id_low.contains("image") || id_low.contains("imagen");
+            let is_legacy_gemini = !is_image_gen
+                && (id_low.starts_with("gemini-2.5")
+                    || id_low.starts_with("gemini-3-")
+                    || id_low.starts_with("gemini-3.0")
+                    || id_low.starts_with("gemini-3.1")
+                    || id_low.starts_with("gemini-3.5"));
             if is_internal || is_disabled || display_name.is_empty() || id.starts_with("chat_") || id.starts_with("tab_") || is_legacy_gemini {
                 continue;
             }
@@ -1162,6 +1382,7 @@ pub async fn fetch_antigravity_models(client: &reqwest::Client) -> Result<Vec<se
                 "supportsTools": true,
                 "supportsAudio": lower.contains("gemini"),
                 "supportsFiles": true,
+                "supportsImageGen": is_image_gen,
                 "remainingFraction": remaining,
                 "isExhausted": is_exhausted,
                 "resetTime": reset_time
@@ -1333,7 +1554,9 @@ pub async fn start_oauth_login(
         }
     }
 
-    open_url_in_browser(&auth_url);
+    if provider != "zcode_oauth" {
+        open_url_in_browser(&auth_url);
+    }
 
     Ok(serde_json::json!({
         "authUrl": auth_url,
@@ -1444,10 +1667,12 @@ pub async fn import_local_accounts(
     }
 
     let mut ag_raw_blobs: Vec<String> = Vec::new();
-    if let Ok(entry) = keyring::Entry::new("gemini", "antigravity") {
-        if let Ok(secret) = entry.get_password() {
-            if !secret.trim().is_empty() {
-                ag_raw_blobs.push(secret);
+    for (svc, usr) in [("gemini", "antigravity"), ("gemini:antigravity", "antigravity")] {
+        if let Ok(entry) = keyring::Entry::new(svc, usr) {
+            if let Ok(secret) = entry.get_password() {
+                if !secret.trim().is_empty() && !ag_raw_blobs.contains(&secret) {
+                    ag_raw_blobs.push(secret);
+                }
             }
         }
     }
@@ -1514,7 +1739,11 @@ pub async fn import_local_accounts(
                             }
                         }
                     }
-                    acc.project_id = Some(fetch_antigravity_project_id(&http_client, &acc.access_token).await);
+                    let (pid, tier_lbl) = fetch_antigravity_account_meta(&http_client, &acc.access_token).await;
+                    acc.project_id = Some(pid);
+                    if tier_lbl.is_some() {
+                        acc.quota_label = tier_lbl;
+                    }
                 }
                 if let Ok(saved) = upsert_account(acc).await {
                     imported.push(OAuthAccountPublic::from(&saved));
@@ -1569,7 +1798,7 @@ pub async fn import_local_accounts(
                 let rt = tokens.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let id_tok = tokens.get("id_token").and_then(|v| v.as_str());
                 if !at.is_empty() || !rt.is_empty() {
-                    let (email_opt, account_id_opt) = extract_chatgpt_claims(id_tok, &at);
+                    let (email_opt, account_id_opt, plan_opt) = extract_chatgpt_claims_full(id_tok, &at);
                     let acc = OAuthAccount {
                         id: format!("codex-{}", uuid::Uuid::new_v4().simple()),
                         provider: "openai_codex".to_string(),
@@ -1587,7 +1816,7 @@ pub async fn import_local_accounts(
                         quota_5h_reset_at_ms: None,
                         quota_weekly_remaining: None,
                         quota_weekly_reset_at_ms: None,
-                        quota_label: None,
+                        quota_label: plan_opt,
                         quota_updated_at_ms: None,
                     };
                     if let Ok(saved) = upsert_account(acc).await {
@@ -2035,7 +2264,10 @@ async fn fetch_account_quota_inner(client: &reqwest::Client, acc: &mut OAuthAcco
             }
             let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
             if let Some(plan) = val.get("plan_type").and_then(|v| v.as_str()) {
-                acc.quota_label = Some(plan.to_string());
+                acc.quota_label = format_chatgpt_plan_label(plan);
+            } else if acc.quota_label.is_none() {
+                let (_, _, plan_opt) = extract_chatgpt_claims_full(None, &acc.access_token);
+                acc.quota_label = plan_opt;
             }
             let rl = val.get("rate_limit");
             let allowed = rl.and_then(|r| r.get("allowed")).and_then(|v| v.as_bool()).unwrap_or(true);
@@ -2114,15 +2346,22 @@ async fn fetch_account_quota_inner(client: &reqwest::Client, acc: &mut OAuthAcco
             Ok(())
         }
         "antigravity" => {
-            let pid = match acc.project_id.clone() {
-                Some(p) if !p.is_empty() => p,
-                _ => {
-                    let fetched = fetch_antigravity_project_id(client, &acc.access_token).await;
-                    if !fetched.is_empty() {
-                        acc.project_id = Some(fetched.clone());
-                    }
-                    fetched
+            let need_meta = acc.project_id.as_deref().map(|p| p.is_empty()).unwrap_or(true)
+                || acc.quota_label.as_deref().map(|l| l.is_empty()).unwrap_or(true);
+            let pid = if need_meta {
+                let (fetched_pid, fetched_tier) = fetch_antigravity_account_meta(client, &acc.access_token).await;
+                if !fetched_pid.is_empty() {
+                    acc.project_id = Some(fetched_pid.clone());
                 }
+                if fetched_tier.is_some() {
+                    acc.quota_label = fetched_tier;
+                }
+                acc.project_id.clone().unwrap_or_default()
+            } else {
+                if let (_, Some(fetched_tier)) = fetch_antigravity_account_meta(client, &acc.access_token).await {
+                    acc.quota_label = Some(fetched_tier);
+                }
+                acc.project_id.clone().unwrap_or_default()
             };
             let resp = client
                 .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")

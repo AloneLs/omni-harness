@@ -1,6 +1,9 @@
 use crate::engine::context_engine::{compute_prompt_cache_key, spill_tool_output_if_needed};
 use crate::engine::stream_manager::SessionHandle;
-use crate::llm::request_compat::{ChatMessage, ChatRequest, FunctionCall, FunctionSpec, MessageContent, ToolCall, ToolDefinition};
+use crate::llm::request_compat::{
+    ChatMessage, ChatRequest, ContentPart, FunctionCall, FunctionSpec, ImageUrlDetail,
+    MessageContent, ToolCall, ToolDefinition,
+};
 use crate::llm::{dispatch_stream_with_protocol, CapabilityRegistry, KeyPool, StreamEvent};
 use crate::tools::ToolDispatcher;
 use serde::{Deserialize, Serialize};
@@ -329,16 +332,17 @@ pub fn delete_custom_subagent(
         if !candidate.is_file() {
             continue;
         }
-        let Ok(canon_target) = std::fs::canonicalize(&candidate) else {
+        let Ok(canon_target) = crate::tools::path_norm::canonicalize_best_effort(&candidate) else {
             continue;
         };
         let mut inside_root = false;
         for (root, _) in &allowed_roots {
-            if let Ok(canon_root) = std::fs::canonicalize(root) {
-                if canon_target.starts_with(&canon_root) && canon_target != canon_root {
-                    inside_root = true;
-                    break;
-                }
+            if root.exists()
+                && crate::tools::path_norm::is_within_root(&canon_target, root)
+                && crate::tools::path_norm::path_key(&canon_target) != crate::tools::path_norm::path_key(root)
+            {
+                inside_root = true;
+                break;
             }
         }
         if inside_root && canon_target.extension().and_then(|e| e.to_str()) == Some("md") {
@@ -360,11 +364,13 @@ fn map_tool_alias(t: &str) -> &str {
         "glob" => "glob",
         "grep" => "grep",
         "bash" | "terminal_exec" => "terminal_exec",
+        "manage_task" => "manage_task",
         "terminal_io" => "terminal_io",
         "webfetch" | "websearch" | "web_research" => "web_research",
         "code_intel" | "lsp" => "code_intel",
         "skill" | "tool_hub" => "tool_hub",
         "memory" | "memory_tool" => "memory_tool",
+        "computer" | "desktop" | "computer_use" => "computer_use",
         other => {
             let _ = other;
             ""
@@ -391,11 +397,13 @@ pub fn allowed_tools_for_subagent(
                         "glob" => Some("glob"),
                         "grep" => Some("grep"),
                         "terminal_exec" => Some("terminal_exec"),
+                        "manage_task" => Some("manage_task"),
                         "terminal_io" => Some("terminal_io"),
                         "web_research" => Some("web_research"),
                         "code_intel" => Some("code_intel"),
                         "tool_hub" => Some("tool_hub"),
                         "memory_tool" => Some("memory_tool"),
+                        "computer_use" => Some("computer_use"),
                         _ => None,
                     };
                     if let Some(s) = static_name {
@@ -420,6 +428,7 @@ pub fn allowed_tools_for_subagent(
             "grep",
             "code_intel",
             "terminal_exec",
+            "manage_task",
             "terminal_io",
         ],
         _ => vec![
@@ -432,10 +441,12 @@ pub fn allowed_tools_for_subagent(
             "grep",
             "code_intel",
             "terminal_exec",
+            "manage_task",
             "terminal_io",
             "web_research",
             "tool_hub",
             "memory_tool",
+            "computer_use",
         ],
     }
 }
@@ -698,8 +709,25 @@ impl SubagentRunner {
                 let res = tools
                     .dispatch_tool(&tc.function.name, &args, None, Some(chat_id))
                     .await;
+                let mut vision_du: Option<String> = None;
                 let raw = if res.success {
-                    serde_json::to_string(&res.output).unwrap_or_else(|_| "{}".to_string())
+                    if tc.function.name == "computer_use" {
+                        if let Some(obj) = res.output.as_object() {
+                            if let Some(du) = obj.get("dataUrl").and_then(|v| v.as_str()) {
+                                vision_du = Some(du.to_string());
+                                let mut compact = obj.clone();
+                                compact.remove("dataUrl");
+                                serde_json::to_string(&Value::Object(compact))
+                                    .unwrap_or_else(|_| "{}".to_string())
+                            } else {
+                                serde_json::to_string(&res.output).unwrap_or_else(|_| "{}".to_string())
+                            }
+                        } else {
+                            serde_json::to_string(&res.output).unwrap_or_else(|_| "{}".to_string())
+                        }
+                    } else {
+                        serde_json::to_string(&res.output).unwrap_or_else(|_| "{}".to_string())
+                    }
                 } else {
                     serde_json::json!({ "error": res.error.unwrap_or_default() }).to_string()
                 };
@@ -712,6 +740,29 @@ impl SubagentRunner {
                     tool_call_id: Some(tc.id),
                     reasoning_content: None,
                 });
+                if let Some(du) = vision_du {
+                    let model_caps = caps_registry.get(&target_model);
+                    if model_caps.supports_vision {
+                        sub_history.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: MessageContent::Parts(vec![
+                                ContentPart::Text {
+                                    text: "Captured target window from computer_use (0..1000 window-relative coordinates).".to_string(),
+                                },
+                                ContentPart::ImageUrl {
+                                    image_url: ImageUrlDetail {
+                                        url: du,
+                                        detail: Some("high".to_string()),
+                                    },
+                                },
+                            ]),
+                            name: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                            reasoning_content: None,
+                        });
+                    }
+                }
             }
         }
 

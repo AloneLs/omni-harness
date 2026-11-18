@@ -192,14 +192,17 @@ async fn stream_openai_responses_inner(
             payload["instructions"] = serde_json::json!("You are a helpful assistant.");
         }
 
+        let is_codex_backend = use_codex_oauth && provider_name == "openai_codex";
         if let Some(ref re) = request.reasoning_effort {
             payload["reasoning"] = serde_json::json!({ "effort": re });
         }
-        if let Some(t) = request.temperature {
-            payload["temperature"] = serde_json::json!(t);
-        }
-        if let Some(mt) = request.max_completion_tokens.or(request.max_tokens) {
-            payload["max_output_tokens"] = serde_json::json!(mt);
+        if !is_codex_backend {
+            if let Some(t) = request.temperature {
+                payload["temperature"] = serde_json::json!(t);
+            }
+            if let Some(mt) = request.max_completion_tokens.or(request.max_tokens) {
+                payload["max_output_tokens"] = serde_json::json!(mt);
+            }
         }
         if let Some(ref tools) = request.tools {
             let mapped_tools: Vec<serde_json::Value> = tools
@@ -448,6 +451,37 @@ async fn stream_openai_responses_inner(
                                             cache_creation_input_tokens: 0,
                                         });
                                     }
+                                }
+                                "error" | "response.failed" => {
+                                    let err_obj = val
+                                        .get("error")
+                                        .or_else(|| val.get("response").and_then(|r| r.get("error")));
+                                    let msg = err_obj
+                                        .and_then(|e| e.get("message"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string())
+                                        .unwrap_or_else(|| data_str.to_string());
+                                    let code_str = err_obj
+                                        .and_then(|e| e.get("code"))
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let status_code = if code_str.contains("rate_limit") || msg.to_lowercase().contains("rate limit") || msg.to_lowercase().contains("usage limit") {
+                                        429
+                                    } else {
+                                        500
+                                    };
+                                    if let Some(ref acc) = oauth_acc {
+                                        if status_code == 429 {
+                                            crate::llm::oauth_accounts::mark_account_quota_exhausted(&acc.id, Some(0.0), None).await;
+                                            crate::llm::oauth_accounts::mark_account_cooldown(&acc.id, 120, &msg).await;
+                                        } else {
+                                            crate::llm::oauth_accounts::mark_account_cooldown(&acc.id, 30, &msg).await;
+                                        }
+                                    }
+                                    return Err(LlmError::ProviderError {
+                                        status: status_code,
+                                        message: msg,
+                                    });
                                 }
                                 _ => {}
                             }
