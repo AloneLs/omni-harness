@@ -27,6 +27,45 @@ import { settingsStore } from './lib/stores/settings.svelte';
 import { chatStore } from './lib/stores/chat.svelte';
 import { SPRING_LAUNCH, SPRING_PANEL, SPRING_POPUP, attachPressScale } from './lib/motion';
 
+interface UpdateInfo {
+  hasUpdate: boolean;
+  currentVersion: string;
+  latestVersion: string;
+  releaseName: string;
+  releaseUrl: string;
+  releaseNotes: string;
+  assetName?: string | null;
+  assetUrl?: string | null;
+  publishedAt: string;
+}
+
+let updateInfo = $state<UpdateInfo | null>(null);
+let updateDismissed = $state<boolean>(false);
+let updateInstalling = $state<boolean>(false);
+let updateStatusText = $state<string>('');
+let updatePercent = $state<number>(0);
+
+async function handleInstallUpdate() {
+  if (!updateInfo?.assetUrl || !updateInfo?.assetName || updateInstalling) return;
+  updateInstalling = true;
+  updateStatusText = 'Downloading...';
+  try {
+    const { listen } = await import('@tauri-apps/api/event');
+    const unlisten = await listen<{ status?: string; percent?: number }>('update-download-progress', (ev) => {
+      if (typeof ev.payload?.percent === 'number') updatePercent = ev.payload.percent;
+      if (ev.payload?.status) updateStatusText = ev.payload.status;
+    });
+    await invoke('install_github_update', {
+      assetUrl: updateInfo.assetUrl,
+      assetName: updateInfo.assetName
+    });
+    unlisten();
+  } catch (err: any) {
+    updateStatusText = err instanceof Error ? err.message : String(err);
+    updateInstalling = false;
+  }
+}
+
 let sidebarOpen = $state<boolean>(true);
 let contractsPanelOpen = $state<boolean>(false);
 let activeSettingsTab = $state<
@@ -56,6 +95,16 @@ onMount(() => {
     invoke('window_show').catch(() => {});
     launchSpring.target = { opacity: 1, scale: 1, y: 0 };
   });
+  setTimeout(() => {
+    invoke<UpdateInfo>('check_github_update')
+      .then((info) => {
+        if (info?.hasUpdate) {
+          updateInfo = info;
+        }
+      })
+      .catch(() => {});
+  }, 3000);
+
   const blockAltCapture = (e: KeyboardEvent) => {
     if (e.key === 'Alt' || e.code === 'AltLeft' || e.code === 'AltRight') {
       e.preventDefault();
@@ -557,5 +606,60 @@ $effect(() => {
     <button type="button" onclick={() => ctxAction('reload')} class="w-full px-3 py-1.5 text-left text-[#A3A3AA] hover:text-white hover:bg-white/[0.07]">
       Reload Window
     </button>
+  </div>
+{/if}
+
+
+{#if updateInfo?.hasUpdate && !updateDismissed}
+  <div
+    transition:fly={{ y: 12, duration: 200 }}
+    class="fixed bottom-5 right-5 z-[450] w-[320px] rounded-[10px] bg-[#161618]/95 backdrop-blur-md border border-white/[0.12] p-3.5 shadow-2xl text-xs text-[#E5E5E8] select-none space-y-2.5"
+  >
+    <div class="flex items-start justify-between gap-2">
+      <div class="min-w-0">
+        <div class="font-medium text-[#EDEDEF]">Доступно обновление v{updateInfo.latestVersion}</div>
+        <div class="text-[11px] text-[#73737A] mt-0.5">Текущая версия: v{updateInfo.currentVersion}</div>
+      </div>
+      {#if !updateInstalling}
+        <button
+          type="button"
+          onclick={() => (updateDismissed = true)}
+          class="p-1 rounded-[4px] text-[#66666D] hover:text-[#E5E5E8] hover:bg-white/[0.06]"
+          title="Позже"
+        >
+          <Icon name="close" class="w-3.5 h-3.5" strokeWidth={1.6} />
+        </button>
+      {/if}
+    </div>
+    {#if updateInstalling}
+      <div class="space-y-1">
+        <div class="flex justify-between font-mono text-[10.5px] text-[#A3A3AA]">
+          <span>{updateStatusText || 'Updating...'}</span>
+          <span>{updatePercent}%</span>
+        </div>
+        <div class="h-1.5 rounded-full bg-white/[0.08] overflow-hidden">
+          <div class="h-full bg-[#EDEDEF] transition-all duration-200" style="width: {updatePercent}%"></div>
+        </div>
+      </div>
+    {:else}
+      <div class="flex items-center justify-end gap-2">
+        <button
+          type="button"
+          onclick={() => (updateDismissed = true)}
+          class="h-7 px-2.5 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.08] text-[11px] text-[#A3A3AA]"
+        >
+          Позже
+        </button>
+        {#if updateInfo.assetUrl}
+          <button
+            type="button"
+            onclick={handleInstallUpdate}
+            class="h-7 px-3 rounded-[6px] bg-[#EDEDEF] hover:bg-white text-[11px] font-medium text-[#111113] transition-colors"
+          >
+            Обновить
+          </button>
+        {/if}
+      </div>
+    {/if}
   </div>
 {/if}

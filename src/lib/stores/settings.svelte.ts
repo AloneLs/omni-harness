@@ -182,7 +182,7 @@ class SettingsStore {
   public async loadSettings(): Promise<void> {
     this.isLoading = true;
     try {
-      const res = await invoke<AppSettings>('get_settings');
+      const res = await invoke<AppSettings | null>('get_settings');
       if (res && typeof res === 'object') {
         this.data = {
           ...DEFAULT_SETTINGS,
@@ -190,7 +190,11 @@ class SettingsStore {
           providers: { ...(res.providers || {}) },
           enabledTools: { ...DEFAULT_SETTINGS.enabledTools, ...(res.enabledTools || {}) }
         };
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem('omni_settings', JSON.stringify(this.data));
+        }
         this.isLoading = false;
+        this.syncProvidersToBackend();
         return;
       }
     } catch {}
@@ -211,6 +215,9 @@ class SettingsStore {
     }
     this.isLoading = false;
     this.syncProvidersToBackend();
+    if (Object.keys(this.data.providers || {}).length > 0) {
+      invoke('save_settings', { settings: this.data }).catch(() => {});
+    }
   }
 
   public async refreshAllModelCapabilities(): Promise<void> {

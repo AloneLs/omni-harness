@@ -322,7 +322,7 @@ pub async fn stream_antigravity(
     let max_attempts = 6u32;
 
     for attempt in 1..=max_attempts {
-        let mut acc = match oauth_accounts::acquire_valid_account(client, "antigravity", &excluded_ids).await {
+        let mut acc = match oauth_accounts::acquire_valid_account_for_model(client, "antigravity", &excluded_ids, Some(&model_clean)).await {
             Ok(a) => a,
             Err(e) => {
                 return Err(last_err.unwrap_or(LlmError::ProviderError { status: 401, message: e }));

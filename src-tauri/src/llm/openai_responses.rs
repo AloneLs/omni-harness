@@ -90,7 +90,7 @@ async fn stream_openai_responses_inner(
     let mut last_oauth_err: Option<LlmError> = None;
     for attempt in 1..=max_attempts {
         let (api_key, oauth_acc) = if use_codex_oauth {
-            let acc = match crate::llm::oauth_accounts::acquire_valid_account(client, provider_name, &excluded_oauth).await {
+            let acc = match crate::llm::oauth_accounts::acquire_valid_account_for_model(client, provider_name, &excluded_oauth, Some(&request.model)).await {
                 Ok(a) => a,
                 Err(e) => return Err(last_oauth_err.unwrap_or(LlmError::ProviderError { status: 401, message: e })),
             };

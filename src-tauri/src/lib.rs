@@ -10,6 +10,7 @@ pub mod state;
 mod themes;
 pub mod telegram;
 pub mod tools;
+pub mod updater;
 
 use engine::task_contract::TaskContract;
 use serde_json::json;
@@ -3029,6 +3030,10 @@ pub fn run() {
             start_theme_agent_stream,
             open_zcode_oauth_window,
             get_debug_log_path,
+            get_settings,
+            save_settings,
+            check_github_update,
+            install_github_update,
             list_subagents,
             save_custom_subagent,
             delete_custom_subagent,
@@ -3285,4 +3290,46 @@ async fn cu_close_window(hwnd: usize) -> Result<serde_json::Value, String> {
     tokio::task::spawn_blocking(move || tools::desktop_uia::close_window_background(hwnd))
         .await
         .map_err(|e| e.to_string())?
+}
+
+
+#[tauri::command]
+async fn get_settings() -> Result<Option<serde_json::Value>, String> {
+    let path = state::AppState::resolve_data_dir().join("settings.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    Ok(Some(parsed))
+}
+
+#[tauri::command]
+async fn save_settings(settings: serde_json::Value) -> Result<(), String> {
+    let dir = state::AppState::resolve_data_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("settings.json");
+    let tmp = dir.join("settings.json.tmp");
+    let json_str = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, json_str).map_err(|e| e.to_string())?;
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_github_update(state: State<'_, AppManagedState>) -> Result<updater::UpdateInfo, String> {
+    updater::check_github_update(&state.http_client).await
+}
+
+#[tauri::command]
+async fn install_github_update(
+    app: tauri::AppHandle,
+    state: State<'_, AppManagedState>,
+    asset_url: String,
+    asset_name: String,
+) -> Result<(), String> {
+    updater::install_github_update(&app, &state.http_client, &asset_url, &asset_name).await
 }

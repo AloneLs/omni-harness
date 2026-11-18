@@ -1228,19 +1228,19 @@ impl SingleAgentRunner {
 
             if active_tool_calls.is_empty() {
                 if history.last().map(|m| m.content.as_text_lossy().trim().is_empty()).unwrap_or(true) {
-                    if empty_retries < 2 {
+                    if empty_retries < 3 {
                         empty_retries += 1;
                         history.pop();
                         crate::logger::warn(
                             "SingleAgent",
-                            &format!("Empty response on turn {}, auto-retrying ({}/2) model={}", turn_seq, empty_retries, model_name),
+                            &format!("Empty response on turn {}, auto-retrying ({}/3) model={}", turn_seq, empty_retries, model_name),
                         );
-                        if empty_retries == 2 {
+                        if empty_retries >= 2 {
                             history.push(ChatMessage::user("Continue and provide your final response or next tool call."));
                         }
                         let _ = event_sender
                             .send(StreamEvent::RetryNotice {
-                                reason: format!("Model returned empty response, retrying ({}/2)...", empty_retries),
+                                reason: format!("Model returned empty response, retrying ({}/3)...", empty_retries),
                                 attempt: empty_retries,
                                 model: model_name.to_string(),
                             })

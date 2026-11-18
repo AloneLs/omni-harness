@@ -46,7 +46,13 @@ let uniqueProjectPaths = $derived.by(() => {
   if (workspaceStore.currentPath) {
     map.set(normProj(workspaceStore.currentPath), workspaceStore.currentPath);
   }
-  for (const c of visibleRecent) {
+  for (const rp of workspaceStore.recentWorkspaces) {
+    if (rp) {
+      const k = normProj(rp);
+      if (!map.has(k)) map.set(k, rp);
+    }
+  }
+  for (const c of chatStore.recentSessions) {
     if (c.projectPath) {
       const k = normProj(c.projectPath);
       if (!map.has(k)) map.set(k, c.projectPath);
@@ -56,8 +62,8 @@ let uniqueProjectPaths = $derived.by(() => {
 });
 
 let projectChatsByNorm = $derived.by(() => {
-  const grouped = new Map<string, typeof visibleRecent>();
-  for (const c of visibleRecent) {
+  const grouped = new Map<string, typeof chatStore.recentSessions>();
+  for (const c of chatStore.recentSessions) {
     if (!c.projectPath) continue;
     const k = normProj(c.projectPath);
     const list = grouped.get(k);

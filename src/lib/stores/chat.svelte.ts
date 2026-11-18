@@ -1716,7 +1716,7 @@ class ChatStore {
 
       try {
         const list = this.messagesByChat[chatId] || [];
-        const priorHistory = list
+        const rawPrior = list
           .slice(0, Math.max(0, list.length - 2))
           .filter((m) => m.role === 'user' || m.role === 'assistant')
           .map((m) => {
@@ -1728,9 +1728,24 @@ class ChatStore {
                 .join('\n')
                 .trim();
             }
+            if (!text && m.role === 'assistant') {
+              text = '[Canceled by user]';
+            }
             return { role: m.role, content: text };
           })
           .filter((m) => m.content.length > 0);
+
+        const priorHistory: Array<{ role: string; content: string }> = [];
+        for (const item of rawPrior) {
+          if (
+            item.role === 'user' &&
+            priorHistory.length > 0 &&
+            priorHistory[priorHistory.length - 1].role === 'user'
+          ) {
+            priorHistory.push({ role: 'assistant', content: '[Canceled by user]' });
+          }
+          priorHistory.push(item);
+        }
 
         const lastUserMsg = [...list].reverse().find((m) => m.role === 'user');
         const msgAttachments = (lastUserMsg?.attachments || []).map((a) => ({

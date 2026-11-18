@@ -79,6 +79,10 @@ pub struct OAuthAccount {
     pub quota_label: Option<String>,
     #[serde(default)]
     pub quota_updated_at_ms: Option<i64>,
+    #[serde(default)]
+    pub plan_tier: Option<String>,
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {
@@ -103,6 +107,8 @@ pub struct OAuthAccountPublic {
     pub quota_weekly_reset_at_ms: Option<i64>,
     pub quota_label: Option<String>,
     pub quota_updated_at_ms: Option<i64>,
+    pub plan_tier: Option<String>,
+    pub allowed_models: Option<Vec<String>>,
 }
 
 impl From<&OAuthAccount> for OAuthAccountPublic {
@@ -123,6 +129,8 @@ impl From<&OAuthAccount> for OAuthAccountPublic {
             quota_weekly_reset_at_ms: a.quota_weekly_reset_at_ms,
             quota_label: a.quota_label.clone(),
             quota_updated_at_ms: a.quota_updated_at_ms,
+            plan_tier: a.plan_tier.clone(),
+            allowed_models: a.allowed_models.clone(),
         }
     }
 }
@@ -441,6 +449,8 @@ async fn upsert_account(acc: OAuthAccount) -> Result<OAuthAccount, String> {
         }
         if acc.quota_label.is_some() {
             existing.quota_label = acc.quota_label.clone();
+            if acc.plan_tier.is_some() { existing.plan_tier = acc.plan_tier.clone(); }
+            if acc.allowed_models.is_some() { existing.allowed_models = acc.allowed_models.clone(); }
         }
         existing.enabled = true;
         existing.cooldown_until_ms = None;
@@ -783,10 +793,66 @@ fn is_quota_exhausted_for_now(a: &OAuthAccount, now: i64) -> bool {
     q5_dead || q7_dead
 }
 
+fn account_supports_model(acc: &OAuthAccount, requested_model: Option<&str>) -> bool {
+    let Some(raw_m) = requested_model.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    let clean = raw_m.strip_prefix("models/").unwrap_or(raw_m).to_ascii_lowercase();
+    if let Some(ref allowed) = acc.allowed_models {
+        if !allowed.is_empty() {
+            let found = allowed.iter().any(|m| {
+                let mc = m.trim().strip_prefix("models/").unwrap_or(m.trim()).to_ascii_lowercase();
+                mc == clean || clean.ends_with(&format!("/{}", mc)) || mc.ends_with(&format!("/{}", clean))
+            });
+            if !found {
+                return false;
+            }
+        }
+    }
+    if let Some(tier) = acc.plan_tier.as_deref().or(acc.quota_label.as_deref()) {
+        let t = tier.to_ascii_lowercase();
+        if (t == "free" || t.contains("free")) && (clean.contains("pro") || clean.contains("max") || clean.contains("ultra") || clean.contains("opus")) {
+            return false;
+        }
+    }
+    true
+}
+
+pub async fn update_account_subscription(
+    id: &str,
+    plan_tier: Option<String>,
+    allowed_models: Option<Vec<String>>,
+) {
+    let _guard = store_lock().lock().await;
+    let mut list = read_accounts_unlocked();
+    if let Some(acc) = list.iter_mut().find(|a| a.id == id) {
+        if let Some(pt) = plan_tier {
+            if !pt.trim().is_empty() {
+                acc.plan_tier = Some(pt.trim().to_string());
+            }
+        }
+        if let Some(am) = allowed_models {
+            if !am.is_empty() {
+                acc.allowed_models = Some(am);
+            }
+        }
+        let _ = write_accounts_unlocked(&list);
+    }
+}
+
 pub async fn acquire_valid_account(
     client: &reqwest::Client,
     provider: &str,
     excluded_ids: &std::collections::HashSet<String>,
+) -> Result<OAuthAccount, String> {
+    acquire_valid_account_for_model(client, provider, excluded_ids, None).await
+}
+
+pub async fn acquire_valid_account_for_model(
+    client: &reqwest::Client,
+    provider: &str,
+    excluded_ids: &std::collections::HashSet<String>,
+    requested_model: Option<&str>,
 ) -> Result<OAuthAccount, String> {
     let _guard = store_lock().lock().await;
     let mut list = read_accounts_unlocked();
@@ -834,6 +900,7 @@ pub async fn acquire_valid_account(
                 && !excluded_ids.contains(&a.id)
                 && a.cooldown_until_ms.map(|c| c <= now).unwrap_or(true)
                 && !is_quota_exhausted_for_now(a, now)
+                && account_supports_model(a, requested_model)
         })
         .map(|(i, _)| i)
         .collect();
@@ -847,6 +914,7 @@ pub async fn acquire_valid_account(
                     && a.enabled
                     && !excluded_ids.contains(&a.id)
                     && !is_quota_exhausted_for_now(a, now)
+                    && account_supports_model(a, requested_model)
             })
             .map(|(i, _)| i)
             .collect();
@@ -966,6 +1034,8 @@ async fn exchange_code_for_account(
                 quota_weekly_reset_at_ms: None,
                 quota_label: tier_label,
                 quota_updated_at_ms: None,
+                plan_tier: None,
+                allowed_models: None,
             };
             upsert_account(acc).await
         }
@@ -1013,6 +1083,8 @@ async fn exchange_code_for_account(
                 quota_weekly_reset_at_ms: None,
                 quota_label: plan_opt,
                 quota_updated_at_ms: None,
+                plan_tier: None,
+                allowed_models: None,
             };
             upsert_account(acc).await
         }
@@ -1069,6 +1141,8 @@ async fn exchange_code_for_account(
                 quota_weekly_reset_at_ms: None,
                 quota_label: None,
                 quota_updated_at_ms: None,
+                plan_tier: None,
+                allowed_models: None,
             };
             upsert_account(acc).await
         }
@@ -1143,6 +1217,8 @@ async fn exchange_code_for_account(
                 quota_weekly_reset_at_ms: None,
                 quota_label: None,
                 quota_updated_at_ms: None,
+                plan_tier: None,
+                allowed_models: None,
             };
             upsert_account(acc).await
         }
@@ -1652,6 +1728,8 @@ pub async fn import_local_accounts(
                             quota_weekly_reset_at_ms: None,
                             quota_label: None,
                             quota_updated_at_ms: None,
+                            plan_tier: None,
+                            allowed_models: None,
                         };
                         let _ = refresh_account_tokens(&http_client, &mut acc).await;
                         if acc.project_id.is_none() && !acc.access_token.is_empty() {
@@ -1717,6 +1795,8 @@ pub async fn import_local_accounts(
                     quota_weekly_reset_at_ms: None,
                     quota_label: None,
                     quota_updated_at_ms: None,
+                    plan_tier: None,
+                    allowed_models: None,
                 };
                 if !acc.refresh_token.is_empty() {
                     let _ = refresh_account_tokens(&http_client, &mut acc).await;
@@ -1780,6 +1860,8 @@ pub async fn import_local_accounts(
                         quota_weekly_reset_at_ms: None,
                         quota_label: None,
                         quota_updated_at_ms: None,
+                        plan_tier: None,
+                        allowed_models: None,
                     };
                     if let Ok(saved) = upsert_account(acc).await {
                         imported.push(OAuthAccountPublic::from(&saved));
@@ -1818,6 +1900,8 @@ pub async fn import_local_accounts(
                         quota_weekly_reset_at_ms: None,
                         quota_label: plan_opt,
                         quota_updated_at_ms: None,
+                        plan_tier: None,
+                        allowed_models: None,
                     };
                     if let Ok(saved) = upsert_account(acc).await {
                         imported.push(OAuthAccountPublic::from(&saved));
@@ -1839,6 +1923,8 @@ pub async fn fetch_codex_models(client: &reqwest::Client) -> Result<Vec<serde_js
         let mut req = client
             .get("https://chatgpt.com/backend-api/codex/models?client_version=0.153.4")
             .bearer_auth(&acc.access_token)
+            .header("User-Agent", "codex_cli_rs/0.153.4 (Windows NT 10.0; x86_64)")
+            .header("Originator", "codex_cli_rs")
             .header("Accept", "application/json");
         if let Some(ref aid) = acc.account_id {
             if !aid.trim().is_empty() {
@@ -1850,13 +1936,15 @@ pub async fn fetch_codex_models(client: &reqwest::Client) -> Result<Vec<serde_js
                 if let Ok(val) = resp.json::<serde_json::Value>().await {
                     if let Some(arr) = val.get("models").and_then(|m| m.as_array()) {
                         let mut out = Vec::new();
+                        let mut slugs = Vec::new();
                         for m in arr {
                             let id = m.get("slug").or_else(|| m.get("id")).and_then(|v| v.as_str()).unwrap_or("").trim();
                             if id.is_empty() {
                                 continue;
                             }
+                            slugs.push(id.to_string());
                             let name = m.get("display_name").or_else(|| m.get("name")).and_then(|v| v.as_str()).unwrap_or(id);
-                            let ctx = m.get("context_window").or_else(|| m.get("max_context_length")).and_then(|v| v.as_u64()).unwrap_or(400000);
+                            let ctx = m.get("context_window").or_else(|| m.get("max_context_length")).and_then(|v| v.as_u64()).unwrap_or(272000);
                             out.push(serde_json::json!({
                                 "id": id,
                                 "name": name,
@@ -1870,6 +1958,7 @@ pub async fn fetch_codex_models(client: &reqwest::Client) -> Result<Vec<serde_js
                             }));
                         }
                         if !out.is_empty() {
+                            update_account_subscription(&acc.id, acc.plan_tier.clone(), Some(slugs)).await;
                             return Ok(out);
                         }
                     }
@@ -1878,12 +1967,13 @@ pub async fn fetch_codex_models(client: &reqwest::Client) -> Result<Vec<serde_js
         }
     }
     let fallback = [
-        ("gpt-6.1-sol", "GPT-6.1 Sol", 524288u64),
-        ("gpt-6-astra", "GPT-6 Astra", 524288u64),
-        ("gpt-6-sol", "GPT-6 Sol", 524288u64),
-        ("gpt-6.1-terra", "GPT-6.1 Terra", 400000u64),
-        ("gpt-6-luna", "GPT-6 Luna", 272000u64),
-        ("gpt-6-chat-thinking", "GPT-6 Chat Thinking", 272000u64),
+        ("gpt-5.4", "GPT-5.4", 400000u64),
+        ("gpt-5.3-codex", "GPT-5.3 Codex", 400000u64),
+        ("gpt-5.2-codex", "GPT-5.2 Codex", 400000u64),
+        ("gpt-5.1-codex-max", "GPT-5.1 Codex Max", 400000u64),
+        ("gpt-5-codex", "GPT-5 Codex", 272000u64),
+        ("gpt-5", "GPT-5", 272000u64),
+        ("codex-mini-latest", "Codex Mini", 200000u64),
     ];
     Ok(fallback
         .iter()
@@ -2054,6 +2144,8 @@ async fn start_kimi_device_flow(
                     quota_weekly_reset_at_ms: None,
                     quota_label: None,
                     quota_updated_at_ms: None,
+                    plan_tier: None,
+                    allowed_models: None,
                 };
                 if let Ok(saved) = upsert_account(acc).await {
                     let _ = app_clone.emit(
@@ -2174,6 +2266,8 @@ async fn start_xai_device_flow(
                     quota_weekly_reset_at_ms: None,
                     quota_label: None,
                     quota_updated_at_ms: None,
+                    plan_tier: None,
+                    allowed_models: None,
                 };
                 if let Ok(saved) = upsert_account(acc).await {
                     let _ = app_clone.emit(
@@ -2228,6 +2322,8 @@ pub async fn add_manual_token_account(
         quota_weekly_reset_at_ms: None,
         quota_label: None,
         quota_updated_at_ms: None,
+        plan_tier: None,
+        allowed_models: None,
     };
     let saved = upsert_account(acc).await?;
     let pub_acc = OAuthAccountPublic::from(&saved);
