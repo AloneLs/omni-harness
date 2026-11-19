@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 
 pub const NVIDIA_RPM_PER_KEY: f64 = 40.0;
 pub const NVIDIA_REQUEST_INTERVAL: Duration = Duration::from_millis(1550);
-pub const AUTH_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
+pub const AUTH_FAILURE_COOLDOWN: Duration = Duration::from_secs(30);
 pub const TRANSIENT_FAILURE_COOLDOWN: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,6 +351,24 @@ impl KeyPool {
             };
 
             tokio::time::sleep(wait_dur.min(Duration::from_millis(200))).await;
+        }
+    }
+
+    pub async fn clear_auth_blocks(&self, base_url: &str, keys: &[String]) {
+        let scope_name = Self::scope_for_url(base_url);
+        let scope_lock = self.get_or_create_scope(&scope_name);
+        let mut state = scope_lock.lock().await;
+        for raw in keys {
+            for k in Self::parse_api_keys(raw) {
+                let fp = Self::fingerprint(&k);
+                if let Some(entry) = state.keys.get_mut(&fp) {
+                    if entry.block_reason == Some(BlockReason::Auth) {
+                        entry.block_reason = None;
+                        entry.cooldown_until = None;
+                        entry.failure_count = 0;
+                    }
+                }
+            }
         }
     }
 

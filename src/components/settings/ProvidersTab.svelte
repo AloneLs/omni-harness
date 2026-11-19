@@ -4,7 +4,7 @@ import { flip } from 'svelte/animate';
 import { onMount } from 'svelte';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { settingsStore, type ApiProtocol, type DetectedModelInfo, type ProviderConfig } from '../../lib/stores/settings.svelte';
+import { settingsStore, groupProviderModels, isNonReasoningModelId, type ApiProtocol, type DetectedModelInfo, type ProviderConfig, type ReasoningLevel } from '../../lib/stores/settings.svelte';
 import Icon from '../Icon.svelte';
 
 let showForm = $state(false);
@@ -49,6 +49,18 @@ interface OAuthAccountItem {
 }
 
 const OAUTH_PROTOCOLS = ['antigravity', 'openai_codex', 'claude_oauth', 'kimi_oauth', 'xai_oauth', 'zcode_oauth', 'perplexity_oauth'] as const;
+
+function isOAuthProvider(protocol?: string): boolean {
+  return Boolean(protocol && OAUTH_PROTOCOLS.includes(protocol as any) && protocol !== 'perplexity_oauth');
+}
+
+const SHORT_REASONING_LABELS: Record<ReasoningLevel, string> = {
+  OFF: 'OFF',
+  LOW: 'LOW',
+  MEDIUM: 'MED',
+  HIGH: 'HIGH',
+  MAX: 'MAX'
+};
 
 const OAUTH_PROVIDERS = [
   { id: 'antigravity', title: 'Antigravity (Google)', subtitle: 'Gemini, Claude & GPT-OSS via Google OAuth', kind: 'oauth' },
@@ -456,6 +468,7 @@ async function deleteOAuthAcc(acc: OAuthAccountItem) {
 }
 
 let providersList = $derived(Object.values(settingsStore.data.providers));
+let regularProvidersList = $derived(providersList.filter((p) => !OAUTH_PROTOCOLS.includes((p.apiProtocol || '') as any)));
 
 let filteredFetchedModels = $derived.by(() => {
   const q = modelSearch.trim().toLowerCase();
@@ -855,6 +868,7 @@ function handleSaveProvider(e: Event) {
       {@const accs = oauthAccounts.filter((a) => a.provider === op.id)}
       {@const agg = aggregateLiveQuota(accs)}
       {@const provTiers = summarizeProviderTiers(accs)}
+      {@const linkedProv = providersList.find((p) => p.apiProtocol === op.id)}
       <div class="px-3.5 py-2.5 space-y-2">
         <div class="flex items-center justify-between gap-3">
           <div class="flex items-center gap-2.5 min-w-0">
@@ -1020,6 +1034,106 @@ function handleSaveProvider(e: Event) {
               </div>
             {/each}
           </div>
+        {/if}
+
+        {#if linkedProv}
+          {#if showForm && editingId === linkedProv.id}
+            <div class="pt-2">
+              {@render providerForm()}
+            </div>
+          {:else}
+            <div class="pt-2 border-t border-white/[0.06] space-y-1.5">
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-[10.5px] text-[#73737A]">Enabled Models ({groupProviderModels(linkedProv.availableModels).length})</span>
+                <div class="flex items-center gap-1">
+                  <button
+                    type="button"
+                    class="p-1 rounded-[5px] text-[#73737A] hover:text-[#EDEDEF] hover:bg-white/[0.06] transition-colors"
+                    onclick={() => openEditForm(linkedProv)}
+                    title="Edit models"
+                  >
+                    <Icon name="edit" class="w-3 h-3" strokeWidth={1.6} />
+                  </button>
+                  <button
+                    type="button"
+                    class="p-1 rounded-[5px] text-[#73737A] hover:text-[#EF4444] hover:bg-white/[0.06] transition-colors"
+                    onclick={() => settingsStore.removeProvider(linkedProv.id)}
+                    title="Remove synced provider"
+                  >
+                    <Icon name="trash" class="w-3 h-3" strokeWidth={1.6} />
+                  </button>
+                </div>
+              </div>
+              <div class="flex flex-wrap gap-1.5">
+                {#each groupProviderModels(linkedProv.availableModels) as grp (grp.displayId)}
+                  {@const probeId = grp.rawIds[0]}
+                  {@const cap = linkedProv.modelCapabilities?.[probeId]}
+                  {@const tStatus = modelTestStatus[`${linkedProv.id}:${probeId}`]}
+                  {@const variantLevels = (['OFF', 'LOW', 'MEDIUM', 'HIGH', 'MAX'] as ReasoningLevel[]).filter((l) => Boolean(grp.reasoningVariants[l]))}
+                  <div class="flex items-center rounded-[6px] border bg-[#121214] text-[#D4D4D8] border-white/[0.08]">
+                    <button
+                      type="button"
+                      class="pl-2 pr-0.5 py-1 flex items-center justify-center transition-colors"
+                      onclick={() => testModel(linkedProv, probeId)}
+                      title={tStatus?.state === 'ok' ? `Available (${tStatus.latencyMs}ms)` : tStatus?.state === 'err' ? `Unavailable: ${tStatus.error || 'Error'}` : 'Test model availability'}
+                    >
+                      <span class="w-2 h-2 rounded-full transition-colors {tStatus?.state === 'ok' ? 'bg-[#4ADE80]' : tStatus?.state === 'err' ? 'bg-[#F87171]' : tStatus?.state === 'testing' ? 'bg-[#EDEDEF] animate-pulse' : 'bg-[#52525B] hover:bg-[#A3A3AA]'}"></span>
+                    </button>
+                    <div class="pl-1.5 pr-2 py-1 font-mono text-[11px] flex items-center gap-1.5">
+                      <span>{grp.displayId}</span>
+                      {#if cap}
+                        <span class="text-[9.5px] text-[#73737A]">{formatCtx(cap.contextWindow)}</span>
+                        {#if variantLevels.length > 0}
+                          <span class="text-[9.5px] text-[#8E8E95]">{variantLevels.map((l) => SHORT_REASONING_LABELS[l]).join('·')}</span>
+                        {:else if cap.supportsReasoning && !isNonReasoningModelId(probeId)}
+                          <span class="text-[9.5px] text-[#8E8E95]">Reasoning</span>
+                        {/if}
+                        {#if cap.supportsVision}
+                          <span class="text-[9.5px] text-[#8E8E95]">Vision</span>
+                        {/if}
+                      {:else if variantLevels.length > 0}
+                        <span class="text-[9.5px] text-[#8E8E95]">{variantLevels.map((l) => SHORT_REASONING_LABELS[l]).join('·')}</span>
+                      {/if}
+                    </div>
+                    <button
+                      type="button"
+                      class="pr-2 pl-1 text-xs text-[#73737A] hover:text-[#EF4444] transition-colors"
+                      onclick={() => {
+                        for (const rawId of grp.rawIds) {
+                          settingsStore.removeModelFromProvider(linkedProv.id, rawId);
+                        }
+                      }}
+                      title="Remove model"
+                    >
+                      ×
+                    </button>
+                  </div>
+                {/each}
+              </div>
+              <div class="flex items-center gap-1.5 pt-0.5">
+                <input
+                  type="text"
+                  bind:value={cardModelInputs[linkedProv.id]}
+                  placeholder="Add model ID..."
+                  class="flex-1 px-2.5 py-1 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#55555C] outline-none"
+                  onkeydown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      addCustomModelToExisting(linkedProv.id);
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  class="w-7 h-7 rounded-[6px] bg-[#121214] hover:bg-[#EDEDEF] hover:text-[#111113] border border-white/[0.08] flex items-center justify-center text-sm text-[#D4D4D8] shrink-0 active:scale-[0.95] transition-all"
+                  onclick={() => addCustomModelToExisting(linkedProv.id)}
+                  title="Add model"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+          {/if}
         {/if}
       </div>
     {/each}
@@ -1313,7 +1427,7 @@ function handleSaveProvider(e: Event) {
     <div transition:slide={{ duration: 180 }}>
       {@render providerForm()}
     </div>
-  {:else if providersList.length === 0}
+  {:else if regularProvidersList.length === 0 && oauthAccounts.length === 0 && providersList.length === 0}
     <div
       transition:slide={{ duration: 180 }}
       class="p-10 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] text-center space-y-3"
@@ -1332,9 +1446,9 @@ function handleSaveProvider(e: Event) {
     </div>
   {/if}
 
-  {#if providersList.length > 0}
+  {#if regularProvidersList.length > 0}
     <div class="space-y-3">
-      {#each providersList as prov (prov.id)}
+      {#each regularProvidersList as prov (prov.id)}
         {#if showForm && editingId === prov.id}
           <div transition:slide={{ duration: 180 }}>
             {@render providerForm()}
@@ -1369,23 +1483,27 @@ function handleSaveProvider(e: Event) {
           </div>
 
           <div class="space-y-2.5 pt-1">
-            <label class="block space-y-1">
-              <span class="text-[11px] text-[#73737A]">API Key</span>
-              <input
-                type="password"
-                value={prov.apiKey}
-                oninput={(e) => settingsStore.setApiKey(prov.id, (e.currentTarget as HTMLInputElement).value)}
-                placeholder="Enter API key"
-                class="w-full px-3 py-1.5 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] outline-none"
-              />
-            </label>
+            {#if !isOAuthProvider(prov.apiProtocol)}
+              <label class="block space-y-1">
+                <span class="text-[11px] text-[#73737A]">API Key</span>
+                <input
+                  type="password"
+                  value={prov.apiKey}
+                  oninput={(e) => settingsStore.setApiKey(prov.id, (e.currentTarget as HTMLInputElement).value)}
+                  placeholder="Enter API key"
+                  class="w-full px-3 py-1.5 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] outline-none"
+                />
+              </label>
+            {/if}
 
             <div class="space-y-1.5">
               <span class="text-[11px] text-[#73737A] block">Enabled Models</span>
               <div class="flex flex-wrap gap-1.5">
-                {#each prov.availableModels as m (m)}
-                  {@const cap = prov.modelCapabilities?.[m]}
-                  {@const tStatus = modelTestStatus[`${prov.id}:${m}`]}
+                {#each groupProviderModels(prov.availableModels) as grp (grp.displayId)}
+                  {@const probeId = grp.rawIds[0]}
+                  {@const cap = prov.modelCapabilities?.[probeId]}
+                  {@const tStatus = modelTestStatus[`${prov.id}:${probeId}`]}
+                  {@const variantLevels = (['OFF', 'LOW', 'MEDIUM', 'HIGH', 'MAX'] as ReasoningLevel[]).filter((l) => Boolean(grp.reasoningVariants[l]))}
                   <div
                     animate:flip={{ duration: 160 }}
                     in:scale={{ start: 0.9, duration: 150 }}
@@ -1394,7 +1512,7 @@ function handleSaveProvider(e: Event) {
                     <button
                       type="button"
                       class="pl-2 pr-0.5 py-1 flex items-center justify-center transition-colors"
-                      onclick={() => testModel(prov, m)}
+                      onclick={() => testModel(prov, probeId)}
                       title={tStatus?.state === 'ok' ? `Available (${tStatus.latencyMs}ms)` : tStatus?.state === 'err' ? `Unavailable: ${tStatus.error || 'Error'}` : 'Test model availability'}
                     >
                       <span
@@ -1402,21 +1520,29 @@ function handleSaveProvider(e: Event) {
                       ></span>
                     </button>
                     <div class="pl-1.5 pr-2 py-1 font-mono text-[11px] flex items-center gap-1.5">
-                      <span>{m}</span>
+                      <span>{grp.displayId}</span>
                       {#if cap}
                         <span class="text-[9.5px] text-[#73737A]">{formatCtx(cap.contextWindow)}</span>
-                        {#if cap.supportsReasoning}
+                        {#if variantLevels.length > 0}
+                          <span class="text-[9.5px] text-[#8E8E95]">{variantLevels.map((l) => SHORT_REASONING_LABELS[l]).join('·')}</span>
+                        {:else if cap.supportsReasoning && !isNonReasoningModelId(probeId)}
                           <span class="text-[9.5px] text-[#8E8E95]">Reasoning</span>
                         {/if}
                         {#if cap.supportsVision}
                           <span class="text-[9.5px] text-[#8E8E95]">Vision</span>
                         {/if}
+                      {:else if variantLevels.length > 0}
+                        <span class="text-[9.5px] text-[#8E8E95]">{variantLevels.map((l) => SHORT_REASONING_LABELS[l]).join('·')}</span>
                       {/if}
                     </div>
                     <button
                       type="button"
                       class="pr-2 pl-1 text-xs text-[#73737A] hover:text-[#EF4444] transition-colors"
-                      onclick={() => settingsStore.removeModelFromProvider(prov.id, m)}
+                      onclick={() => {
+                        for (const rawId of grp.rawIds) {
+                          settingsStore.removeModelFromProvider(prov.id, rawId);
+                        }
+                      }}
                       title="Remove model"
                     >
                       ×

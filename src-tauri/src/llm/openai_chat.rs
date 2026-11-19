@@ -513,9 +513,17 @@ pub async fn stream_openai_chat(
                     message: error_body,
                 });
             }
+            let pool_sz = key_pool.pool_size(provider_name);
+            let reason = if pool_sz > 1 {
+                format!("HTTP {} - rotating key", status)
+            } else if is_rl {
+                "Rate limited (429), retrying...".to_string()
+            } else {
+                format!("HTTP {}, retrying...", code)
+            };
             let _ = sender
                 .send(StreamEvent::RetryNotice {
-                    reason: format!("HTTP {} - rotating key", status),
+                    reason,
                     attempt,
                     model: request.model.clone(),
                 })

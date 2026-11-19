@@ -136,7 +136,7 @@ export function renderMarkdown(content: string): string {
 
   text = text.replace(/<div class="interactive-viz-mount[^>]*><\/div>/g, (m) => hold(m));
 
-  text = text.replace(/^```([a-zA-Z0-9_+\-.]*)[ \t]*\n([\s\S]*?)^```[ \t]*$/gm, (_, rawLang, code) => {
+  const renderCodeBlockHtml = (rawLang: string, code: string): string => {
     const lang = (rawLang || '').trim().toLowerCase() || 'text';
     const trimmedCode = code.replace(/\n$/, '');
     const codeId = `code-${Math.random().toString(36).substring(2, 9)}`;
@@ -170,7 +170,14 @@ export function renderMarkdown(content: string): string {
         </div>
       </div>
     `.trim());
-  });
+  };
+
+  text = text.replace(/^```([a-zA-Z0-9_+\-.]*)[ \t]*\n([\s\S]*?)^```[ \t]*$/gm, (_, rawLang, code) =>
+    renderCodeBlockHtml(rawLang, code)
+  );
+  text = text.replace(/```([a-zA-Z0-9_+\-.]+)[ \t]+([^\n]+?)```/g, (_, rawLang, code) =>
+    renderCodeBlockHtml(rawLang, code)
+  );
 
   text = text.replace(/`([^`\n]+)`/g, (_, code) => {
     return hold(`<code class="px-1.5 py-0.5 rounded-[4px] text-[12px] font-mono bg-white/[0.07] text-[#E5E5E8]">${escapeHtml(code)}</code>`);

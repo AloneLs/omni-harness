@@ -135,8 +135,73 @@ let parsedMarkdown = $derived.by(() => {
   return { html, vizBlocks };
 });
 
+const EDIT_SLASH_COMMANDS = [
+  { cmd: '/goal', desc: 'Autonomous completion loop (/goal <cond>, status, clear)' },
+  { cmd: '/plan', desc: 'Generate engineering execution plan' },
+  { cmd: '/compact', desc: 'Compact message context history' },
+  { cmd: '/clear', desc: 'Clear messages in active session' },
+  { cmd: '/rollback', desc: 'Rollback modified files to last snapshot' },
+  { cmd: '/model', desc: 'Switch primary language model' },
+  { cmd: '/reasoning', desc: 'Adjust deep reasoning level' },
+  { cmd: '/export', desc: 'Export session as Markdown' }
+];
+let editSlashOpen = $state(false);
+let editSlashFilter = $state('');
+let editSlashIdx = $state(0);
+
+let filteredEditSlash = $derived.by(() => {
+  const q = editSlashFilter.toLowerCase();
+  return EDIT_SLASH_COMMANDS.filter((c) => c.cmd.toLowerCase().includes(q) || c.desc.toLowerCase().includes(q));
+});
+
+function handleEditInput() {
+  const m = editText.match(/^(\/[^\s]*)$/);
+  if (m) {
+    editSlashOpen = true;
+    editSlashFilter = m[1];
+    editSlashIdx = 0;
+  } else {
+    editSlashOpen = false;
+  }
+}
+
+function applyEditSlash(cmd: string) {
+  editText = `${cmd} `;
+  editSlashOpen = false;
+}
+
+function handleEditKeydown(e: KeyboardEvent) {
+  if (editSlashOpen && filteredEditSlash.length > 0) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      editSlashIdx = (editSlashIdx + 1) % filteredEditSlash.length;
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      editSlashIdx = (editSlashIdx - 1 + filteredEditSlash.length) % filteredEditSlash.length;
+      return;
+    }
+    if (e.key === 'Tab' || e.key === 'Enter') {
+      e.preventDefault();
+      applyEditSlash(filteredEditSlash[editSlashIdx].cmd);
+      return;
+    }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      editSlashOpen = false;
+      return;
+    }
+  }
+  if (e.key === 'Enter' && !e.shiftKey && !editSlashOpen) {
+    e.preventDefault();
+    saveEditing();
+  }
+}
+
 function startEditing() {
   editText = message.content;
+  editSlashOpen = false;
   isEditing = true;
 }
 
@@ -284,9 +349,25 @@ function handleContainerClick(event: MouseEvent) {
   {:else if message.role === 'user'}
     <div data-omni-message="user" class="flex flex-col items-end">
       {#if isEditing}
-        <div class="w-full max-w-[85%] space-y-2.5 p-3.5 rounded-[8px] border border-white/[0.1] bg-[#1C1C1F]">
+        <div class="w-full max-w-[85%] space-y-2.5 p-3.5 rounded-[8px] border border-white/[0.1] bg-[#1C1C1F] relative">
+          {#if editSlashOpen && filteredEditSlash.length > 0}
+            <div class="mb-2 rounded-[6px] bg-[#141417] border border-white/[0.08] p-1 max-h-44 overflow-y-auto divide-y divide-white/[0.04]">
+              {#each filteredEditSlash as item, idx}
+                <button
+                  type="button"
+                  onclick={() => applyEditSlash(item.cmd)}
+                  class="w-full px-2.5 py-1.5 text-left rounded-[4px] flex items-center justify-between gap-2 text-xs transition-colors {idx === editSlashIdx ? 'bg-white/[0.08] text-[#F5F5F7]' : 'text-[#A3A3AA] hover:bg-white/[0.04]'}"
+                >
+                  <span class="font-mono text-[#E5E5E8]">{item.cmd}</span>
+                  <span class="text-[11px] text-[#66666D] truncate">{item.desc}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
           <textarea
             bind:value={editText}
+            oninput={handleEditInput}
+            onkeydown={handleEditKeydown}
             rows="3"
             class="w-full bg-[#121214] border border-white/[0.08] rounded-[6px] p-2.5 text-[13px] text-[#EDEDEF] outline-none resize-none"
           ></textarea>

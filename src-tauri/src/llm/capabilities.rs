@@ -193,11 +193,12 @@ impl ModelCapabilities {
         }
 
         if short.contains("gemini") {
-            let is_thinking = short.contains("2.5")
+            let is_image = short.contains("-image") || short.ends_with("image");
+            let is_thinking = !is_image && (short.contains("2.5")
                 || short.contains("gemini-3")
                 || short.contains("gemini-4")
                 || short.contains("thinking")
-                || short.contains("argon");
+                || short.contains("argon"));
             return Self {
                 model_id: model_name.to_string(),
                 family: ModelFamily::GoogleGemini,

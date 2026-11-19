@@ -186,6 +186,11 @@ impl TelegramMenuBuilder {
         if !nav.is_empty() {
             rows.push(nav);
         }
+        rows.push(vec![
+            InlineKeyboardButton::callback("➕ Провайдер", "tg:prov-add"),
+            InlineKeyboardButton::callback("✏️ Изменить", "tg:prov-edit"),
+            InlineKeyboardButton::callback("➕ Модель", "tg:model-add"),
+        ]);
         rows.push(vec![InlineKeyboardButton::callback("⬅️ Назад", "tg:cmd:settings")]);
         InlineKeyboardMarkup {
             inline_keyboard: rows,

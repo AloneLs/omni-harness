@@ -791,6 +791,8 @@ impl SingleAgentRunner {
         let mut reactive_compact_count: u32 = 0;
         let mut empty_retries: u32 = 0;
         let mut turn_seq: i64 = 0;
+        crate::engine::policy_guard::audit_event(chat_id, "turn_started", "");
+        crate::engine::policy_guard::audit_event(chat_id, "user_message_received", "");
 
         let _ = state.transition(TaskStateEnum::Executing);
 
@@ -986,9 +988,16 @@ impl SingleAgentRunner {
 
             let max_attempts: u32 = 5;
             let mut attempt: u32 = 0;
+            let mut policy_retries: u32 = 0;
+            const MAX_POLICY_RETRIES: u32 = 3;
 
             loop {
                 attempt += 1;
+                crate::engine::policy_guard::audit_event(
+                    chat_id,
+                    "model_requested",
+                    &format!("step={} retry={}", turn_seq, policy_retries),
+                );
                 last_request_ts = Some(chrono::Utc::now().timestamp());
                 let (stream_tx, mut stream_rx) = mpsc::channel(64);
                 let client = http_client.clone();
@@ -1074,8 +1083,98 @@ impl SingleAgentRunner {
                     (Ok(()), None) => Ok(()),
                 };
 
+                let policy_hit = crate::engine::policy_guard::detect_filter_signature(&assistant_text)
+                    .or_else(|| {
+                        stream_res
+                            .as_ref()
+                            .err()
+                            .and_then(|e| crate::engine::policy_guard::detect_filter_signature(e))
+                    })
+                    .or_else(|| {
+                        crate::engine::policy_guard::detect_thinking_refusal(
+                            &assistant_reasoning,
+                            !active_tool_calls.is_empty(),
+                        )
+                    });
+
+                if let Some(pm) = policy_hit {
+                    crate::engine::policy_guard::audit_event(
+                        chat_id,
+                        "policy_violation_detected",
+                        &format!("step={} signature={} hash={}", turn_seq, pm.category, pm.sig_hash),
+                    );
+                    crate::engine::policy_guard::audit_event(
+                        chat_id,
+                        "step_excluded_from_projection",
+                        &format!("step={}", turn_seq),
+                    );
+                    let _ = event_sender.send(StreamEvent::TurnBufferReset).await;
+
+                    if policy_retries < MAX_POLICY_RETRIES {
+                        policy_retries += 1;
+                        if let Some(last_user) = history.iter_mut().rev().find(|m| m.role == "user") {
+                            let raw_txt = last_user.content.as_text_lossy();
+                            if !raw_txt.trim_start().starts_with("artifact://sha256:") && !raw_txt.trim().is_empty() {
+                                if let Ok(art) = crate::engine::policy_guard::ArtifactStore::save_text_artifact(&raw_txt) {
+                                    crate::engine::policy_guard::audit_event(
+                                        chat_id,
+                                        "artifact_created",
+                                        &format!("sha256:{}", &art.hash[..16]),
+                                    );
+                                    let ref_prompt = crate::engine::policy_guard::ArtifactStore::format_prompt_ref(&art);
+                                    crate::engine::policy_guard::audit_event(
+                                        chat_id,
+                                        "prompt_assembled",
+                                        &format!("artifact://sha256:{}", &art.hash[..16]),
+                                    );
+                                    last_user.content = MessageContent::Text(ref_prompt);
+                                    let (rebuilt_proj, _) = ContextBuilder::build_projection(
+                                        history,
+                                        workspace_root,
+                                        contract.as_ref(),
+                                        caps.context_window,
+                                        last_request_ts,
+                                        preserve_past_reasoning,
+                                        &mut compaction_cursor,
+                                        true,
+                                    );
+                                    chat_req.messages = rebuilt_proj;
+                                }
+                            }
+                        }
+                        crate::engine::policy_guard::audit_event(
+                            chat_id,
+                            "retry_scheduled",
+                            &format!("anchor_step={} retry={}", turn_seq.saturating_sub(1), policy_retries),
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(600 * policy_retries as u64)).await;
+                        attempt = 0;
+                        continue;
+                    }
+
+                    crate::engine::policy_guard::audit_event(
+                        chat_id,
+                        "turn_failed",
+                        &format!("step={} reason={} hash={}", turn_seq, pm.category, pm.sig_hash),
+                    );
+                    Self::save_checkpoint(db, chat_id, history);
+                    let err_out = match stream_res {
+                        Err(e) if !e.trim().is_empty() => format!("Запрос заблокирован фильтром ({}): {}", pm.category, e),
+                        _ => format!("Запрос заблокирован фильтром модели ({}) после {} попыток.", pm.category, MAX_POLICY_RETRIES),
+                    };
+                    let _ = event_sender.send(StreamEvent::Error { error: err_out.clone() }).await;
+                    return Err(err_out);
+                }
+
                 match stream_res {
-                    Ok(()) => break,
+                    Ok(()) => {
+                        crate::engine::policy_guard::audit_event(
+                            chat_id,
+                            "turn_committed",
+                            &format!("step={}", turn_seq),
+                        );
+                        break;
+                    }
                     Err(err_msg) => {
                         let lower = err_msg.to_lowercase();
                         let is_ctx_overflow = lower.contains("context_length_exceeded")
@@ -1422,21 +1521,21 @@ impl SingleAgentRunner {
                 let mut batch_res = Vec::with_capacity(active_tool_calls.len());
                 while let Some(joined) = join_set.join_next().await {
                     if let Ok(item) = joined {
+                        let _ = event_sender
+                            .send(StreamEvent::ToolExecEnd {
+                                id: item.1.clone(),
+                                success: item.4,
+                                output: item.5.clone(),
+                                error: item.6.clone(),
+                                elapsed_ms: item.3,
+                            })
+                            .await;
                         batch_res.push(item);
                     }
                 }
                 batch_res.sort_by_key(|r| r.0);
 
-                for (_idx, tc_id, tc_name, elapsed_ms, ok, bounded_output, err_opt, _ws) in batch_res {
-                    let _ = event_sender
-                        .send(StreamEvent::ToolExecEnd {
-                            id: tc_id.clone(),
-                            success: ok,
-                            output: bounded_output.clone(),
-                            error: err_opt,
-                            elapsed_ms,
-                        })
-                        .await;
+                for (_idx, tc_id, tc_name, _elapsed_ms, _ok, bounded_output, _err_opt, _ws) in batch_res {
                     history.push(ChatMessage {
                         role: "tool".to_string(),
                         content: MessageContent::Text(bounded_output),
@@ -1547,6 +1646,15 @@ impl SingleAgentRunner {
                     continue;
                 }
 
+                if tool_name == "wait" {
+                    if let Some(wmsg) = parsed_args.get("message").and_then(|v| v.as_str()).filter(|m| !m.trim().is_empty()) {
+                        let _ = event_sender
+                            .send(StreamEvent::ContentDelta {
+                                delta: format!("\n{}\n", wmsg.trim()),
+                            })
+                            .await;
+                    }
+                }
                 if tool_name == "task_board" {
                     let tool_started = std::time::Instant::now();
                     let (out_val, items_arr) = Self::handle_task_board(&parsed_args, contract);

@@ -1346,6 +1346,13 @@ async fn ensure_active_chat(
     Ok(chat_id)
 }
 
+
+static TG_PENDING_INPUT: std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashMap<i64, String>>> = std::sync::OnceLock::new();
+
+fn tg_pending_input_map() -> &'static tokio::sync::Mutex<std::collections::HashMap<i64, String>> {
+    TG_PENDING_INPUT.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 async fn emit_chat_updated(ctx: &TelegramRuntimeContext, chat_id: &str) {
     if let Some(app) = ctx.app_handle.read().await.as_ref() {
         let _ = app.emit("telegram-chat-updated", json!({ "chatId": chat_id }));
@@ -1833,6 +1840,124 @@ async fn handle_authorized_message(
     let cmd = raw_cmd.split('@').next().unwrap_or(raw_cmd).to_ascii_lowercase();
     let arg = parts.next().unwrap_or("").trim();
 
+    if !cmd.starts_with('/') && !text.trim().is_empty() {
+        let pending_action = {
+            let mut m = tg_pending_input_map().lock().await;
+            m.remove(&tg_chat_id)
+        };
+        if let Some(act) = pending_action {
+            let raw = text.trim();
+            match act.as_str() {
+                "prov_add" => {
+                    let segs: Vec<&str> = raw.split('|').map(|x| x.trim()).collect();
+                    if segs.len() < 3 || segs[0].is_empty() || segs[1].is_empty() {
+                        let _ = tg_client.send_html(tg_chat_id, "Неверный формат. Используйте: <code>Название | BaseURL | API_Key | Protocol</code>", None).await;
+                        return;
+                    }
+                    let pid = format!("tg-prov-{}", uuid::Uuid::new_v4().simple());
+                    let proto = segs.get(3).copied().filter(|x| !x.is_empty()).unwrap_or("auto").to_string();
+                    let new_prov = SyncedProviderConfig {
+                        id: pid.clone(),
+                        name: segs[0].to_string(),
+                        base_url: segs[1].to_string(),
+                        api_key: segs[2].to_string(),
+                        api_protocol: Some(proto),
+                        proxy_enabled: Some(false),
+                        proxy_url: None,
+                        default_model: String::new(),
+                        available_models: Vec::new(),
+                        model_capabilities: None,
+                        enabled: true,
+                    };
+                    {
+                        let mut snap = providers_snap.write().await;
+                        snap.providers.push(new_prov.clone());
+                        snap.active_provider = pid.clone();
+                    }
+                    if let Some(app) = ctx.app_handle.read().await.as_ref() {
+                        let _ = app.emit("telegram-providers-updated", serde_json::json!({ "action": "add_provider", "provider": new_prov }));
+                    }
+                    let _ = tg_client.send_html(tg_chat_id, &format!("Провайдер <b>{}</b> добавлен и выбран. Теперь добавьте модель через меню Провайдеры -> ➕ Модель.", escape_html(segs[0])), None).await;
+                    return;
+                }
+                "prov_edit" => {
+                    let active_pid = {
+                        let sess_pid = sessions.read().await.get(&tg_chat_id).and_then(|s| s.provider_id.clone());
+                        let snap = providers_snap.read().await;
+                        sess_pid.unwrap_or_else(|| snap.active_provider.clone())
+                    };
+                    let segs: Vec<&str> = raw.split('|').map(|x| x.trim()).collect();
+                    let mut updated_item: Option<SyncedProviderConfig> = None;
+                    {
+                        let mut snap = providers_snap.write().await;
+                        if let Some(prov) = snap.providers.iter_mut().find(|p| p.id == active_pid) {
+                            if segs.len() >= 2 {
+                                if !segs[0].is_empty() { prov.base_url = segs[0].to_string(); }
+                                if !segs[1].is_empty() { prov.api_key = segs[1].to_string(); }
+                            } else {
+                                prov.api_key = raw.to_string();
+                            }
+                            updated_item = Some(prov.clone());
+                        }
+                    }
+                    if let Some(up) = updated_item {
+                        if let Some(app) = ctx.app_handle.read().await.as_ref() {
+                            let _ = app.emit("telegram-providers-updated", serde_json::json!({ "action": "edit_provider", "provider": up }));
+                        }
+                        let _ = tg_client.send_html(tg_chat_id, &format!("Провайдер <b>{}</b> обновлён.", escape_html(&up.name)), None).await;
+                    } else {
+                        let _ = tg_client.send_html(tg_chat_id, "Активный провайдер не найден.", None).await;
+                    }
+                    return;
+                }
+                "model_add" => {
+                    let active_pid = {
+                        let sess_pid = sessions.read().await.get(&tg_chat_id).and_then(|s| s.provider_id.clone());
+                        let snap = providers_snap.read().await;
+                        sess_pid.unwrap_or_else(|| snap.active_provider.clone())
+                    };
+                    let new_models: Vec<String> = raw.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect();
+                    if new_models.is_empty() {
+                        let _ = tg_client.send_html(tg_chat_id, "Пустой список моделей.", None).await;
+                        return;
+                    }
+                    let mut first_added = String::new();
+                    {
+                        let mut snap = providers_snap.write().await;
+                        if let Some(prov) = snap.providers.iter_mut().find(|p| p.id == active_pid) {
+                            for m in &new_models {
+                                if !prov.available_models.contains(m) {
+                                    prov.available_models.push(m.clone());
+                                }
+                            }
+                            first_added = new_models[0].clone();
+                            if prov.default_model.is_empty() {
+                                prov.default_model = first_added.clone();
+                            }
+                            snap.active_model = first_added.clone();
+                        }
+                    }
+                    if !first_added.is_empty() {
+                        {
+                            let mut map = sessions.write().await;
+                            let entry = map.entry(tg_chat_id).or_default();
+                            entry.provider_id = Some(active_pid.clone());
+                            entry.model_id = Some(first_added.clone());
+                        }
+                        if let Some(app) = ctx.app_handle.read().await.as_ref() {
+                            let _ = app.emit("telegram-providers-updated", serde_json::json!({ "action": "add_models", "providerId": active_pid, "models": new_models }));
+                        }
+                        let _ = tg_client.send_html(tg_chat_id, &format!("Добавлены модели: <code>{}</code>", escape_html(&new_models.join(", "))), None).await;
+                    } else {
+                        let _ = tg_client.send_html(tg_chat_id, "Активный провайдер не найден.", None).await;
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     let pending_rename = sessions
         .read()
         .await
@@ -2223,6 +2348,36 @@ async fn handle_callback_query(
                 Some(msg_id),
             )
             .await;
+        }
+        "tg:prov-add" => {
+            tg_pending_input_map().lock().await.insert(tg_chat_id, "prov_add".to_string());
+            send_or_edit(
+                tg_client,
+                tg_chat_id,
+                Some(msg_id),
+                "Отправьте новым сообщением данные провайдера в формате:\n<code>Название | BaseURL | API_Key | Protocol</code>\n<i>Protocol опционально (auto, chat_completions, responses, anthropic_messages, google_gemini)</i>",
+                None,
+            ).await;
+        }
+        "tg:prov-edit" => {
+            tg_pending_input_map().lock().await.insert(tg_chat_id, "prov_edit".to_string());
+            send_or_edit(
+                tg_client,
+                tg_chat_id,
+                Some(msg_id),
+                "Отправьте новым сообщением для активного провайдера:\n<code>BaseURL | API_Key</code> или только новый <code>API_Key</code>",
+                None,
+            ).await;
+        }
+        "tg:model-add" => {
+            tg_pending_input_map().lock().await.insert(tg_chat_id, "model_add".to_string());
+            send_or_edit(
+                tg_client,
+                tg_chat_id,
+                Some(msg_id),
+                "Отправьте ID модели (или несколько через запятую) для добавления в активный провайдер:",
+                None,
+            ).await;
         }
         "tg:cmd:settings" => {
             let (html, _, _) =

@@ -16,6 +16,16 @@ let { onOpenSettings, onToggleSidebar }: {
   onToggleSidebar?: () => void;
 } = $props();
 
+let projCtxMenu = $state<{ open: boolean; x: number; y: number; path: string } | null>(null);
+
+function openProjCtxMenu(e: MouseEvent, path: string) {
+  e.preventDefault();
+  e.stopPropagation();
+  const x = Math.min(e.clientX, Math.max(8, window.innerWidth - 196));
+  const y = Math.min(e.clientY, Math.max(8, window.innerHeight - 180));
+  projCtxMenu = { open: true, x, y, path };
+}
+
 let editingChatId = $state<string | null>(null);
 let editTitleText = $state('');
 let showSearchInput = $state(false);
@@ -296,7 +306,11 @@ function formatRelativeAge(timestamp: number): string {
           {@const projName = projPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || projPath}
           {@const thisProjChats = projectChatsByNorm.get(normProj(projPath)) || []}
           <div class="mb-2">
-            <div class="group/proj flex items-center gap-1 mb-0.5 rounded-[4px] hover:bg-white/[0.04] transition-colors pr-1">
+            <div
+              class="group/proj flex items-center gap-1 mb-0.5 rounded-[4px] hover:bg-white/[0.04] transition-colors pr-1"
+              oncontextmenu={(e) => openProjCtxMenu(e, projPath)}
+              role="presentation"
+            >
               <button
                 type="button"
                 class="flex-1 min-w-0 px-2 py-1.5 flex items-center gap-2 text-left {normProj(workspaceStore.currentPath) === normProj(projPath) ? 'text-[#EDEDEF]' : 'text-[#A3A3AA] hover:text-white'} transition-colors"
@@ -515,3 +529,55 @@ function formatRelativeAge(timestamp: number): string {
     </button>
   </div>
 </aside>
+
+
+<svelte:window onclick={() => { if (projCtxMenu?.open) projCtxMenu = null; }} />
+
+{#if projCtxMenu?.open}
+  <div
+    data-omni-context-menu=""
+    role="menu"
+    tabindex="-1"
+    onclick={(e) => e.stopPropagation()}
+    onkeydown={(e) => { if (e.key === 'Escape') projCtxMenu = null; }}
+    class="fixed z-[910] w-[192px] py-1 rounded-[8px] bg-[#161618]/98 backdrop-blur-md border border-white/[0.1] shadow-2xl text-xs text-[#E5E5E8] select-none"
+    style="left: {projCtxMenu.x}px; top: {projCtxMenu.y}px;"
+  >
+    <button
+      type="button"
+      onclick={() => { if (projCtxMenu) workspaceStore.setWorkspaceDir(projCtxMenu.path); projCtxMenu = null; }}
+      class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07]"
+    >
+      Выбрать проект
+    </button>
+    <button
+      type="button"
+      onclick={() => { if (projCtxMenu) { workspaceStore.setWorkspaceDir(projCtxMenu.path); chatStore.createSession('New task', projCtxMenu.path); } projCtxMenu = null; }}
+      class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07]"
+    >
+      Новый чат в проекте
+    </button>
+    <button
+      type="button"
+      onclick={() => { if (projCtxMenu) invoke('open_path_in_explorer', { path: projCtxMenu.path }).catch(() => {}); projCtxMenu = null; }}
+      class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07]"
+    >
+      Открыть в проводнике
+    </button>
+    <button
+      type="button"
+      onclick={() => { if (projCtxMenu) navigator.clipboard.writeText(projCtxMenu.path).catch(() => {}); projCtxMenu = null; }}
+      class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07]"
+    >
+      Копировать путь
+    </button>
+    <div class="my-1 border-t border-white/[0.06]"></div>
+    <button
+      type="button"
+      onclick={() => { if (projCtxMenu) workspaceStore.removeRecentWorkspace(projCtxMenu.path); projCtxMenu = null; }}
+      class="w-full px-3 py-1.5 text-left text-[#F87171] hover:bg-[#EF4444]/15"
+    >
+      Удалить из списка
+    </button>
+  </div>
+{/if}

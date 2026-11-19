@@ -1,7 +1,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import type { ToolExecutionRecord } from '../toolMapper';
 import { formatToolExecution } from '../toolMapper';
-import { settingsStore, type ReasoningLevel } from './settings.svelte';
+import { settingsStore, resolveModelForReasoning, type ReasoningLevel } from './settings.svelte';
 import { workspaceStore } from './workspace.svelte';
 
 export interface ChatAttachment {
@@ -161,6 +161,7 @@ class ChatStore {
   private resolveByChat: Record<string, (() => void) | null> = {};
   private streamSaveTimers: Record<string, number> = {};
   private pendingTextByChat: Record<string, string> = {};
+  private turnSnapshotByChat: Record<string, { contentLen: number; reasoningLen: number; stepsLen: number; toolsLen: number }> = {};
   private pendingReasoningByChat: Record<string, string> = {};
   private smoothRafByChat: Record<string, number | null> = {};
   private activeSmoothMsgByChat: Record<string, string | null> = {};
@@ -498,10 +499,11 @@ class ChatStore {
         }
       };
 
+      const resolvedSideModel = resolveModelForReasoning(prov, settingsStore.data.activeModel, settingsStore.data.reasoningLevel);
       await invoke('ask_side_question', {
         chatId: chatId || 'side-question',
         question: q,
-        modelId: settingsStore.data.activeModel,
+        modelId: resolvedSideModel,
         providerName: prov?.name || null,
         baseUrl: prov?.baseUrl || null,
         apiKey: prov?.apiKey || null,
@@ -1755,10 +1757,12 @@ class ChatStore {
           data_url: a.previewUrl || null
         }));
 
+        const resolvedStreamModel = resolveModelForReasoning(prov, settingsStore.data.activeModel, settingsStore.data.reasoningLevel);
+        const resolvedCaps = prov?.modelCapabilities?.[resolvedStreamModel] || detectedInfo;
         await invoke('start_chat_stream', {
           chatId,
           prompt,
-          modelId: settingsStore.data.activeModel,
+          modelId: resolvedStreamModel,
           reasoningEffort: settingsStore.data.reasoningLevel,
           providerName: prov?.name || null,
           baseUrl: prov?.baseUrl || null,
@@ -1766,9 +1770,9 @@ class ChatStore {
           apiProtocol: prov?.apiProtocol || 'auto',
           proxyEnabled: Boolean(prov?.proxyEnabled),
           proxyUrl: prov?.proxyUrl || null,
-          contextWindow: detectedInfo?.contextWindow || modelCaps.contextWindow || null,
-          maxOutputTokens: detectedInfo?.maxOutputTokens || null,
-          supportsReasoning: detectedInfo?.supportsReasoning ?? modelCaps.supportsReasoning,
+          contextWindow: resolvedCaps?.contextWindow || modelCaps.contextWindow || null,
+          maxOutputTokens: resolvedCaps?.maxOutputTokens || null,
+          supportsReasoning: resolvedCaps?.supportsReasoning ?? modelCaps.supportsReasoning,
           workspaceDir: sess?.projectPath || null,
           planMode: !forceExecute && /(?:^|\s)\/plan(?:\s|$)/i.test(prompt.trim()),
           resume,
@@ -2139,7 +2143,57 @@ class ChatStore {
       return;
     }
 
+    const settleRunningTools = (status: 'success' | 'error') => {
+      const toolCalls = currentAssistantMsg.toolCalls || [];
+      if (!toolCalls.some((tc) => tc.status === 'running' || tc.status === 'pending')) {
+        return;
+      }
+      const now = Date.now();
+      currentAssistantMsg.toolCalls = toolCalls.map((tc) =>
+        tc.status === 'running' || tc.status === 'pending'
+          ? { ...tc, status, finishedAt: tc.finishedAt || now, elapsedMs: tc.elapsedMs ?? (now - tc.startedAt) }
+          : tc
+      );
+      const steps = currentAssistantMsg.steps || [];
+      currentAssistantMsg.steps = steps.map((s) =>
+        s.kind === 'tool' && (s.record.status === 'running' || s.record.status === 'pending')
+          ? {
+              kind: 'tool',
+              record: {
+                ...s.record,
+                status,
+                finishedAt: s.record.finishedAt || now,
+                elapsedMs: s.record.elapsedMs ?? (now - s.record.startedAt)
+              }
+            }
+          : s
+      );
+    };
+
+    if (!this.turnSnapshotByChat[cid]) {
+      this.turnSnapshotByChat[cid] = {
+        contentLen: currentAssistantMsg.content.length,
+        reasoningLen: (currentAssistantMsg.reasoningContent || '').length,
+        stepsLen: currentAssistantMsg.steps.length,
+        toolsLen: currentAssistantMsg.toolCalls.length
+      };
+    }
+
+    if (event.type === 'turn_buffer_reset') {
+      this.pendingTextByChat[cid] = '';
+      this.pendingReasoningByChat[cid] = '';
+      const snap = this.turnSnapshotByChat[cid];
+      if (snap) {
+        currentAssistantMsg.content = currentAssistantMsg.content.slice(0, snap.contentLen);
+        currentAssistantMsg.reasoningContent = (currentAssistantMsg.reasoningContent || '').slice(0, snap.reasoningLen);
+        currentAssistantMsg.steps = currentAssistantMsg.steps.slice(0, snap.stepsLen);
+        currentAssistantMsg.toolCalls = currentAssistantMsg.toolCalls.slice(0, snap.toolsLen);
+      }
+      return;
+    }
+
     if (event.type === 'delta') {
+      settleRunningTools('success');
       const chunk = event.content ?? event.text ?? '';
       if (chunk) {
         this.activeSmoothMsgByChat[cid] = currentAssistantMsg.id;
@@ -2147,6 +2201,7 @@ class ChatStore {
         this.startSmoothFlush(cid);
       }
     } else if (event.type === 'reasoning_delta' || event.type === 'reasoning') {
+      settleRunningTools('success');
       const chunk = event.content ?? event.text ?? '';
       if (chunk) {
         this.activeSmoothMsgByChat[cid] = currentAssistantMsg.id;
@@ -2264,8 +2319,16 @@ class ChatStore {
           }
         };
       });
+      this.turnSnapshotByChat[cid] = {
+        contentLen: currentAssistantMsg.content.length,
+        reasoningLen: (currentAssistantMsg.reasoningContent || '').length,
+        stepsLen: currentAssistantMsg.steps.length,
+        toolsLen: currentAssistantMsg.toolCalls.length
+      };
       this.scheduleStreamingSave(cid);
     } else if (event.type === 'done') {
+      delete this.turnSnapshotByChat[cid];
+      settleRunningTools('success');
       this.flushSmoothBuffers(cid);
       this.streamingChats = { ...this.streamingChats, [cid]: false };
       if (this.reasoningTimers[cid]) {

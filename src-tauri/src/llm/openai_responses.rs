@@ -557,9 +557,17 @@ async fn stream_openai_responses_inner(
                 if code == 401 {
                     let _ = crate::llm::oauth_accounts::force_refresh_account(client, &acc.id).await;
                 }
+                let acc_cnt = crate::llm::oauth_accounts::list_accounts(Some("openai_codex")).await.into_iter().filter(|a| a.enabled).count();
+                let reason = if acc_cnt > 1 {
+                    format!("ChatGPT Codex HTTP {} ({}) - switching account", code, acc.email)
+                } else if code == 429 {
+                    format!("ChatGPT Codex rate limited (429, {}), retrying...", acc.email)
+                } else {
+                    format!("ChatGPT Codex HTTP {} ({}), retrying...", code, acc.email)
+                };
                 let _ = sender
                     .send(StreamEvent::RetryNotice {
-                        reason: format!("ChatGPT Codex HTTP {} ({}) - switching account", code, acc.email),
+                        reason,
                         attempt,
                         model: request.model.clone(),
                     })
@@ -602,9 +610,17 @@ async fn stream_openai_responses_inner(
                     message: error_body,
                 });
             }
+            let pool_sz = key_pool.pool_size(provider_name);
+            let reason = if pool_sz > 1 {
+                format!("HTTP {} - rotating key", status)
+            } else if is_rl {
+                "Rate limited (429), retrying...".to_string()
+            } else {
+                format!("HTTP {}, retrying...", code)
+            };
             let _ = sender
                 .send(StreamEvent::RetryNotice {
-                    reason: format!("HTTP {} - rotating key", status),
+                    reason,
                     attempt,
                     model: request.model.clone(),
                 })

@@ -66,6 +66,55 @@ let expandedThoughts = $state<Record<string, boolean>>({});
 let expandedTools = $state<Record<string, boolean>>({});
 let expandedCompacts = $state<Record<string, boolean>>({});
 let showErrorTrace = $state<boolean>(false);
+let confirmRetryErr = $state<boolean>(false);
+let confirmRetryTimer: ReturnType<typeof setTimeout> | null = null;
+
+function handleRetryErrorClick() {
+  if (confirmRetryErr) {
+    if (confirmRetryTimer) clearTimeout(confirmRetryTimer);
+    confirmRetryErr = false;
+    onRetry();
+    return;
+  }
+  confirmRetryErr = true;
+  if (confirmRetryTimer) clearTimeout(confirmRetryTimer);
+  confirmRetryTimer = setTimeout(() => {
+    confirmRetryErr = false;
+    confirmRetryTimer = null;
+  }, 4000);
+}
+
+function buildMiniDiffLines(call: ToolExecutionRecord): Array<{ type: 'add' | 'del' | 'same'; text: string }> {
+  if (call.diff?.changes && call.diff.changes.length > 0) {
+    const changes = call.diff.changes;
+    const keep = new Set<number>();
+    for (let i = 0; i < changes.length; i++) {
+      if (changes[i].type !== 'same') {
+        for (let j = Math.max(0, i - 2); j <= Math.min(changes.length - 1, i + 2); j++) {
+          keep.add(j);
+        }
+      }
+    }
+    if (keep.size > 0) {
+      return changes.filter((_, idx) => keep.has(idx));
+    }
+    return changes;
+  }
+  const meta = extractEditTexts(call);
+  const out: Array<{ type: 'add' | 'del' | 'same'; text: string }> = [];
+  const maxPairs = Math.max(meta.removedTexts.length, meta.addedTexts.length);
+  for (let i = 0; i < maxPairs; i++) {
+    const rem = meta.removedTexts[i];
+    const add = meta.addedTexts[i];
+    if (rem) {
+      for (const l of rem.split('\n')) out.push({ type: 'del', text: l });
+    }
+    if (add) {
+      for (const l of add.split('\n')) out.push({ type: 'add', text: l });
+    }
+  }
+  return out;
+}
 let errorCopied = $state<boolean>(false);
 let nowMs = $state<number>(Date.now());
 
@@ -553,12 +602,13 @@ function toggleTool(id: string) {
                       {#if call.terminalData.stderr}
                         <pre class="text-[#F87171] whitespace-pre-wrap break-all max-h-40 overflow-y-auto">{call.terminalData.stderr}</pre>
                       {/if}
-                    {:else if call.diff}
-                      <div class="space-y-0.5 max-h-56 overflow-y-auto">
-                        {#each call.diff.changes as change}
-                          <div class="px-1.5 py-0.5 flex gap-2 {change.type === 'add' ? 'text-[#6EE7B7]' : change.type === 'del' ? 'text-[#F87171]' : 'text-[#73737A]'}">
-                            <span class="w-3 select-none">{change.type === 'add' ? '+' : change.type === 'del' ? '-' : ' '}</span>
-                            <span class="whitespace-pre-wrap break-all">{change.text}</span>
+                    {:else if call.diff || ((call.toolName.toLowerCase().includes('edit') || call.toolName.toLowerCase().includes('write') || call.toolName.toLowerCase().includes('patch')) && buildMiniDiffLines(call).length > 0)}
+                      {@const miniDiff = buildMiniDiffLines(call)}
+                      <div class="rounded-[6px] border border-white/[0.06] bg-[#0B0B0D] py-1 max-h-60 overflow-y-auto">
+                        {#each miniDiff as change}
+                          <div class="px-2 py-0.5 flex gap-2 {change.type === 'add' ? 'bg-[#22C55E]/10 text-[#6EE7B7]' : change.type === 'del' ? 'bg-[#EF4444]/10 text-[#FCA5A5]' : 'text-[#73737A]'}">
+                            <span class="w-3 shrink-0 select-none">{change.type === 'add' ? '+' : change.type === 'del' ? '-' : ' '}</span>
+                            <span class="whitespace-pre-wrap break-all">{change.text || ' '}</span>
                           </div>
                         {/each}
                       </div>
@@ -640,10 +690,10 @@ function toggleTool(id: string) {
                       </button>
                       <button
                         type="button"
-                        class="px-2 py-0.5 rounded-[4px] text-[11px] font-sans text-[#A3A3AA] hover:text-[#EDEDEF] hover:bg-white/[0.06] transition-colors"
-                        onclick={onRetry}
+                        class="px-2 py-0.5 rounded-[4px] text-[11px] font-sans transition-colors {confirmRetryErr ? 'bg-[#F59E0B]/15 text-[#F59E0B]' : 'text-[#A3A3AA] hover:text-[#EDEDEF] hover:bg-white/[0.06]'}"
+                        onclick={handleRetryErrorClick}
                       >
-                        Retry
+                        {confirmRetryErr ? 'Confirm?' : 'Retry'}
                       </button>
                     {/if}
                   </div>

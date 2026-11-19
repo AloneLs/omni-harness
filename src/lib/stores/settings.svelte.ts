@@ -2,6 +2,169 @@ import { invoke } from '@tauri-apps/api/core';
 
 export type ReasoningLevel = 'OFF' | 'LOW' | 'MEDIUM' | 'HIGH' | 'MAX';
 
+export const REASONING_ORDER: ReasoningLevel[] = ['OFF', 'LOW', 'MEDIUM', 'HIGH', 'MAX'];
+
+const REASONING_SUFFIX_MAP: Record<string, ReasoningLevel> = {
+  off: 'OFF',
+  none: 'OFF',
+  minimal: 'LOW',
+  low: 'LOW',
+  med: 'MEDIUM',
+  medium: 'MEDIUM',
+  high: 'HIGH',
+  xhigh: 'MAX',
+  max: 'MAX'
+};
+
+export interface GroupedProviderModel {
+  displayId: string;
+  rawIds: string[];
+  reasoningVariants: Partial<Record<ReasoningLevel, string>>;
+}
+
+export function splitReasoningSuffix(modelId: string): { baseId: string; level: ReasoningLevel | null } {
+  const lower = modelId.toLowerCase();
+  for (const [suffix, level] of Object.entries(REASONING_SUFFIX_MAP)) {
+    const tag = `-${suffix}`;
+    if (lower.endsWith(tag) && modelId.length > tag.length) {
+      return { baseId: modelId.slice(0, modelId.length - tag.length), level };
+    }
+  }
+  return { baseId: modelId, level: null };
+}
+
+export function groupProviderModels(availableModels: string[]): GroupedProviderModel[] {
+  const groups = new Map<string, GroupedProviderModel>();
+  for (const rawId of availableModels) {
+    const { baseId, level } = splitReasoningSuffix(rawId);
+    let grp = groups.get(baseId);
+    if (!grp) {
+      grp = { displayId: baseId, rawIds: [], reasoningVariants: {} };
+      groups.set(baseId, grp);
+    }
+    if (!grp.rawIds.includes(rawId)) {
+      grp.rawIds.push(rawId);
+    }
+    if (level !== null && !grp.reasoningVariants[level]) {
+      grp.reasoningVariants[level] = rawId;
+    }
+  }
+  return Array.from(groups.values());
+}
+
+export function findModelGroup(
+  prov: ProviderConfig | null | undefined,
+  modelId: string
+): GroupedProviderModel | null {
+  if (!prov || !modelId) return null;
+  const groups = groupProviderModels(prov.availableModels || []);
+  return groups.find((g) => g.displayId === modelId || g.rawIds.includes(modelId)) || null;
+}
+
+export function getDisplayModelId(
+  prov: ProviderConfig | null | undefined,
+  modelId: string
+): string {
+  const grp = findModelGroup(prov, modelId);
+  return grp ? grp.displayId : modelId;
+}
+
+export function resolveModelForReasoning(
+  prov: ProviderConfig | null | undefined,
+  modelId: string,
+  level: ReasoningLevel
+): string {
+  const grp = findModelGroup(prov, modelId);
+  if (!grp) return modelId;
+  const variantKeys = Object.keys(grp.reasoningVariants) as ReasoningLevel[];
+  if (variantKeys.length === 0) return grp.rawIds[0] || modelId;
+  if (grp.reasoningVariants[level]) return grp.reasoningVariants[level]!;
+  const ordered = REASONING_ORDER.filter((l) => grp.reasoningVariants[l]);
+  const targetIdx = REASONING_ORDER.indexOf(level);
+  let best = ordered[0];
+  let bestDist = Infinity;
+  for (const cand of ordered) {
+    const d = Math.abs(REASONING_ORDER.indexOf(cand) - targetIdx);
+    if (d < bestDist) {
+      bestDist = d;
+      best = cand;
+    }
+  }
+  return (best && grp.reasoningVariants[best]) || grp.rawIds[0] || modelId;
+}
+
+export function isNonReasoningModelId(modelId: string): boolean {
+  const m = modelId.toLowerCase();
+  return (
+    m.includes('-image') ||
+    m.endsWith('image') ||
+    m.includes('imagine-image') ||
+    m.includes('imagine-video') ||
+    m.includes('flux') ||
+    m.includes('tts') ||
+    m.includes('whisper') ||
+    m.includes('embedding') ||
+    m.includes('dall-e') ||
+    m.includes('sora')
+  );
+}
+
+export function getSupportedReasoningLevels(
+  prov: ProviderConfig | null | undefined,
+  modelId: string
+): ReasoningLevel[] {
+  if (!modelId) return [];
+  const grp = findModelGroup(prov, modelId);
+  if (grp) {
+    const variantLevels = REASONING_ORDER.filter((l) => Boolean(grp.reasoningVariants[l]));
+    if (variantLevels.length > 0) return variantLevels;
+  }
+  const probeId = grp?.rawIds[0] || modelId;
+  if (isNonReasoningModelId(probeId)) return [];
+  const detected = prov?.modelCapabilities?.[probeId] || prov?.modelCapabilities?.[modelId];
+  const m = probeId.toLowerCase();
+  const proto = (prov?.apiProtocol || '').toLowerCase();
+  if (detected && !detected.supportsReasoning) return [];
+  if (!detected && prov && !prov.supportsReasoning) {
+    const heuristicReasoning =
+      m.includes('reason') ||
+      m.includes('thinking') ||
+      m.includes('r1') ||
+      m.includes('o1') ||
+      m.includes('o3') ||
+      m.includes('o4') ||
+      m.includes('gpt-5') ||
+      m.includes('gpt-6') ||
+      m.includes('gemini-2.5') ||
+      m.includes('gemini-3') ||
+      m.includes('gemini-4') ||
+      m.includes('claude') ||
+      m.includes('glm-4.5') ||
+      m.includes('glm-4.7') ||
+      m.includes('glm-5');
+    if (!heuristicReasoning) return [];
+  }
+  if (m.includes('gemini-3') || m.includes('gemini-4')) {
+    return ['OFF', 'LOW', 'MEDIUM', 'HIGH'];
+  }
+  if (m.includes('claude') && m.includes('thinking')) {
+    return ['LOW', 'MEDIUM', 'HIGH', 'MAX'];
+  }
+  if (m.includes('claude') || proto === 'claude_oauth' || proto === 'zcode_oauth' || m.includes('glm')) {
+    return ['OFF', 'LOW', 'MEDIUM', 'HIGH', 'MAX'];
+  }
+  if (m.startsWith('o1') || m.startsWith('o3') || m.startsWith('o4')) {
+    return ['LOW', 'MEDIUM', 'HIGH'];
+  }
+  if (proto === 'openai_codex' || m.includes('gpt-5') || m.includes('gpt-6')) {
+    return ['LOW', 'MEDIUM', 'HIGH', 'MAX'];
+  }
+  if (m.includes('deepseek') && (m.includes('reason') || m.includes('r1'))) {
+    return ['OFF', 'HIGH'];
+  }
+  return ['OFF', 'LOW', 'MEDIUM', 'HIGH', 'MAX'];
+}
+
 export interface DetectedModelInfo {
   id: string;
   name: string;
@@ -101,8 +264,11 @@ class SettingsStore {
   });
 
   currentModelCapabilities = $derived.by(() => {
-    const model = this.data.activeModel || '';
-    const detected = this.currentProvider?.modelCapabilities?.[model];
+    const rawModel = this.data.activeModel || '';
+    const model = resolveModelForReasoning(this.currentProvider, rawModel, this.data.reasoningLevel);
+    const detected =
+      this.currentProvider?.modelCapabilities?.[model] ||
+      this.currentProvider?.modelCapabilities?.[rawModel];
     if (detected) {
       return {
         modelId: model,
@@ -122,7 +288,7 @@ class SettingsStore {
     return {
       modelId: model,
       providerId: this.data.activeProvider,
-      supportsReasoning: isReasoner || Boolean(this.currentProvider?.supportsReasoning),
+      supportsReasoning: !isNonReasoningModelId(model) && (isReasoner || Boolean(this.currentProvider?.supportsReasoning)),
       contextWindow: 128000,
       supportsVision: model.includes('4o') || model.includes('claude'),
       supportsTools: true
@@ -167,6 +333,52 @@ class SettingsStore {
             }
           }
         );
+        listen<any>('telegram-providers-updated', (ev) => {
+          const p = ev.payload;
+          if (!p) return;
+          if (p.action === 'add_provider' && p.provider) {
+            const np = p.provider;
+            this.data.providers = {
+              ...this.data.providers,
+              [np.id]: {
+                id: np.id,
+                name: np.name,
+                baseUrl: np.baseUrl || np.base_url || '',
+                apiKey: np.apiKey || np.api_key || '',
+                apiProtocol: np.apiProtocol || np.api_protocol || 'auto',
+                proxyEnabled: Boolean(np.proxyEnabled),
+                proxyUrl: np.proxyUrl || '',
+                defaultModel: np.defaultModel || '',
+                availableModels: np.availableModels || [],
+                supportsReasoning: true,
+                enabled: true
+              }
+            };
+            this.data.activeProvider = np.id;
+            this.saveSettings();
+          } else if (p.action === 'edit_provider' && p.provider) {
+            const up = p.provider;
+            const ex = this.data.providers[up.id];
+            if (ex) {
+              this.updateProvider(up.id, {
+                baseUrl: up.baseUrl || up.base_url || ex.baseUrl,
+                apiKey: up.apiKey || up.api_key || ex.apiKey
+              });
+            }
+          } else if (p.action === 'add_models' && p.providerId && Array.isArray(p.models)) {
+            const ex = this.data.providers[p.providerId];
+            if (ex) {
+              const merged = Array.from(new Set([...(ex.availableModels || []), ...p.models]));
+              this.updateProvider(p.providerId, {
+                availableModels: merged,
+                defaultModel: ex.defaultModel || p.models[0] || ''
+              });
+              if (p.models[0]) {
+                this.setActiveModel(p.providerId, p.models[0]);
+              }
+            }
+          }
+        });
       })
       .catch(() => {});
     this.refreshAllModelCapabilities();
@@ -379,8 +591,9 @@ class SettingsStore {
     if (this.data.providers[providerId]) {
       this.data.activeProvider = providerId;
       const prov = this.data.providers[providerId];
-      if (prov.availableModels.length > 0 && !prov.availableModels.includes(this.data.activeModel)) {
-        this.data.activeModel = prov.defaultModel || prov.availableModels[0];
+      const grp = findModelGroup(prov, this.data.activeModel);
+      if (prov.availableModels.length > 0 && !grp) {
+        this.data.activeModel = getDisplayModelId(prov, prov.defaultModel || prov.availableModels[0]);
       }
       this.saveSettings();
     }

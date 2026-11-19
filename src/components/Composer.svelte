@@ -7,7 +7,7 @@ import FileToolIcon from './FileToolIcon.svelte';
 import { themeStore } from '../lib/stores/theme.svelte';
 import { chatStore, type ChatAttachment } from '../lib/stores/chat.svelte';
 import { renderMarkdown } from '../lib/markdown';
-import { settingsStore, type ReasoningLevel } from '../lib/stores/settings.svelte';
+import { settingsStore, groupProviderModels, getSupportedReasoningLevels, getDisplayModelId, REASONING_ORDER, type ReasoningLevel } from '../lib/stores/settings.svelte';
 import { workspaceStore } from '../lib/stores/workspace.svelte';
 import { VoiceCapture } from '../lib/voiceCapture';
 import { SPRING_POPUP, SPRING_KEYCAP, SPRING_SLIDER, attachPressScale } from '../lib/motion';
@@ -34,6 +34,7 @@ let showPlusMenu = $state<boolean>(false);
 let isDraggingOver = $state<boolean>(false);
 let attachments = $state<ChatAttachment[]>([]);
 let showModelPopup = $state<boolean>(false);
+let showProjectPopup = $state<boolean>(false);
 let activePalette = $state<'slash' | 'at' | 'dollar' | null>(null);
 let paletteFilter = $state<string>('');
 let paletteSelectedIndex = $state<number>(0);
@@ -128,7 +129,6 @@ function startSideQuestionResize(e: PointerEvent) {
   window.addEventListener('pointerup', onUp);
 }
 
-const REASONING_LEVELS: ReasoningLevel[] = ['OFF', 'LOW', 'MEDIUM', 'HIGH', 'MAX'];
 const REASONING_LABELS: Record<ReasoningLevel, string> = {
   OFF: 'OFF',
   LOW: 'LOW',
@@ -137,11 +137,36 @@ const REASONING_LABELS: Record<ReasoningLevel, string> = {
   MAX: 'MAX'
 };
 
-let reasoningIndex = $derived(
-  Math.max(0, REASONING_LEVELS.indexOf(settingsStore.data.reasoningLevel))
+let supportedReasoningLevels = $derived(
+  getSupportedReasoningLevels(settingsStore.currentProvider, settingsStore.data.activeModel)
 );
 
+let displayActiveModel = $derived(
+  getDisplayModelId(settingsStore.currentProvider, settingsStore.data.activeModel)
+);
+
+let reasoningIndex = $derived(
+  Math.max(0, supportedReasoningLevels.indexOf(settingsStore.data.reasoningLevel))
+);
+
+$effect(() => {
+  if (supportedReasoningLevels.length > 0 && !supportedReasoningLevels.includes(settingsStore.data.reasoningLevel)) {
+    const targetIdx = REASONING_ORDER.indexOf(settingsStore.data.reasoningLevel);
+    let best = supportedReasoningLevels[0];
+    let bestDist = Infinity;
+    for (const lvl of supportedReasoningLevels) {
+      const d = Math.abs(REASONING_ORDER.indexOf(lvl) - targetIdx);
+      if (d < bestDist) {
+        bestDist = d;
+        best = lvl;
+      }
+    }
+    if (best) settingsStore.setReasoningLevel(best);
+  }
+});
+
 const plusMenuSpring = new Spring({ opacity: 0, y: 6, scale: 0.96 }, SPRING_POPUP);
+const projectMenuSpring = new Spring({ opacity: 0, scale: 0.95, y: 6 }, SPRING_POPUP);
 const modelMenuSpring = new Spring({ opacity: 0, y: 6, scale: 0.96 }, SPRING_POPUP);
 const paletteSpring = new Spring({ opacity: 0, y: 6 }, SPRING_POPUP);
 const keycapSpring = new Spring({ scale: 1, y: 0 }, SPRING_KEYCAP);
@@ -175,6 +200,9 @@ $effect(() => {
 });
 
 $effect(() => {
+  projectMenuSpring.target = showProjectPopup
+    ? { opacity: 1, scale: 1, y: 0 }
+    : { opacity: 0, scale: 0.95, y: 6 };
   modelMenuSpring.target = showModelPopup
     ? { opacity: 1, y: 0, scale: 1 }
     : { opacity: 0, y: 6, scale: 0.96 };
@@ -377,6 +405,7 @@ function editQueuedItem(id: string) {
 function closeAllPopups() {
   showPlusMenu = false;
   showModelPopup = false;
+  showProjectPopup = false;
 }
 
 function handleWindowPointerDown(e: PointerEvent) {
@@ -435,7 +464,11 @@ $effect(() => {
 let availableModels = $derived.by(() => {
   const prov = settingsStore.data.providers[popupProviderId];
   if (!prov || !prov.enabled) return [];
-  return prov.availableModels.map((m) => ({ providerId: prov.id, model: m }));
+  return groupProviderModels(prov.availableModels).map((g) => ({
+    providerId: prov.id,
+    model: g.displayId,
+    rawIds: g.rawIds
+  }));
 });
 
 let allSlashCommands = $derived.by(() => {
@@ -1176,59 +1209,89 @@ async function stopAndSendVoice() {
                 <span class="font-mono text-[10.5px] text-[#66666D]">FILE</span>
               </button>
 
-              {#if !chatStore.activeSession?.isThemeStudio}
-              <div class="border-t border-white/[0.06] pt-1.5 mt-1">
-                <div class="px-2 pb-1 font-mono text-[10px] text-[#66666D] uppercase tracking-wider">Project</div>
-                <button
-                  type="button"
-                  class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {!workspaceStore.currentPath ? 'bg-white/[0.08] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.05] hover:text-white'}"
-                  onclick={() => {
-                    workspaceStore.clearWorkspace();
-                    chatStore.setActiveSessionProject('');
-                    closeAllPopups();
-                  }}
-                >
-                  <span>No project (Full PC)</span>
-                </button>
 
-                {#if workspaceStore.recentWorkspaces.length > 0}
-                  <div class="max-h-28 overflow-y-auto space-y-0.5 mt-0.5">
-                    {#each workspaceStore.recentWorkspaces as path}
-                      <button
-                        type="button"
-                        class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] truncate transition-colors {workspaceStore.currentPath === path ? 'bg-white/[0.08] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.05] hover:text-white'}"
-                        onclick={() => {
-                          workspaceStore.setWorkspaceDir(path);
-                          chatStore.setActiveSessionProject(path);
-                          closeAllPopups();
-                        }}
-                        title={path}
-                      >
-                        {path.split(/[\\/]/).pop() || path}
-                      </button>
-                    {/each}
-                  </div>
-                {/if}
-
-                <button
-                  type="button"
-                  class="w-full px-2.5 py-1.5 mt-0.5 rounded-[4px] text-left text-xs text-[#D4D4D8] hover:bg-white/[0.05] flex items-center justify-between transition-colors"
-                  onclick={async () => {
-                    closeAllPopups();
-                    const picked = await workspaceStore.openDirectoryPicker();
-                    if (picked) chatStore.setActiveSessionProject(picked);
-                  }}
-                >
-                  <span>Open folder...</span>
-                  <Icon name="chevron-right" class="w-3.5 h-3.5 text-[#73737A]" strokeWidth={1.8} />
-                </button>
-              </div>
-              {/if}
             </div>
           {/if}
         </div>
 
-        <div class="flex items-center gap-2.5">
+        <div class="flex items-center gap-2">
+          {#if !chatStore.activeSession?.isThemeStudio}
+            <div class="relative">
+              <button
+                type="button"
+                class="px-2 py-1 rounded-[4px] flex items-center gap-1.5 text-[11px] font-mono text-[#A3A3AA] hover:text-[#E5E5E8] hover:bg-white/[0.05] transition-colors max-w-[150px]"
+                onclick={() => {
+                  const next = !showProjectPopup;
+                  closeAllPopups();
+                  showProjectPopup = next;
+                }}
+                title={workspaceStore.currentPath || 'No project (Full PC)'}
+                use:attachPressScale
+              >
+                <Icon name="folder" class="w-3.5 h-3.5 text-[#73737A] shrink-0" strokeWidth={1.6} />
+                <span class="truncate">{workspaceStore.workspaceName || 'Full PC'}</span>
+                <Icon name="chevron-down" class="w-3 h-3 text-[#66666D] shrink-0 transition-transform duration-150 {showProjectPopup ? 'rotate-180' : ''}" strokeWidth={1.8} />
+              </button>
+
+              {#if showProjectPopup || projectMenuSpring.current.opacity > 0.02}
+                <div
+                  class="absolute bottom-full mb-2 right-0 w-64 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-1.5 z-50 text-xs space-y-1 shadow-2xl {showProjectPopup ? 'pointer-events-auto' : 'pointer-events-none'}"
+                  style="opacity: {projectMenuSpring.current.opacity}; transform: translateY({projectMenuSpring.current.y}px) scale({projectMenuSpring.current.scale});"
+                >
+                  <div class="px-2 py-0.5 font-mono text-[10px] text-[#66666D] uppercase tracking-wider">Workspace / Project</div>
+                  <button
+                    type="button"
+                    class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {!workspaceStore.currentPath ? 'bg-white/[0.08] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.05] hover:text-white'}"
+                    onclick={() => {
+                      workspaceStore.clearWorkspace();
+                      chatStore.setActiveSessionProject('');
+                      closeAllPopups();
+                    }}
+                  >
+                    <span>No project (Full PC)</span>
+                    {#if !workspaceStore.currentPath}
+                      <Icon name="check" class="w-3 h-3 text-[#EDEDEF]" strokeWidth={2} />
+                    {/if}
+                  </button>
+
+                  {#if workspaceStore.recentWorkspaces.length > 0}
+                    <div class="max-h-40 overflow-y-auto space-y-0.5 border-t border-white/[0.06] pt-1">
+                      {#each workspaceStore.recentWorkspaces as path}
+                        <button
+                          type="button"
+                          class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between gap-2 transition-colors {workspaceStore.currentPath === path ? 'bg-white/[0.08] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.05] hover:text-white'}"
+                          onclick={() => {
+                            workspaceStore.setWorkspaceDir(path);
+                            chatStore.setActiveSessionProject(path);
+                            closeAllPopups();
+                          }}
+                          title={path}
+                        >
+                          <span class="truncate">{path.split(/[\\/]/).pop() || path}</span>
+                          {#if workspaceStore.currentPath === path}
+                            <Icon name="check" class="w-3 h-3 text-[#EDEDEF] shrink-0" strokeWidth={2} />
+                          {/if}
+                        </button>
+                      {/each}
+                    </div>
+                  {/if}
+
+                  <button
+                    type="button"
+                    class="w-full px-2.5 py-1.5 border-t border-white/[0.06] pt-1.5 rounded-[4px] text-left text-xs text-[#D4D4D8] hover:bg-white/[0.05] flex items-center justify-between transition-colors"
+                    onclick={async () => {
+                      closeAllPopups();
+                      const picked = await workspaceStore.openDirectoryPicker();
+                      if (picked) chatStore.setActiveSessionProject(picked);
+                    }}
+                  >
+                    <span>Open folder...</span>
+                    <Icon name="chevron-right" class="w-3.5 h-3.5 text-[#73737A]" strokeWidth={1.8} />
+                  </button>
+                </div>
+              {/if}
+            </div>
+          {/if}
           {#if chatStore.contextTelemetry.usedTokens > 0}
             {@const r = 6}
             {@const circ = 2 * Math.PI * r}
@@ -1267,8 +1330,10 @@ async function stopAndSendVoice() {
               title="Model & Reasoning"
               use:attachPressScale
             >
-              <span>{settingsStore.data.activeModel || 'Select model'}</span>
-              <span class="text-[#73737A]">{REASONING_LABELS[settingsStore.data.reasoningLevel]}</span>
+              <span>{displayActiveModel || 'Select model'}</span>
+              {#if supportedReasoningLevels.length > 0}
+                <span class="text-[#73737A]">{REASONING_LABELS[settingsStore.data.reasoningLevel]}</span>
+              {/if}
               <Icon name="chevron-down" class="w-3 h-3 text-[#66666D]" strokeWidth={1.8} />
             </button>
 
@@ -1332,11 +1397,12 @@ async function stopAndSendVoice() {
                     {#key popupProviderId}
                       <div in:fly={{ y: 4, duration: 140 }} class="max-h-40 overflow-y-auto space-y-0.5">
                         {#each availableModels as item (item.model)}
+                          {@const isSelected = settingsStore.data.activeProvider === item.providerId && (displayActiveModel === item.model || item.rawIds.includes(settingsStore.data.activeModel))}
                           <button
                             type="button"
-                            class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {settingsStore.data.activeModel === item.model && settingsStore.data.activeProvider === item.providerId ? 'bg-white/[0.09] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.04] hover:text-white'}"
+                            class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {isSelected ? 'bg-white/[0.09] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.04] hover:text-white'}"
                             onclick={() => {
-                              const prev = chatStore.activeSession?.modelId || settingsStore.data.activeModel;
+                              const prev = getDisplayModelId(settingsStore.currentProvider, chatStore.activeSession?.modelId || settingsStore.data.activeModel);
                               settingsStore.setActiveModel(item.providerId, item.model);
                               chatStore.setSessionModel(item.providerId, item.model);
                               if (prev && prev !== item.model) {
@@ -1353,30 +1419,35 @@ async function stopAndSendVoice() {
                   {/if}
                 </div>
 
-                <div class="border-t border-white/[0.06] pt-2.5 space-y-2">
-                  <div class="flex items-center justify-between px-0.5">
-                    <span class="font-mono text-[10px] text-[#66666D] uppercase tracking-wider">Reasoning</span>
-                    <span class="font-mono text-[10.5px] text-[#D4D4D8]">
-                      {REASONING_LABELS[settingsStore.data.reasoningLevel]}
-                    </span>
-                  </div>
+                {#if supportedReasoningLevels.length > 0}
+                  <div class="border-t border-white/[0.06] pt-2.5 space-y-2">
+                    <div class="flex items-center justify-between px-0.5">
+                      <span class="font-mono text-[10px] text-[#66666D] uppercase tracking-wider">Reasoning</span>
+                      <span class="font-mono text-[10.5px] text-[#D4D4D8]">
+                        {REASONING_LABELS[settingsStore.data.reasoningLevel]}
+                      </span>
+                    </div>
 
-                  <div class="relative h-7 bg-[#121214] rounded-[4px] border border-white/[0.06] p-0.5 grid grid-cols-5 items-center">
                     <div
-                      class="absolute top-0.5 bottom-0.5 left-0.5 rounded-[3px] bg-white/[0.12] border-t border-white/[0.18] pointer-events-none"
-                      style="width: calc((100% - 4px) / 5); transform: translateX(calc({sliderSpring.current} * 100%));"
-                    ></div>
-                    {#each REASONING_LEVELS as lvl}
-                      <button
-                        type="button"
-                        class="relative z-10 h-full font-mono text-[10px] text-center transition-colors {settingsStore.data.reasoningLevel === lvl ? 'text-[#EDEDEF] font-semibold' : 'text-[#73737A] hover:text-[#D4D4D8]'}"
-                        onclick={() => settingsStore.setReasoningLevel(lvl)}
-                      >
-                        {REASONING_LABELS[lvl]}
-                      </button>
-                    {/each}
+                      class="relative h-7 bg-[#121214] rounded-[4px] border border-white/[0.06] p-0.5 grid items-center"
+                      style="grid-template-columns: repeat({supportedReasoningLevels.length}, minmax(0, 1fr));"
+                    >
+                      <div
+                        class="absolute top-0.5 bottom-0.5 left-0.5 rounded-[3px] bg-white/[0.12] border-t border-white/[0.18] pointer-events-none"
+                        style="width: calc((100% - 4px) / {supportedReasoningLevels.length}); transform: translateX(calc({sliderSpring.current} * 100%));"
+                      ></div>
+                      {#each supportedReasoningLevels as lvl}
+                        <button
+                          type="button"
+                          class="relative z-10 h-full font-mono text-[10px] text-center transition-colors {settingsStore.data.reasoningLevel === lvl ? 'text-[#EDEDEF] font-semibold' : 'text-[#73737A] hover:text-[#D4D4D8]'}"
+                          onclick={() => settingsStore.setReasoningLevel(lvl)}
+                        >
+                          {REASONING_LABELS[lvl]}
+                        </button>
+                      {/each}
+                    </div>
                   </div>
-                </div>
+                {/if}
               </div>
             {/if}
           </div>

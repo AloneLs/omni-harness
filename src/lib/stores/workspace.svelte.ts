@@ -100,12 +100,28 @@ class WorkspaceStore {
   }
 
   public addRecentWorkspace(path: string): void {
-    const list = this.recentWorkspaces.filter((p) => p !== path);
-    list.unshift(path);
-    if (list.length > 10) list.pop();
+    const norm = path.replace(/[\\/]+$/, '').toLowerCase();
+    const exists = this.recentWorkspaces.some((p) => p.replace(/[\\/]+$/, '').toLowerCase() === norm);
+    if (exists) return;
+    const list = [path, ...this.recentWorkspaces];
+    if (list.length > 15) list.pop();
     this.recentWorkspaces = list;
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem('omni_recent_workspaces', JSON.stringify(list));
+    }
+    this.syncWorkspacesToBackend();
+  }
+
+  public removeRecentWorkspace(path: string): void {
+    const norm = path.replace(/[\\/]+$/, '').toLowerCase();
+    this.recentWorkspaces = this.recentWorkspaces.filter(
+      (p) => p.replace(/[\\/]+$/, '').toLowerCase() !== norm
+    );
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('omni_recent_workspaces', JSON.stringify(this.recentWorkspaces));
+    }
+    if (this.currentPath.replace(/[\\/]+$/, '').toLowerCase() === norm) {
+      this.clearWorkspace().catch(() => {});
     }
     this.syncWorkspacesToBackend();
   }

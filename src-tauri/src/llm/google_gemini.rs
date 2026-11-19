@@ -402,9 +402,17 @@ pub async fn stream_google_gemini(
                     key_pool.mark_transient(provider_name, base_url, &api_key, Some(delay)).await;
                 }
                 if attempt < max_attempts {
+                    let pool_sz = key_pool.pool_size(provider_name);
+                    let reason = if pool_sz > 1 {
+                        format!("Google Gemini HTTP {} - rotating key", status_code)
+                    } else if is_rl {
+                        "Google Gemini rate limited (429), retrying...".to_string()
+                    } else {
+                        format!("Google Gemini HTTP {}, retrying...", status_code)
+                    };
                     let _ = sender
                         .send(StreamEvent::RetryNotice {
-                            reason: format!("Google Gemini HTTP {} - rotating key", status_code),
+                            reason,
                             attempt,
                             model: request.model.clone(),
                         })

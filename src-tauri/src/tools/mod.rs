@@ -542,6 +542,16 @@ impl ToolDispatcher {
         ));
 
         declarations.push(make_decl(
+            "wait",
+            "Pause and wait up to 600 seconds (10 minutes) for a long-running build, download, or background task without spamming status tools. Provide a short status message explaining what you are waiting for.",
+            &[
+                ("seconds", "integer", "Seconds to wait (1 to 600)"),
+                ("message", "string", "Short status message shown to user (e.g. 'Ожидаю сборку...')"),
+            ],
+            &["seconds", "message"],
+        ));
+
+        declarations.push(make_decl(
             "task_board",
             "Step-by-step Todo planner: set full plan items [{id, text, status}], update step status (pending|in_progress|completed|failed), add, list, or ask_user.",
             &[
@@ -554,6 +564,17 @@ impl ToolDispatcher {
                 ("question", "string", "Clarifying question for ask_user"),
             ],
             &["action"],
+        ));
+
+        declarations.push(make_decl(
+            "artifact_read",
+            "Read text content of an artifact://sha256:... reference stored by the harness.",
+            &[
+                ("uri", "string", "Artifact reference URI (artifact://sha256:...)"),
+                ("offset", "integer", "Optional character offset (default 0)"),
+                ("limit", "integer", "Optional max characters to read (default 16000)"),
+            ],
+            &["uri"],
         ));
 
         declarations.push(make_decl(
@@ -1551,6 +1572,39 @@ impl ToolDispatcher {
                     }
                     other => Err(format!("Unsupported subagent_builder action: {}", other)),
                 }
+            }
+            "artifact_read" => {
+                let uri = args.get("uri").and_then(|v| v.as_str()).ok_or("Missing uri")?;
+                let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(16_000).clamp(1, 64_000) as usize;
+                let full = crate::engine::policy_guard::ArtifactStore::read_artifact(uri)?;
+                let total = full.chars().count();
+                let slice: String = full.chars().skip(offset).take(limit).collect();
+                Ok(json!({
+                    "uri": uri,
+                    "totalChars": total,
+                    "offset": offset,
+                    "content": slice
+                }))
+            }
+            "wait" => {
+                let secs = args
+                    .get("seconds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(5)
+                    .clamp(1, 600);
+                let message = args
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Ожидаю завершения задачи...")
+                    .trim()
+                    .to_string();
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                Ok(json!({
+                    "status": "waited",
+                    "seconds": secs,
+                    "message": message
+                }))
             }
             "generate_image" => {
                 use base64::Engine;

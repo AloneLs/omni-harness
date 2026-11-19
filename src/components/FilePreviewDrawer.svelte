@@ -36,15 +36,58 @@ let removedLines = $derived.by(() => {
   return out;
 });
 
-let renderedLines = $derived.by(() => {
+type DiffDisplayRow =
+  | { kind: 'del'; key: string; raw: string; html: string }
+  | { kind: 'line'; key: string; num: number; raw: string; html: string; isAdded: boolean };
+
+let renderedRows = $derived.by<DiffDisplayRow[]>(() => {
   if (!fileContent) return [];
-  const raw = fileContent.replace(/\r\n/g, '\n').split('\n');
-  return raw.map((line, i) => ({
-    num: i + 1,
-    raw: line,
-    html: highlightCode(line, ext),
-    isAdded: addedSet.has(line.trim())
-  }));
+  const rawLines = fileContent.replace(/\r\n/g, '\n').split('\n');
+  const addedBlocks = preview?.addedTexts || [];
+  const removedBlocks = preview?.removedTexts || [];
+  const delBeforeLine = new Map<number, string[]>();
+  const orphanRemoved: string[] = [];
+
+  for (let b = 0; b < removedBlocks.length; b++) {
+    const remLines = (removedBlocks[b] || '').split('\n');
+    const addBlock = (addedBlocks[b] || '').trim();
+    const firstAddLine = addBlock.split('\n').map((l) => l.trim()).find((l) => l.length > 0) || '';
+    let anchorIdx = -1;
+    if (firstAddLine) {
+      anchorIdx = rawLines.findIndex((rl) => rl.trim() === firstAddLine);
+    }
+    if (anchorIdx >= 0) {
+      const existing = delBeforeLine.get(anchorIdx) || [];
+      delBeforeLine.set(anchorIdx, [...existing, ...remLines]);
+    } else {
+      orphanRemoved.push(...remLines);
+    }
+  }
+
+  const rows: DiffDisplayRow[] = [];
+  for (let i = 0; i < rawLines.length; i++) {
+    const dels = delBeforeLine.get(i);
+    if (dels) {
+      dels.forEach((d, di) => {
+        rows.push({ kind: 'del', key: `del-${i}-${di}`, raw: d, html: highlightCode(d, ext) });
+      });
+    }
+    const line = rawLines[i];
+    rows.push({
+      kind: 'line',
+      key: `ln-${i + 1}`,
+      num: i + 1,
+      raw: line,
+      html: highlightCode(line, ext),
+      isAdded: addedSet.has(line.trim())
+    });
+  }
+  if (orphanRemoved.length > 0) {
+    orphanRemoved.forEach((d, di) => {
+      rows.push({ kind: 'del', key: `del-end-${di}`, raw: d, html: highlightCode(d, ext) });
+    });
+  }
+  return rows;
 });
 
 $effect(() => {
@@ -103,22 +146,19 @@ $effect(() => {
       {:else if errorMsg}
         <div class="p-4 text-[#F87171] text-xs whitespace-pre-wrap">{errorMsg}</div>
       {:else}
-        {#if removedLines.length > 0}
-          <div class="border-b border-white/[0.06] bg-[#EF4444]/[0.06]">
-            {#each removedLines as rl}
-              <div class="flex px-3 py-0.5 bg-[#EF4444]/15 border-l-2 border-[#EF4444] text-[#FCA5A5]">
-                <span class="w-9 shrink-0 select-none text-[#F87171]/70">-</span>
-                <span class="whitespace-pre">{rl}</span>
-              </div>
-            {/each}
-          </div>
-        {/if}
         <div class="py-2">
-          {#each renderedLines as line (line.num)}
-            <div class="flex px-3 {line.isAdded ? 'bg-[#22C55E]/15 border-l-2 border-[#22C55E]' : 'hover:bg-white/[0.02]'}">
-              <span class="w-9 shrink-0 select-none text-right pr-3 text-[#55555C]">{line.num}</span>
-              <span class="whitespace-pre text-[#E5E5E8]">{@html line.html || ' '}</span>
-            </div>
+          {#each renderedRows as row (row.key)}
+            {#if row.kind === 'del'}
+              <div class="flex px-3 bg-[#EF4444]/15 border-l-2 border-[#EF4444] text-[#FCA5A5]">
+                <span class="w-9 shrink-0 select-none text-right pr-3 text-[#F87171]/80">-</span>
+                <span class="whitespace-pre">{@html row.html || ' '}</span>
+              </div>
+            {:else}
+              <div class="flex px-3 {row.isAdded ? 'bg-[#22C55E]/15 border-l-2 border-[#22C55E]' : 'hover:bg-white/[0.02]'}">
+                <span class="w-9 shrink-0 select-none text-right pr-3 text-[#55555C]">{row.num}</span>
+                <span class="whitespace-pre text-[#E5E5E8]">{@html row.html || ' '}</span>
+              </div>
+            {/if}
           {/each}
         </div>
       {/if}

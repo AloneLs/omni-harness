@@ -39,6 +39,44 @@ interface UpdateInfo {
   publishedAt: string;
 }
 
+let hoverTip = $state<{ text: string; x: number; y: number } | null>(null);
+let hoverEl: HTMLElement | null = null;
+let hoverTimer: ReturnType<typeof setTimeout> | null = null;
+
+function handleGlobalMouseOver(e: MouseEvent) {
+  const el = (e.target as HTMLElement | null)?.closest?.('[title],[data-omni-tip]') as HTMLElement | null;
+  if (!el) {
+    if (hoverTimer) clearTimeout(hoverTimer);
+    hoverTip = null;
+    hoverEl = null;
+    return;
+  }
+  const rawTitle = el.getAttribute('title');
+  if (rawTitle) {
+    el.setAttribute('data-omni-tip', rawTitle);
+    el.removeAttribute('title');
+  }
+  const tipText = el.getAttribute('data-omni-tip') || '';
+  if (!tipText.trim()) return;
+  if (hoverEl === el && hoverTip) return;
+  hoverEl = el;
+  if (hoverTimer) clearTimeout(hoverTimer);
+  const rect = el.getBoundingClientRect();
+  hoverTimer = setTimeout(() => {
+    const x = Math.min(Math.max(10, rect.left + rect.width / 2), window.innerWidth - 160);
+    const y = rect.top > 44 ? rect.top - 8 : rect.bottom + 8;
+    hoverTip = { text: tipText, x, y };
+  }, 320);
+}
+
+function handleGlobalMouseOut(e: MouseEvent) {
+  const rel = e.relatedTarget as HTMLElement | null;
+  if (hoverEl && rel && hoverEl.contains(rel)) return;
+  if (hoverTimer) clearTimeout(hoverTimer);
+  hoverTip = null;
+  hoverEl = null;
+}
+
 let updateInfo = $state<UpdateInfo | null>(null);
 let updateDismissed = $state<boolean>(false);
 let updateInstalling = $state<boolean>(false);
@@ -287,6 +325,8 @@ $effect(() => {
   onkeyup={handleGlobalKeyup}
   oncontextmenu={handleGlobalContextMenu}
   onclick={closeCtxMenu}
+  onmouseover={handleGlobalMouseOver}
+  onmouseout={handleGlobalMouseOut}
 />
 
 <div data-omni-theme-root="" class="w-screen h-screen overflow-hidden">
@@ -661,5 +701,15 @@ $effect(() => {
         {/if}
       </div>
     {/if}
+  </div>
+{/if}
+
+
+{#if hoverTip}
+  <div
+    class="fixed z-[950] pointer-events-none px-2.5 py-1 rounded-[6px] bg-[#18181B]/96 backdrop-blur-md border border-white/[0.1] shadow-xl font-sans text-[11px] text-[#EDEDEF] max-w-[280px] truncate -translate-x-1/2 -translate-y-full"
+    style="left: {hoverTip.x}px; top: {hoverTip.y}px;"
+  >
+    {hoverTip.text}
   </div>
 {/if}

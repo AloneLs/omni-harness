@@ -50,6 +50,7 @@ pub enum StreamEvent {
     RetroactiveReasoningMove {
         text: String,
     },
+    TurnBufferReset,
     ToolCallDelta {
         index: usize,
         #[serde(skip_serializing_if = "Option::is_none")]

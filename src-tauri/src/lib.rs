@@ -1110,21 +1110,20 @@ async fn start_chat_stream(
     let session = state.stream_mgr.create_session(&chat_id).await;
     let session_id = chat_id.clone();
 
+    let install_ws = state::AppState::resolve_install_workspace();
     let explicit_ws = workspace_dir
         .as_deref()
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let fallback_ws = if explicit_ws.is_none() {
-        let ws = state.app_state.get_workspace_dir().await;
-        let s = ws.to_string_lossy().to_string();
-        if s.trim().is_empty() { None } else { Some(s) }
-    } else {
-        explicit_ws.clone()
-    };
-    let (tools_ws_path, workspace_str) = match fallback_ws {
+        .filter(|s| {
+            if s.is_empty() {
+                return false;
+            }
+            PathBuf::from(s) != install_ws
+        });
+    let (tools_ws_path, workspace_str) = match explicit_ws {
         Some(ref dir) => (PathBuf::from(dir), dir.clone()),
         None => {
-            let chat_ws = state::AppState::resolve_install_workspace().join(&chat_id);
+            let chat_ws = install_ws.join(&chat_id);
             let _ = std::fs::create_dir_all(&chat_ws);
             (PathBuf::new(), chat_ws.to_string_lossy().to_string())
         }
@@ -1193,7 +1192,9 @@ async fn start_chat_stream(
     }
     if let Some(ak) = api_key {
         if !ak.trim().is_empty() {
-            key_pool.set_keys(&resolved_provider, vec![ak.trim().to_string()]);
+            let key_str = ak.trim().to_string();
+            key_pool.set_keys(&resolved_provider, vec![key_str.clone()]);
+            key_pool.clear_auth_blocks(&resolved_url, &[key_str]).await;
         }
     }
     let provider_name = resolved_provider;
@@ -1263,6 +1264,9 @@ async fn start_chat_stream(
                 }
                 llm::StreamEvent::RetroactiveReasoningMove { text } => {
                     json!({ "type": "retroactive_reasoning_move", "reasoningContent": text })
+                }
+                llm::StreamEvent::TurnBufferReset => {
+                    json!({ "type": "turn_buffer_reset" })
                 }
                 llm::StreamEvent::RetryNotice { attempt, reason, .. } => {
                     json!({ "type": "retry_notice", "attempt": attempt, "reason": reason })

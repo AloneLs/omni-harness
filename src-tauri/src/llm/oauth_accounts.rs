@@ -1451,7 +1451,7 @@ pub async fn fetch_antigravity_models(client: &reqwest::Client) -> Result<Vec<se
             out.push(serde_json::json!({
                 "id": id,
                 "name": display_name,
-                "contextWindow": info.get("maxInputTokens").and_then(|v| v.as_u64()).unwrap_or(200000),
+                "contextWindow": info.get("maxInputTokens").or_else(|| info.get("inputTokenLimit")).and_then(|v| v.as_u64()).unwrap_or_else(|| if lower.contains("gemini") { 1_048_576 } else { 200_000 }),
                 "maxOutputTokens": info.get("maxOutputTokens").and_then(|v| v.as_u64()).unwrap_or(32768),
                 "supportsReasoning": supports_reasoning,
                 "supportsVision": info.get("supportsImages").and_then(|v| v.as_bool()).unwrap_or(true),

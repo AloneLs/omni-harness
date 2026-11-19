@@ -160,8 +160,12 @@ pub async fn stream_antigravity(
                 .or_else(|| msg.tool_call_id.as_ref().and_then(|id| call_id_to_name.get(id).cloned()))
                 .unwrap_or_else(|| "tool".to_string());
             let raw_out = msg.content.as_text_lossy();
-            let resp_val = serde_json::from_str::<serde_json::Value>(&raw_out)
+            let parsed_out = serde_json::from_str::<serde_json::Value>(&raw_out)
                 .unwrap_or_else(|_| serde_json::json!({ "result": raw_out }));
+            let resp_val = match parsed_out {
+                serde_json::Value::Object(_) => parsed_out,
+                other => serde_json::json!({ "result": other }),
+            };
             contents.push(serde_json::json!({
                 "role": "user",
                 "parts": [{
@@ -443,9 +447,17 @@ pub async fn stream_antigravity(
                         message: format!("{} ({})", smsg, acc.email),
                     });
                     if attempt < max_attempts && (scode == 429 || scode >= 500 || scode == 403) {
+                        let acc_cnt = oauth_accounts::list_accounts(Some("antigravity")).await.into_iter().filter(|a| a.enabled).count();
+                        let reason = if acc_cnt > 1 {
+                            format!("Antigravity stream {} ({}): switching account", scode, acc.email)
+                        } else if scode == 429 {
+                            format!("Antigravity rate limited (429, {}), retrying...", acc.email)
+                        } else {
+                            format!("Antigravity stream {} ({}), retrying...", scode, acc.email)
+                        };
                         let _ = sender
                             .send(StreamEvent::RetryNotice {
-                                reason: format!("Antigravity stream {} ({}): switching account", scode, acc.email),
+                                reason,
                                 attempt,
                                 model: request.model.clone(),
                             })
@@ -477,9 +489,17 @@ pub async fn stream_antigravity(
         });
 
         if attempt < max_attempts && (code == 429 || code >= 500 || code == 403) {
+            let acc_cnt = oauth_accounts::list_accounts(Some("antigravity")).await.into_iter().filter(|a| a.enabled).count();
+            let reason = if acc_cnt > 1 {
+                format!("Antigravity {} ({}): switching account", code, acc.email)
+            } else if code == 429 {
+                format!("Antigravity rate limited (429, {}), retrying...", acc.email)
+            } else {
+                format!("Antigravity {} ({}), retrying...", code, acc.email)
+            };
             let _ = sender
                 .send(StreamEvent::RetryNotice {
-                    reason: format!("Antigravity {} ({}): switching account", code, acc.email),
+                    reason,
                     attempt,
                     model: request.model.clone(),
                 })
