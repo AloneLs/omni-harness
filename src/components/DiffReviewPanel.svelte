@@ -42,63 +42,86 @@ function buildDiffRows(file: TurnFileDiff): DiffRow[] {
     return newLines.map((text, idx) => ({ kind: 'add', newLine: idx + 1, text }));
   }
 
-  const m = oldLines.length;
-  const n = newLines.length;
-  if (m * n > 360000) {
-    const rows: DiffRow[] = [];
-    const maxLen = Math.max(m, n);
-    for (let i = 0; i < maxLen; i++) {
-      const a = oldLines[i];
-      const b = newLines[i];
-      if (a === b && a !== undefined) {
-        rows.push({ kind: 'ctx', oldLine: i + 1, newLine: i + 1, text: a });
-      } else {
-        if (a !== undefined) rows.push({ kind: 'del', oldLine: i + 1, text: a });
-        if (b !== undefined) rows.push({ kind: 'add', newLine: i + 1, text: b });
-      }
-    }
-    return collapseContext(rows);
+  let head = 0;
+  while (head < oldLines.length && head < newLines.length && oldLines[head] === newLines[head]) head++;
+  let tail = 0;
+  while (
+    tail < oldLines.length - head &&
+    tail < newLines.length - head &&
+    oldLines[oldLines.length - 1 - tail] === newLines[newLines.length - 1 - tail]
+  )
+    tail++;
+
+  const oldMid = oldLines.slice(head, oldLines.length - tail);
+  const newMid = newLines.slice(head, newLines.length - tail);
+  const rows: DiffRow[] = [];
+
+  for (let k = 0; k < head; k++) {
+    rows.push({ kind: 'ctx', oldLine: k + 1, newLine: k + 1, text: oldLines[k] });
   }
 
-  const dp = new Int32Array((m + 1) * (n + 1));
-  const cols = n + 1;
-  for (let i = m - 1; i >= 0; i--) {
-    for (let j = n - 1; j >= 0; j--) {
-      if (oldLines[i] === newLines[j]) {
-        dp[i * cols + j] = dp[(i + 1) * cols + (j + 1)] + 1;
-      } else {
-        const down = dp[(i + 1) * cols + j];
-        const right = dp[i * cols + (j + 1)];
-        dp[i * cols + j] = down >= right ? down : right;
+  const m = oldMid.length;
+  const n = newMid.length;
+  if (m === 0) {
+    for (let j = 0; j < n; j++) rows.push({ kind: 'add', newLine: head + j + 1, text: newMid[j] });
+  } else if (n === 0) {
+    for (let i = 0; i < m; i++) rows.push({ kind: 'del', oldLine: head + i + 1, text: oldMid[i] });
+  } else if (m * n > 1000000) {
+    for (let i = 0; i < m; i++) rows.push({ kind: 'del', oldLine: head + i + 1, text: oldMid[i] });
+    for (let j = 0; j < n; j++) rows.push({ kind: 'add', newLine: head + j + 1, text: newMid[j] });
+  } else {
+    const cols = n + 1;
+    const dp = new Int32Array((m + 1) * cols);
+    for (let i = m - 1; i >= 0; i--) {
+      for (let j = n - 1; j >= 0; j--) {
+        dp[i * cols + j] =
+          oldMid[i] === newMid[j]
+            ? dp[(i + 1) * cols + (j + 1)] + 1
+            : Math.max(dp[(i + 1) * cols + j], dp[i * cols + (j + 1)]);
       }
+    }
+
+    let i = 0;
+    let j = 0;
+    while (i < m && j < n) {
+      if (oldMid[i] === newMid[j]) {
+        rows.push({ kind: 'ctx', oldLine: head + i + 1, newLine: head + j + 1, text: oldMid[i] });
+        i++;
+        j++;
+      } else if (dp[(i + 1) * cols + j] >= dp[i * cols + (j + 1)]) {
+        rows.push({ kind: 'del', oldLine: head + i + 1, text: oldMid[i] });
+        i++;
+      } else {
+        rows.push({ kind: 'add', newLine: head + j + 1, text: newMid[j] });
+        j++;
+      }
+    }
+    while (i < m) {
+      rows.push({ kind: 'del', oldLine: head + i + 1, text: oldMid[i] });
+      i++;
+    }
+    while (j < n) {
+      rows.push({ kind: 'add', newLine: head + j + 1, text: newMid[j] });
+      j++;
     }
   }
 
-  const rawRows: DiffRow[] = [];
-  let i = 0;
-  let j = 0;
-  while (i < m && j < n) {
-    if (oldLines[i] === newLines[j]) {
-      rawRows.push({ kind: 'ctx', oldLine: i + 1, newLine: j + 1, text: oldLines[i] });
-      i++;
-      j++;
-    } else if (dp[(i + 1) * cols + j] >= dp[i * cols + (j + 1)]) {
-      rawRows.push({ kind: 'del', oldLine: i + 1, text: oldLines[i] });
-      i++;
-    } else {
-      rawRows.push({ kind: 'add', newLine: j + 1, text: newLines[j] });
-      j++;
-    }
+  for (let k = 0; k < tail; k++) {
+    const oldIdx = oldLines.length - tail + k;
+    const newIdx = newLines.length - tail + k;
+    rows.push({ kind: 'ctx', oldLine: oldIdx + 1, newLine: newIdx + 1, text: oldLines[oldIdx] });
   }
-  while (i < m) {
-    rawRows.push({ kind: 'del', oldLine: i + 1, text: oldLines[i] });
-    i++;
-  }
-  while (j < n) {
-    rawRows.push({ kind: 'add', newLine: j + 1, text: newLines[j] });
-    j++;
-  }
-  return collapseContext(rawRows);
+
+  return capRows(collapseContext(rows));
+}
+
+function capRows(rows: DiffRow[]): DiffRow[] {
+  if (rows.length <= 1400) return rows;
+  return [
+    ...rows.slice(0, 1000),
+    { kind: 'gap', text: `${rows.length - 1200} more lines hidden` },
+    ...rows.slice(rows.length - 200)
+  ];
 }
 
 function collapseContext(rows: DiffRow[]): DiffRow[] {
@@ -155,7 +178,7 @@ function submitInlineComment() {
 {#if chatStore.diffReview}
   <aside
     transition:slide={{ axis: 'x', duration: 180 }}
-    class="h-full w-[48%] min-w-[380px] max-w-[780px] shrink-0 border-r border-white/[0.08] bg-[#0D0D10] flex flex-col overflow-hidden"
+    class="h-full w-[48%] min-w-[380px] max-w-[780px] shrink-0 border-l border-white/[0.08] bg-[#0D0D10] flex flex-col overflow-hidden"
   >
     <div class="h-10 px-3 border-b border-white/[0.08] flex items-center justify-between gap-2 shrink-0 bg-[#121215]">
       <div class="flex items-center gap-2 min-w-0">
@@ -226,7 +249,7 @@ function submitInlineComment() {
                 {#each rows as row, rIdx (`${file.path}-${rIdx}`)}
                   {#if row.kind === 'gap'}
                     <div class="px-4 py-0.5 bg-[#121216] text-[#55555E] text-[10.5px] border-y border-white/[0.04]">
-                      ···
+                      {row.text === '...' ? '···' : row.text}
                     </div>
                   {:else}
                     {@const rowKey = `${file.path}:${rIdx}`}

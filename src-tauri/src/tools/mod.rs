@@ -737,6 +737,12 @@ impl ToolDispatcher {
     ) -> Result<Value, String> {
         let plan_mode = self.is_plan_mode();
         let ws_root = self.working_dir.to_string_lossy().to_string();
+        let owned_conn = if conn.is_none() {
+            self.db.read().ok().and_then(|g| g.clone()).map(|d| d.conn())
+        } else {
+            None
+        };
+        let conn = conn.or(owned_conn.as_deref());
 
         match name {
             "read_file" => {

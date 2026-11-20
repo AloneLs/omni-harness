@@ -404,8 +404,8 @@ $effect(() => {
     </div>
 
     <div data-omni-main="" class="flex-1 flex min-h-0 overflow-hidden relative z-10">
-      <DiffReviewPanel />
       <ChatView onToggleContracts={toggleContractsPanel} />
+      <DiffReviewPanel />
 
       {#if contractsWidth.current > 0.5}
         <div

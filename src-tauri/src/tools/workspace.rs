@@ -10,6 +10,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileMutationResult {
     pub snapshot_id: String,
     pub path: String,
@@ -84,43 +85,52 @@ pub fn record_file_snapshot(
     Ok(snapshot_id)
 }
 
-fn compute_line_diff(old_text: &str, new_text: &str) -> (i64, i64) {
+pub fn compute_line_diff(old_text: &str, new_text: &str) -> (i64, i64) {
     let old_lines: Vec<&str> = old_text.lines().collect();
     let new_lines: Vec<&str> = new_text.lines().collect();
 
-    let mut added = 0i64;
-    let mut removed = 0i64;
+    let mut head = 0usize;
+    while head < old_lines.len() && head < new_lines.len() && old_lines[head] == new_lines[head] {
+        head += 1;
+    }
+    let mut tail = 0usize;
+    while tail < old_lines.len() - head
+        && tail < new_lines.len() - head
+        && old_lines[old_lines.len() - 1 - tail] == new_lines[new_lines.len() - 1 - tail]
+    {
+        tail += 1;
+    }
 
-    let mut i = 0;
-    let mut j = 0;
-    while i < old_lines.len() && j < new_lines.len() {
-        if old_lines[i] == new_lines[j] {
-            i += 1;
-            j += 1;
-        } else {
-            let mut found_in_new = None;
-            for offset in 1..20 {
-                if j + offset < new_lines.len() && old_lines[i] == new_lines[j + offset] {
-                    found_in_new = Some(offset);
-                    break;
-                }
-            }
-            if let Some(offset) = found_in_new {
-                added += offset as i64;
-                j += offset;
+    let old_mid = &old_lines[head..old_lines.len() - tail];
+    let new_mid = &new_lines[head..new_lines.len() - tail];
+    let m = old_mid.len();
+    let n = new_mid.len();
+    if m == 0 {
+        return (n as i64, 0);
+    }
+    if n == 0 {
+        return (0, m as i64);
+    }
+
+    const MAX_DIFF_CELLS: usize = 1_000_000;
+    if m.saturating_mul(n) > MAX_DIFF_CELLS {
+        return (n as i64, m as i64);
+    }
+
+    let cols = n + 1;
+    let mut dp = vec![0u32; (m + 1) * cols];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            dp[i * cols + j] = if old_mid[i] == new_mid[j] {
+                dp[(i + 1) * cols + (j + 1)] + 1
             } else {
-                removed += 1;
-                i += 1;
-            }
+                dp[(i + 1) * cols + j].max(dp[i * cols + (j + 1)])
+            };
         }
     }
-    if i < old_lines.len() {
-        removed += (old_lines.len() - i) as i64;
-    }
-    if j < new_lines.len() {
-        added += (new_lines.len() - j) as i64;
-    }
-    (added, removed)
+
+    let lcs = dp[0] as i64;
+    ((n as i64) - lcs, (m as i64) - lcs)
 }
 
 pub fn read_file(

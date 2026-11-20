@@ -448,30 +448,44 @@ async fn get_turn_file_diffs(
     snapshot_ids: Vec<String>,
 ) -> Result<Vec<TurnFileDiff>, String> {
     let mut order: Vec<String> = Vec::new();
-    let mut by_path: std::collections::HashMap<String, (Option<Vec<u8>>, Option<Vec<u8>>, i64, i64, bool)> =
+    let mut by_path: std::collections::HashMap<String, (Option<Vec<u8>>, Option<Vec<u8>>, bool)> =
         std::collections::HashMap::new();
 
     for sid in snapshot_ids {
         if let Ok(snap) = state.app_state.db.get_file_snapshot(&sid) {
             let entry = by_path.entry(snap.file_path.clone()).or_insert_with(|| {
                 order.push(snap.file_path.clone());
-                (snap.before_blob.clone(), snap.after_blob.clone(), 0, 0, snap.existed_before)
+                (snap.before_blob.clone(), snap.after_blob.clone(), snap.existed_before)
             });
-            entry.1 = snap.after_blob;
-            entry.2 += snap.added_lines;
-            entry.3 += snap.removed_lines;
+            if snap.after_blob.is_some() {
+                entry.1 = snap.after_blob;
+            }
+            entry.2 = entry.2 || snap.existed_before;
         }
     }
 
     let mut out = Vec::with_capacity(order.len());
     for path in order {
-        if let Some((before_b, after_b, added, removed, existed_before)) = by_path.remove(&path) {
+        let Some((before_b, after_b, existed_before)) = by_path.remove(&path) else { continue };
             let before_text = before_b
-                .map(|b| String::from_utf8_lossy(&b).to_string())
+                .as_deref()
+                .map(|b| String::from_utf8_lossy(b).to_string())
                 .unwrap_or_default();
             let after_text = after_b
-                .map(|b| String::from_utf8_lossy(&b).to_string())
+                .as_deref()
+                .map(|b| String::from_utf8_lossy(b).to_string())
                 .unwrap_or_default();
+            let blobs_known = before_b.is_some() && after_b.is_some();
+            let (added, removed) = if existed_before && before_b.is_some() {
+                crate::tools::workspace::compute_line_diff(&before_text, &after_text)
+            } else if after_b.is_some() {
+                (after_text.lines().count() as i64, 0)
+            } else {
+                (0, before_text.lines().count() as i64)
+            };
+            if blobs_known && added == 0 && removed == 0 {
+                continue;
+            }
             out.push(TurnFileDiff {
                 path,
                 before_text,
@@ -480,7 +494,6 @@ async fn get_turn_file_diffs(
                 removed_lines: removed,
                 existed_before,
             });
-        }
     }
     Ok(out)
 }
