@@ -1,6 +1,6 @@
 [package]
 name = "omni-harness"
-version = "1.0.2"
+version = "1.0.3"
 description = "OmniHarness Windows 11 AI-Agent Harness"
 edition = "2021"
 
