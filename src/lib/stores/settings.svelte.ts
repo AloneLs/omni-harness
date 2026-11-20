@@ -65,8 +65,10 @@ export function getDisplayModelId(
   prov: ProviderConfig | null | undefined,
   modelId: string
 ): string {
+  if (!modelId) return '';
   const grp = findModelGroup(prov, modelId);
-  return grp ? grp.displayId : modelId;
+  if (grp) return grp.displayId;
+  return splitReasoningSuffix(modelId).baseId;
 }
 
 export function resolveModelForReasoning(
@@ -91,6 +93,18 @@ export function resolveModelForReasoning(
     }
   }
   return (best && grp.reasoningVariants[best]) || grp.rawIds[0] || modelId;
+}
+
+export function isImageGenerationModel(modelId: string): boolean {
+  const m = modelId.toLowerCase();
+  return (
+    m.includes('-image') ||
+    m.endsWith('image') ||
+    m.includes('imagine-image') ||
+    m.includes('imagen') ||
+    m.includes('dall-e') ||
+    m.includes('flux')
+  );
 }
 
 export function isNonReasoningModelId(modelId: string): boolean {
@@ -258,6 +272,7 @@ class SettingsStore {
   isLoading = $state<boolean>(false);
   isSettingsOpen = $state<boolean>(false);
   isFirstRunOpen = $state<boolean>(false);
+  private diskLoaded = false;
 
   currentProvider = $derived.by(() => {
     return this.data.providers[this.data.activeProvider] || null;
@@ -270,11 +285,14 @@ class SettingsStore {
       this.currentProvider?.modelCapabilities?.[model] ||
       this.currentProvider?.modelCapabilities?.[rawModel];
     if (detected) {
+      const mLow = model.toLowerCase();
+      const isFaulty200k = detected.contextWindow === 200000 && (mLow.includes('gemini') || mLow.includes('sonnet-4') || mLow.includes('sonnet-5') || mLow.includes('sol') || mLow.includes('astra'));
+      const resolvedCtx = isFaulty200k ? (mLow.includes('gemini') ? 1048576 : 1000000) : detected.contextWindow;
       return {
         modelId: model,
         providerId: this.data.activeProvider,
         supportsReasoning: detected.supportsReasoning,
-        contextWindow: detected.contextWindow,
+        contextWindow: resolvedCtx,
         supportsVision: detected.supportsVision,
         supportsTools: detected.supportsTools
       };
@@ -296,7 +314,25 @@ class SettingsStore {
   });
 
   constructor() {
+    this.hydrateFromLocalStorageSync();
     this.init();
+  }
+
+  private hydrateFromLocalStorageSync(): void {
+    if (typeof localStorage === 'undefined') return;
+    const saved = localStorage.getItem('omni_settings');
+    if (!saved) return;
+    try {
+      const parsed = JSON.parse(saved);
+      if (parsed && typeof parsed === 'object') {
+        this.data = {
+          ...DEFAULT_SETTINGS,
+          ...parsed,
+          providers: { ...(parsed.providers || {}) },
+          enabledTools: { ...DEFAULT_SETTINGS.enabledTools, ...(parsed.enabledTools || {}) }
+        };
+      }
+    } catch {}
   }
 
   private async init(): Promise<void> {
@@ -393,38 +429,59 @@ class SettingsStore {
 
   public async loadSettings(): Promise<void> {
     this.isLoading = true;
+    const localProviders = { ...(this.data.providers || {}) };
     try {
       const res = await invoke<AppSettings | null>('get_settings');
       if (res && typeof res === 'object') {
+        const diskProviders = { ...(res.providers || {}) };
+        const mergedProviders =
+          Object.keys(diskProviders).length > 0
+            ? { ...localProviders, ...diskProviders }
+            : localProviders;
+        const activeProvider =
+          res.activeProvider && mergedProviders[res.activeProvider]
+            ? res.activeProvider
+            : this.data.activeProvider && mergedProviders[this.data.activeProvider]
+              ? this.data.activeProvider
+              : Object.values(mergedProviders).find((p) => p.enabled)?.id || '';
+        const activeProvObj = activeProvider ? mergedProviders[activeProvider] : null;
+        for (const prov of Object.values(mergedProviders)) {
+          if (!prov.modelCapabilities) continue;
+          for (const [mid, cap] of Object.entries(prov.modelCapabilities)) {
+            const mLow = mid.toLowerCase();
+            if (cap.contextWindow === 200000) {
+              if (mLow.includes('gemini')) {
+                cap.contextWindow = 1048576;
+              } else if (mLow.includes('sonnet-4') || mLow.includes('sonnet-5') || mLow.includes('sol') || mLow.includes('astra')) {
+                cap.contextWindow = 1000000;
+              }
+            }
+          }
+        }
+        const rawActiveModel = res.activeModel || this.data.activeModel || activeProvObj?.defaultModel || activeProvObj?.availableModels?.[0] || '';
         this.data = {
           ...DEFAULT_SETTINGS,
+          ...this.data,
           ...res,
-          providers: { ...(res.providers || {}) },
+          activeProvider,
+          activeModel: getDisplayModelId(activeProvObj, rawActiveModel),
+          providers: mergedProviders,
           enabledTools: { ...DEFAULT_SETTINGS.enabledTools, ...(res.enabledTools || {}) }
         };
         if (typeof localStorage !== 'undefined') {
           localStorage.setItem('omni_settings', JSON.stringify(this.data));
         }
+        this.diskLoaded = true;
         this.isLoading = false;
         this.syncProvidersToBackend();
+        if (Object.keys(diskProviders).length === 0 && Object.keys(mergedProviders).length > 0) {
+          invoke('save_settings', { settings: this.data }).catch(() => {});
+        }
         return;
       }
     } catch {}
 
-    if (typeof localStorage !== 'undefined') {
-      const saved = localStorage.getItem('omni_settings');
-      if (saved) {
-        try {
-          const parsed = JSON.parse(saved);
-          this.data = {
-            ...DEFAULT_SETTINGS,
-            ...parsed,
-            providers: { ...(parsed.providers || {}) },
-            enabledTools: { ...DEFAULT_SETTINGS.enabledTools, ...(parsed.enabledTools || {}) }
-          };
-        } catch {}
-      }
-    }
+    this.diskLoaded = true;
     this.isLoading = false;
     this.syncProvidersToBackend();
     if (Object.keys(this.data.providers || {}).length > 0) {
@@ -433,27 +490,23 @@ class SettingsStore {
   }
 
   public async refreshAllModelCapabilities(): Promise<void> {
+    const oauthProtos = new Set(['antigravity', 'openai_codex', 'claude_oauth', 'kimi_oauth', 'xai_oauth', 'zcode_oauth', 'perplexity_oauth']);
     const provs = Object.values(this.data.providers || {});
     let changed = false;
     for (const prov of provs) {
       const models = prov.availableModels || [];
       if (models.length === 0) continue;
+      const isOAuth = oauthProtos.has(prov.apiProtocol || '');
       const nextCaps: Record<string, DetectedModelInfo> = { ...(prov.modelCapabilities || {}) };
       for (const mid of models) {
+        const prev = nextCaps[mid];
+        const mLow = mid.toLowerCase();
+        const isCorrupted200k = prev && prev.contextWindow === 200000 && (mLow.includes('gemini') || mLow.includes('sonnet-4') || mLow.includes('sonnet-5') || mLow.includes('sol') || mLow.includes('astra'));
+        if (prev && prev.contextWindow > 0 && !isCorrupted200k) continue;
         try {
           const detected = await invoke<DetectedModelInfo>('detect_model_capabilities', { modelId: mid });
-          const prev = nextCaps[mid];
-          if (
-            !prev ||
-            prev.contextWindow !== detected.contextWindow ||
-            prev.maxOutputTokens !== detected.maxOutputTokens ||
-            prev.supportsReasoning !== detected.supportsReasoning ||
-            prev.supportsVision !== detected.supportsVision ||
-            prev.supportsTools !== detected.supportsTools
-          ) {
-            nextCaps[mid] = detected;
-            changed = true;
-          }
+          nextCaps[mid] = detected;
+          changed = true;
         } catch {}
       }
       prov.modelCapabilities = nextCaps;
@@ -473,6 +526,7 @@ class SettingsStore {
   }
 
   public async saveSettings(): Promise<void> {
+    if (!this.diskLoaded) return;
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem('omni_settings', JSON.stringify(this.data));
     }
@@ -505,8 +559,8 @@ class SettingsStore {
       ...this.data.providers,
       [providerId]: updated
     };
-    if (this.data.activeProvider === providerId && updated.availableModels.length > 0 && !updated.availableModels.includes(this.data.activeModel)) {
-      this.data.activeModel = updated.defaultModel || updated.availableModels[0];
+    if (this.data.activeProvider === providerId && updated.availableModels.length > 0 && !findModelGroup(updated, this.data.activeModel)) {
+      this.data.activeModel = getDisplayModelId(updated, updated.defaultModel || updated.availableModels[0]);
     }
     this.saveSettings();
   }
@@ -560,8 +614,9 @@ class SettingsStore {
   }
 
   public setActiveModel(providerId: string, modelId: string): void {
+    const prov = this.data.providers[providerId];
     this.data.activeProvider = providerId;
-    this.data.activeModel = modelId;
+    this.data.activeModel = getDisplayModelId(prov, modelId);
     this.saveSettings();
   }
 

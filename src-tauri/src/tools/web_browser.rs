@@ -480,4 +480,141 @@ impl CdpController {
         let html_str = result.as_str().unwrap_or("").to_string();
         Ok(html_to_markdown(&html_str))
     }
+
+    pub fn inspect_interactive_dom(&self, ws_url: &str, selector_opt: Option<&str>) -> Result<serde_json::Value, String> {
+        let root_js = selector_opt
+            .map(|s| format!("document.querySelector({}) || document.body", serde_json::to_string(s).unwrap()))
+            .unwrap_or_else(|| "document.body".to_string());
+        let script = format!(
+            r#"(() => {{
+                const root = {};
+                if (!root) return {{ url: location.href, title: document.title, elements: [] }};
+                const els = Array.from(root.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],[role="textbox"],[contenteditable="true"]'));
+                const out = [];
+                for (const el of els) {{
+                    const r = el.getBoundingClientRect();
+                    if (r.width < 2 || r.height < 2) continue;
+                    const st = getComputedStyle(el);
+                    if (st.visibility === 'hidden' || st.display === 'none') continue;
+                    let sel = '';
+                    if (el.id) sel = '#' + CSS.escape(el.id);
+                    else if (el.getAttribute('data-testid')) sel = `[data-testid="${{el.getAttribute('data-testid')}}"]`;
+                    else if (el.name) sel = `${{el.tagName.toLowerCase()}}[name="${{el.name}}"]`;
+                    else {{
+                        const cls = (typeof el.className === 'string' ? el.className : '').trim().split(/\s+/).filter(Boolean).slice(0, 2);
+                        sel = el.tagName.toLowerCase() + (cls.length ? '.' + cls.map(c => CSS.escape(c)).join('.') : '');
+                    }}
+                    out.push({{
+                        tag: el.tagName.toLowerCase(),
+                        type: el.getAttribute('type') || undefined,
+                        text: (el.innerText || el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().slice(0, 80),
+                        placeholder: el.getAttribute('placeholder') || undefined,
+                        href: el.getAttribute('href') || undefined,
+                        selector: sel,
+                        rect: [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]
+                    }});
+                    if (out.length >= 120) break;
+                }}
+                return {{ url: location.href, title: document.title, scrollY: Math.round(window.scrollY), elements: out }};
+            }})()"#,
+            root_js
+        );
+        self.evaluate_script(ws_url, &script)
+    }
+
+    pub fn click_smart(&self, ws_url: &str, selector_or_text: &str) -> Result<(), String> {
+        let q = serde_json::to_string(selector_or_text).unwrap();
+        let script = format!(
+            r#"(() => {{
+                const q = {};
+                let el = null;
+                try {{ el = document.querySelector(q); }} catch {{}}
+                if (!el) {{
+                    const low = q.toLowerCase();
+                    const cands = Array.from(document.querySelectorAll('a,button,[role="button"],input[type="submit"],input[type="button"],[role="link"]'));
+                    el = cands.find(e => ((e.innerText || e.value || e.getAttribute('aria-label') || '').trim().toLowerCase()).includes(low));
+                }}
+                if (!el) throw new Error("Element not found: " + q);
+                el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                el.dispatchEvent(new PointerEvent('pointerdown', {{ bubbles: true }}));
+                el.dispatchEvent(new MouseEvent('mousedown', {{ bubbles: true }}));
+                el.dispatchEvent(new PointerEvent('pointerup', {{ bubbles: true }}));
+                el.dispatchEvent(new MouseEvent('mouseup', {{ bubbles: true }}));
+                el.click();
+                return true;
+            }})()"#,
+            q
+        );
+        self.evaluate_script(ws_url, &script)?;
+        Ok(())
+    }
+
+    pub fn type_smart(&self, ws_url: &str, selector: &str, text: &str, submit: bool) -> Result<(), String> {
+        let script = format!(
+            r#"(() => {{
+                const q = {};
+                let el = null;
+                try {{ el = document.querySelector(q); }} catch {{}}
+                if (!el) {{
+                    const low = q.toLowerCase();
+                    el = Array.from(document.querySelectorAll('input,textarea,[contenteditable="true"]')).find(e =>
+                        (e.getAttribute('placeholder') || e.getAttribute('aria-label') || e.name || '').toLowerCase().includes(low)
+                    );
+                }}
+                if (!el) throw new Error("Input not found: " + q);
+                el.scrollIntoView({{ behavior: 'instant', block: 'center' }});
+                el.focus();
+                const val = {};
+                if (el.isContentEditable) {{
+                    el.innerText = val;
+                }} else {{
+                    const proto = el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) setter.call(el, val); else el.value = val;
+                }}
+                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                if ({}) {{
+                    el.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }}));
+                    el.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }}));
+                    if (el.form && typeof el.form.requestSubmit === 'function') el.form.requestSubmit();
+                }}
+                return true;
+            }})()"#,
+            serde_json::to_string(selector).unwrap(),
+            serde_json::to_string(text).unwrap(),
+            if submit { "true" } else { "false" }
+        );
+        self.evaluate_script(ws_url, &script)?;
+        Ok(())
+    }
+
+    pub fn scroll_page(&self, ws_url: &str, dx: i32, dy: i32, selector_opt: Option<&str>) -> Result<(), String> {
+        let script = if let Some(sel) = selector_opt {
+            format!(
+                "(() => {{ const el = document.querySelector({}); if (el) el.scrollBy({}, {}); else window.scrollBy({}, {}); return true; }})()",
+                serde_json::to_string(sel).unwrap(), dx, dy, dx, dy
+            )
+        } else {
+            format!("(() => {{ window.scrollBy({}, {}); return true; }})()", dx, dy)
+        };
+        self.evaluate_script(ws_url, &script)?;
+        Ok(())
+    }
+
+    pub fn wait_for_selector(&self, ws_url: &str, selector: &str, timeout_ms: u64) -> Result<bool, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.clamp(200, 15_000));
+        let check_js = format!("Boolean(document.querySelector({}))", serde_json::to_string(selector).unwrap());
+        loop {
+            if let Ok(v) = self.evaluate_script(ws_url, &check_js) {
+                if v.as_bool() == Some(true) {
+                    return Ok(true);
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
 }

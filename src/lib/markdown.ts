@@ -172,11 +172,14 @@ export function renderMarkdown(content: string): string {
     `.trim());
   };
 
-  text = text.replace(/^```([a-zA-Z0-9_+\-.]*)[ \t]*\n([\s\S]*?)^```[ \t]*$/gm, (_, rawLang, code) =>
+  text = text.replace(/^[ \t]*```([a-zA-Z0-9_+\-.]*)[ \t]*\n([\s\S]*?)```[ \t]*$/gm, (_, rawLang, code) =>
     renderCodeBlockHtml(rawLang, code)
   );
-  text = text.replace(/```([a-zA-Z0-9_+\-.]+)[ \t]+([^\n]+?)```/g, (_, rawLang, code) =>
+  text = text.replace(/```([a-zA-Z0-9_+\-.]+)[ \t]+([\s\S]*?)```/g, (_, rawLang, code) =>
     renderCodeBlockHtml(rawLang, code)
+  );
+  text = text.replace(/```[ \t]*\n([\s\S]*?)```/g, (_, code) =>
+    renderCodeBlockHtml('text', code)
   );
 
   text = text.replace(/`([^`\n]+)`/g, (_, code) => {

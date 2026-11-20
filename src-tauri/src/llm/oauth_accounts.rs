@@ -1448,11 +1448,22 @@ pub async fn fetch_antigravity_models(client: &reqwest::Client) -> Result<Vec<se
                 || lower.contains("gemini-4")
                 || lower.contains("opus")
                 || lower.contains("sonnet");
+            let def_caps = crate::llm::capabilities::ModelCapabilities::default_for_model(&id);
+            let context_window = info
+                .get("maxTokens")
+                .or_else(|| info.get("maxInputTokens"))
+                .or_else(|| info.get("inputTokenLimit"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(def_caps.context_window as u64);
+            let max_output_tokens = info
+                .get("maxOutputTokens")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(def_caps.max_output_tokens as u64);
             out.push(serde_json::json!({
                 "id": id,
                 "name": display_name,
-                "contextWindow": info.get("maxInputTokens").or_else(|| info.get("inputTokenLimit")).and_then(|v| v.as_u64()).unwrap_or_else(|| if lower.contains("gemini") { 1_048_576 } else { 200_000 }),
-                "maxOutputTokens": info.get("maxOutputTokens").and_then(|v| v.as_u64()).unwrap_or(32768),
+                "contextWindow": context_window,
+                "maxOutputTokens": max_output_tokens,
                 "supportsReasoning": supports_reasoning,
                 "supportsVision": info.get("supportsImages").and_then(|v| v.as_bool()).unwrap_or(true),
                 "supportsTools": true,
@@ -1464,6 +1475,47 @@ pub async fn fetch_antigravity_models(client: &reqwest::Client) -> Result<Vec<se
                 "resetTime": reset_time
             }));
         }
+    }
+    if out.iter().any(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.starts_with("gemini-3.8-flash")).unwrap_or(false))
+        && !out.iter().any(|m| m.get("id").and_then(|v| v.as_str()) == Some("gemini-3.8-flash"))
+    {
+        let flash_caps = crate::llm::capabilities::ModelCapabilities::default_for_model("gemini-3.8-flash");
+        let ref_m = out.iter().find(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.starts_with("gemini-3.8-flash")).unwrap_or(false));
+        out.insert(0, serde_json::json!({
+            "id": "gemini-3.8-flash",
+            "name": "Gemini 3.8 Flash",
+            "contextWindow": flash_caps.context_window,
+            "maxOutputTokens": flash_caps.max_output_tokens,
+            "supportsReasoning": true,
+            "supportsVision": true,
+            "supportsTools": true,
+            "supportsAudio": true,
+            "supportsFiles": true,
+            "supportsImageGen": false,
+            "remainingFraction": ref_m.and_then(|m| m.get("remainingFraction")).cloned(),
+            "isExhausted": ref_m.and_then(|m| m.get("isExhausted")).and_then(|v| v.as_bool()).unwrap_or(false),
+            "resetTime": ref_m.and_then(|m| m.get("resetTime")).cloned()
+        }));
+    }
+    if out.iter().any(|m| m.get("id").and_then(|v| v.as_str()).map(|s| s.starts_with("gpt-oss-120b")).unwrap_or(false))
+        && !out.iter().any(|m| m.get("id").and_then(|v| v.as_str()) == Some("gpt-oss-120b"))
+    {
+        let gpt_caps = crate::llm::capabilities::ModelCapabilities::default_for_model("gpt-oss-120b");
+        out.push(serde_json::json!({
+            "id": "gpt-oss-120b",
+            "name": "GPT-OSS 120B",
+            "contextWindow": gpt_caps.context_window,
+            "maxOutputTokens": gpt_caps.max_output_tokens,
+            "supportsReasoning": true,
+            "supportsVision": true,
+            "supportsTools": true,
+            "supportsAudio": false,
+            "supportsFiles": true,
+            "supportsImageGen": false,
+            "remainingFraction": null,
+            "isExhausted": false,
+            "resetTime": null
+        }));
     }
     Ok(out)
 }
@@ -1944,15 +1996,23 @@ pub async fn fetch_codex_models(client: &reqwest::Client) -> Result<Vec<serde_js
                             }
                             slugs.push(id.to_string());
                             let name = m.get("display_name").or_else(|| m.get("name")).and_then(|v| v.as_str()).unwrap_or(id);
-                            let ctx = m.get("context_window").or_else(|| m.get("max_context_length")).and_then(|v| v.as_u64()).unwrap_or(272000);
+                            let def_caps = crate::llm::capabilities::ModelCapabilities::default_for_model(id);
+                            let ctx = m.get("context_window")
+                                .or_else(|| m.get("max_context_length"))
+                                .or_else(|| m.get("max_tokens"))
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(def_caps.context_window as u64);
+                            let max_out = m.get("max_output_tokens")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(def_caps.max_output_tokens as u64);
                             out.push(serde_json::json!({
                                 "id": id,
                                 "name": name,
                                 "contextWindow": ctx,
-                                "maxOutputTokens": 65536,
-                                "supportsReasoning": true,
-                                "supportsVision": true,
-                                "supportsTools": true,
+                                "maxOutputTokens": max_out,
+                                "supportsReasoning": def_caps.supports_reasoning,
+                                "supportsVision": def_caps.supports_vision,
+                                "supportsTools": def_caps.supports_tools,
                                 "supportsAudio": false,
                                 "supportsFiles": true
                             }));
@@ -1967,25 +2027,26 @@ pub async fn fetch_codex_models(client: &reqwest::Client) -> Result<Vec<serde_js
         }
     }
     let fallback = [
-        ("gpt-5.4", "GPT-5.4", 400000u64),
-        ("gpt-5.3-codex", "GPT-5.3 Codex", 400000u64),
-        ("gpt-5.2-codex", "GPT-5.2 Codex", 400000u64),
-        ("gpt-5.1-codex-max", "GPT-5.1 Codex Max", 400000u64),
-        ("gpt-5-codex", "GPT-5 Codex", 272000u64),
-        ("gpt-5", "GPT-5", 272000u64),
-        ("codex-mini-latest", "Codex Mini", 200000u64),
+        ("gpt-5.4", "GPT-5.4"),
+        ("gpt-5.3-codex", "GPT-5.3 Codex"),
+        ("gpt-5.2-codex", "GPT-5.2 Codex"),
+        ("gpt-5.1-codex-max", "GPT-5.1 Codex Max"),
+        ("gpt-5-codex", "GPT-5 Codex"),
+        ("gpt-5", "GPT-5"),
+        ("codex-mini-latest", "Codex Mini"),
     ];
     Ok(fallback
         .iter()
-        .map(|(id, name, ctx)| {
+        .map(|(id, name)| {
+            let def_caps = crate::llm::capabilities::ModelCapabilities::default_for_model(id);
             serde_json::json!({
                 "id": id,
                 "name": name,
-                "contextWindow": ctx,
-                "maxOutputTokens": 65536,
-                "supportsReasoning": true,
-                "supportsVision": true,
-                "supportsTools": true,
+                "contextWindow": def_caps.context_window,
+                "maxOutputTokens": def_caps.max_output_tokens,
+                "supportsReasoning": def_caps.supports_reasoning,
+                "supportsVision": def_caps.supports_vision,
+                "supportsTools": def_caps.supports_tools,
                 "supportsAudio": false,
                 "supportsFiles": true
             })
@@ -2015,14 +2076,15 @@ pub async fn fetch_claude_models(client: &reqwest::Client) -> Result<Vec<serde_j
                                 continue;
                             }
                             let name = m.get("display_name").and_then(|v| v.as_str()).unwrap_or(id);
+                            let def_caps = crate::llm::capabilities::ModelCapabilities::default_for_model(id);
                             out.push(serde_json::json!({
                                 "id": id,
                                 "name": name,
-                                "contextWindow": 200000,
-                                "maxOutputTokens": 64000,
-                                "supportsReasoning": true,
-                                "supportsVision": true,
-                                "supportsTools": true,
+                                "contextWindow": def_caps.context_window,
+                                "maxOutputTokens": def_caps.max_output_tokens,
+                                "supportsReasoning": def_caps.supports_reasoning,
+                                "supportsVision": def_caps.supports_vision,
+                                "supportsTools": def_caps.supports_tools,
                                 "supportsAudio": false,
                                 "supportsFiles": true
                             }));
@@ -2043,14 +2105,15 @@ pub async fn fetch_claude_models(client: &reqwest::Client) -> Result<Vec<serde_j
     Ok(fallback
         .iter()
         .map(|(id, name)| {
+            let def_caps = crate::llm::capabilities::ModelCapabilities::default_for_model(id);
             serde_json::json!({
                 "id": id,
                 "name": name,
-                "contextWindow": 200000,
-                "maxOutputTokens": 64000,
-                "supportsReasoning": true,
-                "supportsVision": true,
-                "supportsTools": true,
+                "contextWindow": def_caps.context_window,
+                "maxOutputTokens": def_caps.max_output_tokens,
+                "supportsReasoning": def_caps.supports_reasoning,
+                "supportsVision": def_caps.supports_vision,
+                "supportsTools": def_caps.supports_tools,
                 "supportsAudio": false,
                 "supportsFiles": true
             })
@@ -2474,29 +2537,54 @@ async fn fetch_account_quota_inner(client: &reqwest::Client, acc: &mut OAuthAcco
                 return Err(format!("Antigravity check HTTP {}: {}", status.as_u16(), txt));
             }
             let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            let mut min_frac: Option<f64> = None;
-            let mut earliest_reset: Option<i64> = None;
+            let mut min_5h: Option<f64> = None;
+            let mut reset_5h: Option<i64> = None;
+            let mut min_weekly: Option<f64> = None;
+            let mut reset_weekly: Option<i64> = None;
+            let mut fallback_min: Option<f64> = None;
+            let mut fallback_reset: Option<i64> = None;
             if let Some(models) = val.get("models").and_then(|m| m.as_object()) {
                 for (_, info) in models {
                     if info.get("isInternal").and_then(|v| v.as_bool()).unwrap_or(false) {
                         continue;
                     }
                     if let Some(qi) = info.get("quotaInfo") {
-                        if let Some(frac) = qi.get("remainingFraction").and_then(|v| v.as_f64()) {
-                            min_frac = Some(min_frac.map(|m| m.min(frac)).unwrap_or(frac));
+                        if let Some(w_frac) = qi.get("weeklyRemainingFraction").or_else(|| qi.get("weeklyQuotaInfo").and_then(|w| w.get("remainingFraction"))).and_then(|v| v.as_f64()) {
+                            min_weekly = Some(min_weekly.map(|m| m.min(w_frac)).unwrap_or(w_frac));
                         }
-                        if let Some(rt) = qi.get("resetTime").and_then(|v| v.as_str()) {
-                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(rt) {
+                        if let Some(wrt) = qi.get("weeklyResetTime").or_else(|| qi.get("weeklyQuotaInfo").and_then(|w| w.get("resetTime"))).and_then(|v| v.as_str()) {
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(wrt) {
                                 let ms = dt.timestamp_millis();
-                                earliest_reset = Some(earliest_reset.map(|e| e.min(ms)).unwrap_or(ms));
+                                reset_weekly = Some(reset_weekly.map(|e| e.min(ms)).unwrap_or(ms));
+                            }
+                        }
+                        let frac_opt = qi.get("remainingFraction").and_then(|v| v.as_f64());
+                        let rt_ms = qi.get("resetTime").and_then(|v| v.as_str()).and_then(|rt| chrono::DateTime::parse_from_rfc3339(rt).ok()).map(|dt| dt.timestamp_millis());
+                        if let Some(frac) = frac_opt {
+                            fallback_min = Some(fallback_min.map(|m| m.min(frac)).unwrap_or(frac));
+                            if let Some(ms) = rt_ms {
+                                fallback_reset = Some(fallback_reset.map(|e| e.min(ms)).unwrap_or(ms));
+                                if ms - now > 18 * 3600 * 1000 {
+                                    min_weekly = Some(min_weekly.map(|m| m.min(frac)).unwrap_or(frac));
+                                    reset_weekly = Some(reset_weekly.map(|e| e.min(ms)).unwrap_or(ms));
+                                } else {
+                                    min_5h = Some(min_5h.map(|m| m.min(frac)).unwrap_or(frac));
+                                    reset_5h = Some(reset_5h.map(|e| e.min(ms)).unwrap_or(ms));
+                                }
+                            } else {
+                                min_5h = Some(min_5h.map(|m| m.min(frac)).unwrap_or(frac));
                             }
                         }
                     }
                 }
             }
-            if let Some(frac) = min_frac {
+            if let Some(frac) = min_5h.or(fallback_min) {
                 acc.quota_5h_remaining = Some((frac * 100.0).clamp(0.0, 100.0));
-                acc.quota_5h_reset_at_ms = earliest_reset;
+                acc.quota_5h_reset_at_ms = reset_5h.or(fallback_reset);
+            }
+            if let Some(w_frac) = min_weekly {
+                acc.quota_weekly_remaining = Some((w_frac * 100.0).clamp(0.0, 100.0));
+                acc.quota_weekly_reset_at_ms = reset_weekly;
             }
             acc.quota_updated_at_ms = Some(now);
             acc.last_error = None;

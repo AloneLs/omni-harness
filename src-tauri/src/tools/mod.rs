@@ -592,7 +592,7 @@ impl ToolDispatcher {
             "computer_use",
             "Non-intrusive background Windows Computer Use (zero cursor theft, zero focus theft, off-screen staging). Bind or launch a target window first, then inspect/act via COM UIAutomation (snapshot_ui / uia_action) or window-relative ghost input (screenshot, click, double_click, right_click, drag, scroll, type, hotkey). Normalized 0..1000 coordinates are relative to the bound target window.",
             &[
-                ("action", "string", "list_windows | launch_app | bind_window | restore_window | close_window | screenshot | snapshot_ui | uia_action | click | double_click | right_click | middle_click | move | drag | scroll | hscroll | type | hotkey | wait"),
+                ("action", "string", "list_windows | launch_app | bind_window | restore_window | close_window | screenshot | snapshot_ui | uia_action | click | double_click | right_click | middle_click | move | drag | scroll | hscroll | type | hotkey | wait | web_targets | web_open | web_dom | web_click | web_type | web_scroll | web_wait | web_eval | web_screenshot"),
                 ("app", "string", "Executable name or path for launch_app (e.g. 'notepad', 'calc', 'C:\\\\path\\\\app.exe')"),
                 ("args", "array", "Optional CLI arguments array for launch_app"),
                 ("window_title", "string", "Window title substring filter for bind_window / list_windows / snapshot_ui"),
@@ -1863,6 +1863,86 @@ fn execute_computer_use_blocking(
                 "title": info.title,
                 "bounds": info.bounds,
             }))
+        }
+        "web_targets" => {
+            let targets = web_browser::CdpController::new(9222).list_targets()?;
+            Ok(json!({ "targets": targets }))
+        }
+        "web_open" => {
+            let url = args.get("url").and_then(|v| v.as_str()).ok_or("Missing url")?;
+            let targets = match web_browser::CdpController::new(9222).list_targets() {
+                Ok(t) if !t.is_empty() => t,
+                _ => {
+                    #[cfg(target_os = "windows")]
+                    {
+                        use std::os::windows::process::CommandExt;
+                        let _ = std::process::Command::new("cmd")
+                            .args(["/C", "start", "", "msedge", "--remote-debugging-port=9222", url])
+                            .creation_flags(0x08000000)
+                            .spawn();
+                        std::thread::sleep(std::time::Duration::from_millis(1600));
+                    }
+                    web_browser::CdpController::new(9222).list_targets()?
+                }
+            };
+            let ws_url = targets
+                .first()
+                .and_then(|t| t.web_socket_debugger_url.as_deref())
+                .ok_or("No CDP WebSocket target available (start browser with --remote-debugging-port=9222)")?;
+            web_browser::CdpController::new(9222).navigate(ws_url, url)?;
+            Ok(json!({ "status": "navigated", "url": url }))
+        }
+        "web_dom" => {
+            let targets = web_browser::CdpController::new(9222).list_targets()?;
+            let ws_url = targets.first().and_then(|t| t.web_socket_debugger_url.as_deref()).ok_or("No CDP target")?;
+            let sel = args.get("selector").and_then(|v| v.as_str());
+            web_browser::CdpController::new(9222).inspect_interactive_dom(ws_url, sel)
+        }
+        "web_click" => {
+            let q = args.get("selector").or_else(|| args.get("text")).and_then(|v| v.as_str()).ok_or("Missing selector or text")?;
+            let targets = web_browser::CdpController::new(9222).list_targets()?;
+            let ws_url = targets.first().and_then(|t| t.web_socket_debugger_url.as_deref()).ok_or("No CDP target")?;
+            web_browser::CdpController::new(9222).click_smart(ws_url, q)?;
+            Ok(json!({ "status": "clicked", "target": q }))
+        }
+        "web_type" => {
+            let q = args.get("selector").or_else(|| args.get("text_field")).and_then(|v| v.as_str()).ok_or("Missing selector")?;
+            let txt = args.get("text").and_then(|v| v.as_str()).ok_or("Missing text")?;
+            let submit = args.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
+            let targets = web_browser::CdpController::new(9222).list_targets()?;
+            let ws_url = targets.first().and_then(|t| t.web_socket_debugger_url.as_deref()).ok_or("No CDP target")?;
+            web_browser::CdpController::new(9222).type_smart(ws_url, q, txt, submit)?;
+            Ok(json!({ "status": "typed", "selector": q }))
+        }
+        "web_scroll" => {
+            let dx = args.get("dx").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            let dy = args.get("dy").and_then(|v| v.as_i64()).unwrap_or(500) as i32;
+            let sel = args.get("selector").and_then(|v| v.as_str());
+            let targets = web_browser::CdpController::new(9222).list_targets()?;
+            let ws_url = targets.first().and_then(|t| t.web_socket_debugger_url.as_deref()).ok_or("No CDP target")?;
+            web_browser::CdpController::new(9222).scroll_page(ws_url, dx, dy, sel)?;
+            Ok(json!({ "status": "scrolled", "dx": dx, "dy": dy }))
+        }
+        "web_wait" => {
+            let sel = args.get("selector").and_then(|v| v.as_str()).ok_or("Missing selector")?;
+            let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(5000);
+            let targets = web_browser::CdpController::new(9222).list_targets()?;
+            let ws_url = targets.first().and_then(|t| t.web_socket_debugger_url.as_deref()).ok_or("No CDP target")?;
+            let found = web_browser::CdpController::new(9222).wait_for_selector(ws_url, sel, timeout_ms)?;
+            Ok(json!({ "found": found, "selector": sel }))
+        }
+        "web_eval" => {
+            let script = args.get("script").and_then(|v| v.as_str()).ok_or("Missing script")?;
+            let targets = web_browser::CdpController::new(9222).list_targets()?;
+            let ws_url = targets.first().and_then(|t| t.web_socket_debugger_url.as_deref()).ok_or("No CDP target")?;
+            let val = web_browser::CdpController::new(9222).evaluate_script(ws_url, script)?;
+            Ok(json!({ "result": val }))
+        }
+        "web_screenshot" => {
+            let targets = web_browser::CdpController::new(9222).list_targets()?;
+            let ws_url = targets.first().and_then(|t| t.web_socket_debugger_url.as_deref()).ok_or("No CDP target")?;
+            let b64 = web_browser::CdpController::new(9222).capture_screenshot(ws_url, Some("png"))?;
+            Ok(json!({ "dataUrl": format!("data:image/png;base64,{}", b64) }))
         }
         "close_window" => {
             let target_hwnd =

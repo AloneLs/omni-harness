@@ -222,6 +222,39 @@ function extractEditTexts(record: ToolExecutionRecord): { filePath: string; adde
 
 function formatToolLabel(record: ToolExecutionRecord): { verb: string; target: string; added?: number; removed?: number } {
   const n = record.toolName.toLowerCase();
+  if (n === 'tool_hub' && record.args?.action === 'load_skill') {
+    return { verb: 'Skill', target: String(record.args?.name || 'skill') };
+  }
+  if (n.includes('read')) {
+    const { filePath } = extractEditTexts(record);
+    const fileName = filePath ? (filePath.split(/[\\/]/).pop() || filePath) : '';
+    let rangeSuffix = '';
+    let startLine = Number(record.args?.offset ?? record.args?.start_line ?? record.args?.line ?? 0);
+    let endLine = Number(record.args?.end_line ?? 0);
+    if (record.output && record.output.trim().startsWith('{')) {
+      try {
+        const parsed = JSON.parse(record.output);
+        if (typeof parsed?.startLine === 'number') startLine = parsed.startLine;
+        if (typeof parsed?.endLine === 'number') endLine = parsed.endLine;
+        else if (typeof parsed?.linesRead === 'number' && parsed.linesRead > 0) {
+          const s0 = startLine > 0 ? startLine : 1;
+          endLine = s0 + parsed.linesRead - 1;
+          startLine = s0;
+        } else if (typeof parsed?.content === 'string') {
+          const lineCnt = parsed.content.split('\n').length;
+          const s0 = startLine > 0 ? startLine : 1;
+          endLine = s0 + Math.max(0, lineCnt - 1);
+          startLine = s0;
+        }
+      } catch {}
+    } else if (startLine > 0 && Number(record.args?.limit) > 0) {
+      endLine = startLine + Number(record.args.limit) - 1;
+    }
+    if (startLine > 0 && endLine >= startLine) {
+      rangeSuffix = ` #L${startLine}-${endLine}`;
+    }
+    return { verb: 'Read', target: `${fileName || record.actionName}${rangeSuffix}` };
+  }
   if (record.args?.description && typeof record.args.description === 'string') {
     return { verb: '', target: record.args.description };
   }
@@ -422,10 +455,10 @@ function toggleTool(id: string) {
 
 {#if isStreaming || (paused && canResume) || normalizedSteps.length > 0 || (error && (canResume || error !== 'User canceled execution'))}
   {@const isCanceled = error === 'User canceled execution'}
-  <div data-omni-timeline="" class="w-full my-1.5 text-[13px] select-none">
+  <div data-omni-timeline="" class="w-full my-1.5 text-[14.5px] select-none">
     {#if isStreaming && normalizedSteps.length === 0 && !error}
       <div class="relative inline-flex items-center gap-2 py-1 group/retry">
-        <span class="font-sans text-[12.5px] font-medium shimmer-text">
+        <span class="font-sans text-[14px] font-medium shimmer-text">
           {statusText || themeStore.t('working', 'Working')} · {totalDurationLabel}
         </span>
         {#if retryReason}
@@ -446,7 +479,7 @@ function toggleTool(id: string) {
       >
         {#if isStreaming}
           <span class="relative inline-flex items-center group/retry">
-            <span class="font-sans text-[12.5px] font-medium shimmer-text">
+            <span class="font-sans text-[14px] font-medium shimmer-text">
               {statusText || themeStore.t('working', 'Working')} · {totalDurationLabel}
             </span>
             {#if retryReason}
@@ -456,9 +489,9 @@ function toggleTool(id: string) {
             {/if}
           </span>
         {:else if paused}
-          <span class="font-sans text-[12.5px] font-medium text-[#D4D4D8]">Paused · {totalDurationLabel}</span>
+          <span class="font-sans text-[14px] font-medium text-[#D4D4D8]">Paused · {totalDurationLabel}</span>
         {:else}
-          <span class="font-sans text-[12.5px] font-medium">{themeStore.t('worked_for', 'Worked for')} {totalDurationLabel}</span>
+          <span class="font-sans text-[14px] font-medium">{themeStore.t('worked_for', 'Worked for')} {totalDurationLabel}</span>
         {/if}
         <Icon
           name="chevron-down"
@@ -519,7 +552,8 @@ function toggleTool(id: string) {
                 {#if expandedThoughts[step.id]}
                   <div
                     transition:slide={{ duration: 150 }}
-                    class="thought-prose mt-1 mb-1.5 pl-3 border-l border-white/[0.08] font-sans text-[12px] text-[#8E8E95] leading-relaxed max-h-64 overflow-y-auto select-text"
+                    data-omni-thought-body=""
+                    class="thought-prose mt-1 mb-1.5 pl-3 border-l border-white/[0.08] font-sans text-[13.5px] text-[#8E8E95] leading-relaxed max-h-64 overflow-y-auto select-text"
                   >
                     {@html renderMarkdown(step.text)}
                   </div>
@@ -540,7 +574,7 @@ function toggleTool(id: string) {
                   onclick={() => toggleTool(call.toolCallId)}
                 >
                   <FileToolIcon name={String(call.args?.path || call.args?.Path || info.target || '')} toolName={call.toolName} class="w-3.5 h-3.5" />
-                  <span class="font-sans text-[12.5px] truncate {isToolRunning ? 'shimmer-text' : 'text-[#A3A3AA] group-hover/step:text-[#EDEDEF]'}">
+                  <span class="font-sans text-[13.5px] truncate {isToolRunning ? 'shimmer-text' : 'text-[#A3A3AA] group-hover/step:text-[#EDEDEF]'}">
                     {#if info.verb}{info.verb}{/if}
                     {#if info.target}
                       {#if isFileTool && editMeta.filePath}
@@ -604,7 +638,7 @@ function toggleTool(id: string) {
                       {/if}
                     {:else if call.diff || ((call.toolName.toLowerCase().includes('edit') || call.toolName.toLowerCase().includes('write') || call.toolName.toLowerCase().includes('patch')) && buildMiniDiffLines(call).length > 0)}
                       {@const miniDiff = buildMiniDiffLines(call)}
-                      <div class="rounded-[6px] border border-white/[0.06] bg-[#0B0B0D] py-1 max-h-60 overflow-y-auto">
+                      <div data-omni-tool-diff="" class="rounded-[6px] border border-white/[0.06] bg-[#0B0B0D] py-1 max-h-60 overflow-y-auto">
                         {#each miniDiff as change}
                           <div class="px-2 py-0.5 flex gap-2 {change.type === 'add' ? 'bg-[#22C55E]/10 text-[#6EE7B7]' : change.type === 'del' ? 'bg-[#EF4444]/10 text-[#FCA5A5]' : 'text-[#73737A]'}">
                             <span class="w-3 shrink-0 select-none">{change.type === 'add' ? '+' : change.type === 'del' ? '-' : ' '}</span>
@@ -614,8 +648,11 @@ function toggleTool(id: string) {
                       </div>
                     {:else if call.error}
                       <pre class="text-[#F87171] whitespace-pre-wrap break-all max-h-48 overflow-y-auto">{call.error}</pre>
+                    {:else if call.toolName === 'tool_hub' && call.args?.action === 'load_skill' && call.output}
+                      {@const skillContent = (() => { try { const p = JSON.parse(call.output); return typeof p?.content === 'string' ? p.content : readableOut; } catch { return readableOut; } })()}
+                      <div class="markdown-prose text-[12px] text-[#C4C4CA] max-h-64 overflow-y-auto pr-1">{@html renderMarkdown(skillContent)}</div>
                     {:else if readableOut}
-                      <pre class="text-[#9BA1B0] whitespace-pre-wrap break-all max-h-52 overflow-y-auto">{readableOut}</pre>
+                      <pre data-omni-tool-output="" class="text-[#9BA1B0] whitespace-pre-wrap break-all max-h-52 overflow-y-auto">{readableOut}</pre>
                     {:else if isToolRunning}
                       <div class="text-[#66666D] italic">Waiting for output...</div>
                     {:else}
@@ -660,7 +697,7 @@ function toggleTool(id: string) {
                     class="flex items-center gap-1.5 min-w-0 text-left text-[#F87171]/90 hover:text-[#FCA5A5] transition-colors"
                     onclick={() => (showErrorTrace = !showErrorTrace)}
                   >
-                    <span class="font-sans text-[12.5px] truncate">{formatFriendlyError(error)}</span>
+                    <span class="font-sans text-[13.5px] truncate">{formatFriendlyError(error)}</span>
                     <Icon
                       name="chevron-right"
                       class="w-3 h-3 text-[#F87171]/60 shrink-0 transition-transform duration-150 {showErrorTrace ? 'rotate-90' : ''}"
@@ -742,7 +779,7 @@ function toggleTool(id: string) {
               class="flex items-center gap-1.5 min-w-0 text-left text-[#F87171]/90 hover:text-[#FCA5A5] transition-colors"
               onclick={() => (showErrorTrace = !showErrorTrace)}
             >
-              <span class="font-sans text-[12.5px] truncate">{formatFriendlyError(error)}</span>
+              <span class="font-sans text-[13.5px] truncate">{formatFriendlyError(error)}</span>
               <Icon
                 name="chevron-right"
                 class="w-3 h-3 text-[#F87171]/60 shrink-0 transition-transform duration-150 {showErrorTrace ? 'rotate-90' : ''}"

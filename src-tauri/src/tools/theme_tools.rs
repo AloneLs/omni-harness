@@ -102,7 +102,13 @@ pub async fn execute_theme_tool(
                 "[data-omni-chat-view]", "[data-omni-messages]", "[data-omni-message='user']", "[data-omni-message='assistant']",
                 "[data-omni-message-bubble]", "[data-omni-timeline]", "[data-omni-timeline-header]", "[data-omni-tool-row]",
                 "[data-omni-composer]", "[data-omni-composer-box]", "[data-omni-composer-input]", "[data-omni-button='send']",
-                "[data-omni-button='new-chat']", "[data-omni-button='settings']", "[data-omni-icon='<name>']"
+                "[data-omni-button='new-chat']", "[data-omni-button='settings']", "[data-omni-icon='<name>']",
+                "[data-omni-timeline-thoughts]", "[data-omni-thought-toggle]", "[data-omni-thought-body]",
+                "[data-omni-tool-icon]", "[data-omni-tool-label]", "[data-omni-tool-diff]", "[data-omni-tool-output]",
+                "[data-omni-todo-board]", "[data-omni-todo-item]", "[data-omni-error-box]",
+                "[data-omni-message-prose]", "[data-omni-code-block]", "[data-omni-diff-summary]", "[data-omni-message-actions]",
+                "[data-omni-project-group]", "[data-omni-project-header]", "[data-omni-project-chats]", "[data-omni-standalone-header]",
+                "[data-omni-model-btn]", "[data-omni-project-btn]", "[data-omni-reasoning-slider]" 
             ],
             "icons": [
                 "send", "stop", "plus", "close", "settings", "sidebar", "attach", "mic",

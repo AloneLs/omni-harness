@@ -47,6 +47,76 @@ impl AppManagedState {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn resolve_windows_system_proxy() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    let out = std::process::Command::new("reg")
+        .args([
+            "query",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+            "/v",
+            "ProxyEnable",
+        ])
+        .creation_flags(0x08000000)
+        .output()
+        .ok()?;
+    let en_txt = String::from_utf8_lossy(&out.stdout);
+    let enabled = en_txt.contains("0x1") || en_txt.lines().any(|l| l.trim().ends_with(" 1"));
+    if !enabled {
+        return None;
+    }
+    let out2 = std::process::Command::new("reg")
+        .args([
+            "query",
+            "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings",
+            "/v",
+            "ProxyServer",
+        ])
+        .creation_flags(0x08000000)
+        .output()
+        .ok()?;
+    let srv_txt = String::from_utf8_lossy(&out2.stdout);
+    let line = srv_txt.lines().find(|l| l.contains("ProxyServer"))?;
+    let raw = line.split_whitespace().last()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut picked = raw.to_string();
+    if raw.contains('=') {
+        let parts: Vec<&str> = raw.split(';').collect();
+        picked = parts
+            .iter()
+            .find(|x| x.to_ascii_lowercase().starts_with("https="))
+            .or_else(|| parts.iter().find(|x| x.to_ascii_lowercase().starts_with("http=")))
+            .or_else(|| parts.iter().find(|x| x.to_ascii_lowercase().starts_with("socks=")))
+            .and_then(|x| x.split_once('=').map(|(_, v)| v.to_string()))
+            .unwrap_or_else(|| raw.to_string());
+    }
+    let lower = picked.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("socks") {
+        Some(picked)
+    } else if raw.to_ascii_lowercase().contains("socks=") && !raw.to_ascii_lowercase().contains("http=") {
+        Some(format!("socks5h://{}", picked))
+    } else {
+        Some(format!("http://{}", picked))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_windows_system_proxy() -> Option<String> {
+    None
+}
+
+fn is_direct_image_model(model_id: &str) -> bool {
+    let m = model_id.to_ascii_lowercase();
+    m.contains("-image")
+        || m.ends_with("image")
+        || m.contains("imagen")
+        || m.contains("dall-e")
+        || m.contains("flux")
+        || m.contains("imagine-image")
+}
+
 fn build_http_client(
     proxy_enabled: Option<bool>,
     proxy_url: Option<&str>,
@@ -55,6 +125,15 @@ fn build_http_client(
     if proxy_enabled.unwrap_or(false) {
         if let Some(purl) = proxy_url.map(|s| s.trim()).filter(|s| !s.is_empty()) {
             let proxy = reqwest::Proxy::all(purl).map_err(|e| format!("Invalid proxy URL: {}", e))?;
+            return reqwest::Client::builder()
+                .proxy(proxy)
+                .connect_timeout(std::time::Duration::from_secs(20))
+                .build()
+                .map_err(|e| e.to_string());
+        }
+    }
+    if let Some(sys_proxy) = resolve_windows_system_proxy() {
+        if let Ok(proxy) = reqwest::Proxy::all(&sys_proxy) {
             return reqwest::Client::builder()
                 .proxy(proxy)
                 .connect_timeout(std::time::Duration::from_secs(20))
@@ -1190,7 +1269,7 @@ async fn start_chat_stream(
             resolved_url = bu;
         }
     }
-    if let Some(ak) = api_key {
+    if let Some(ref ak) = api_key {
         if !ak.trim().is_empty() {
             let key_str = ak.trim().to_string();
             key_pool.set_keys(&resolved_provider, vec![key_str.clone()]);
@@ -1199,6 +1278,113 @@ async fn start_chat_stream(
     }
     let provider_name = resolved_provider;
     let base_url = resolved_url;
+
+    if !is_theme_mode && is_direct_image_model(&model_id) {
+        let out_base = if !tools_ws_path.as_os_str().is_empty() {
+            tools_ws_path.clone()
+        } else {
+            PathBuf::from(&workspace_str)
+        };
+        let img_dir = out_base.join("generated_images");
+        let _ = std::fs::create_dir_all(&img_dir);
+        let prompt_clean = prompt.clone();
+        let model_clean = model_id.clone();
+        let http_for_img = http_client.clone();
+        let on_evt_img = on_event.clone();
+        let db_img = state.app_state.db.clone();
+        let cid_img = chat_id.clone();
+        let proto_img = api_protocol.clone().unwrap_or_default();
+        let base_img = base_url.clone();
+        let key_img = api_key.clone().unwrap_or_default();
+        let sess_img = session.clone();
+        let mgr_img = state.stream_mgr.clone();
+
+        tokio::spawn(async move {
+            let gen_res: Result<String, String> = async {
+                let (bytes, mime) = if proto_img == "antigravity" || proto_img.is_empty() || key_img.trim().is_empty() {
+                    let (_, b, m) = llm::antigravity_client::generate_antigravity_image(
+                        &http_for_img,
+                        Some(&model_clean),
+                        &prompt_clean,
+                        None,
+                    )
+                    .await?;
+                    (b, m)
+                } else {
+                    use base64::Engine;
+                    let url = format!("{}/images/generations", base_img.trim_end_matches('/'));
+                    let resp = http_for_img
+                        .post(&url)
+                        .bearer_auth(key_img.trim())
+                        .json(&json!({
+                            "model": model_clean,
+                            "prompt": prompt_clean,
+                            "n": 1,
+                            "response_format": "b64_json"
+                        }))
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    if !resp.status().is_success() {
+                        let st = resp.status();
+                        let txt = resp.text().await.unwrap_or_default();
+                        return Err(format!("Image API HTTP {}: {}", st, txt));
+                    }
+                    let v: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+                    let b64 = v
+                        .get("data")
+                        .and_then(|d| d.get(0))
+                        .and_then(|x| x.get("b64_json"))
+                        .and_then(|s| s.as_str())
+                        .ok_or_else(|| "No b64_json in image response".to_string())?;
+                    let b = base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .map_err(|e| e.to_string())?;
+                    (b, "image/png".to_string())
+                };
+                let ext = if mime.contains("jpeg") || mime.contains("jpg") {
+                    "jpg"
+                } else if mime.contains("webp") {
+                    "webp"
+                } else {
+                    "png"
+                };
+                let out_file = img_dir.join(format!("gen_{}.{}", chrono::Utc::now().timestamp_millis(), ext));
+                std::fs::write(&out_file, &bytes).map_err(|e| e.to_string())?;
+                Ok(out_file.to_string_lossy().to_string())
+            }
+            .await;
+
+            if !sess_img.is_active() {
+                mgr_img.remove_session(&cid_img).await;
+                return;
+            }
+            match gen_res {
+                Ok(path_str) => {
+                    let md = format!("![generated]({})", path_str);
+                    let _ = on_evt_img.send(json!({ "type": "delta", "content": md }));
+                    let seq = db_img.max_message_seq(&cid_img) + 1;
+                    let _ = db_img.create_message(&db::chats::Message {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        chat_id: cid_img.clone(),
+                        role: "assistant".to_string(),
+                        content: md,
+                        reasoning_content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        sequence_num: seq,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    });
+                    let _ = on_evt_img.send(json!({ "type": "done", "usage": null }));
+                }
+                Err(e) => {
+                    let _ = on_evt_img.send(json!({ "type": "error", "message": e }));
+                }
+            }
+            mgr_img.remove_session(&cid_img).await;
+        });
+        return Ok(session_id);
+    }
 
     let is_swarm = prompt.starts_with("/swarm");
     let (tx, mut rx) = tokio::sync::mpsc::channel(128);
@@ -2638,14 +2824,41 @@ async fn get_speech_status(
 
 #[tauri::command]
 async fn download_whisper_model(
+    app: tauri::AppHandle,
     state: State<'_, AppManagedState>,
     model_id: String,
 ) -> Result<String, String> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, u64)>(32);
+    let app_c = app.clone();
+    let mid_c = model_id.clone();
+    tokio::spawn(async move {
+        let mut last_pct: i32 = -1;
+        while let Some((dl, total)) = rx.recv().await {
+            let pct = if total > 0 { ((dl as f64 / total as f64) * 100.0).round() as i32 } else { 0 };
+            if pct != last_pct {
+                last_pct = pct;
+                let _ = tauri::Emitter::emit(&app_c, "whisper-download-progress", serde_json::json!({
+                    "modelId": mid_c,
+                    "downloaded": dl,
+                    "total": total,
+                    "percent": pct.clamp(0, 100)
+                }));
+            }
+        }
+    });
     let path = state
         .speech_engine
-        .download_model(&model_id, None)
+        .download_model(&model_id, Some(tx))
         .await?;
     Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn delete_whisper_model(
+    state: State<'_, AppManagedState>,
+    model_id: String,
+) -> Result<(), String> {
+    state.speech_engine.delete_model(&model_id)
 }
 
 
@@ -3048,6 +3261,7 @@ pub fn run() {
             transcribe_audio,
             get_speech_status,
             download_whisper_model,
+            delete_whisper_model,
             get_telegram_config,
             start_telegram_bot,
             stop_telegram_bot,

@@ -110,8 +110,30 @@ impl Database {
         Ok(())
     }
 
+    fn ensure_project_row(conn: &rusqlite::Connection, project_id: Option<&str>) {
+        if let Some(pid) = project_id.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            let exists: bool = conn
+                .query_row("SELECT 1 FROM projects WHERE id = ?1", [pid], |_| Ok(true))
+                .unwrap_or(false);
+            if !exists {
+                let name = pid
+                    .trim_end_matches(&['/', '\\'][..])
+                    .rsplit(&['/', '\\'][..])
+                    .next()
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or(pid);
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = conn.execute(
+                    "INSERT OR IGNORE INTO projects (id, name, root_path, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![pid, name, pid, now, now],
+                );
+            }
+        }
+    }
+
     pub fn create_chat(&self, chat: &Chat) -> Result<(), AppError> {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        Self::ensure_project_row(&conn, chat.project_id.as_deref());
         conn.execute(
             "INSERT INTO chats (id, project_id, title, model_id, system_prompt, is_pinned, created_at, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -225,6 +247,7 @@ impl Database {
 
     pub fn update_chat_project(&self, id: &str, project_id: Option<&str>) -> Result<(), AppError> {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        Self::ensure_project_row(&conn, project_id);
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "UPDATE chats SET project_id = ?1, updated_at = ?2 WHERE id = ?3",

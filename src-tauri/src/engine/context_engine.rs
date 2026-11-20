@@ -179,65 +179,39 @@ pub fn spill_tool_output_if_needed(
     spill_tool_output_with_path(workspace_root, call_id, raw_output).0
 }
 
-pub fn read_project_memory_prefix(workspace_root: &str) -> String {
-    let root = Path::new(workspace_root);
-    let mut out = String::new();
+pub fn resolve_auto_memory_dir(workspace_root: &str) -> std::path::PathBuf {
+    crate::state::AppState::resolve_project_data_dir(workspace_root).join("memory")
+}
 
-    let primary_summary = resolve_project_summary_path(workspace_root);
-    let legacy_summary = root.join(".omniharness").join("PROJECT_SUMMARY.md");
-    let summary_path = if primary_summary.is_file() {
-        primary_summary
-    } else {
-        legacy_summary
-    };
-    if summary_path.is_file() {
-        if let Ok(content) = std::fs::read_to_string(&summary_path) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                let cap = if trimmed.chars().count() > 8000 {
-                    format!("{}...", safe_slice_head(trimmed, 8000))
-                } else {
-                    trimmed.to_string()
-                };
-                let age_note = std::fs::metadata(&summary_path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| SystemTime::now().duration_since(t).ok())
-                    .map(|d| d.as_secs() / 86400)
-                    .filter(|days| *days >= 1)
-                    .map(|days| format!("\n<system-reminder>PROJECT_SUMMARY.md is {} day(s) old. Verify critical claims against live files if code changed.</system-reminder>", days))
-                    .unwrap_or_default();
-                out.push_str(&format!(
-                    "\n--- PROJECT SUMMARY (PROJECT_SUMMARY.md - SOURCE OF TRUTH) ---\n{}{}\n",
-                    cap, age_note
-                ));
-            }
+pub fn read_project_memory_prefix(workspace_root: &str) -> String {
+    let mut out = String::new();
+    let summary_path = resolve_project_summary_path(workspace_root);
+    if let Ok(raw) = std::fs::read_to_string(&summary_path) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            out.push_str("
+<project_summary>
+");
+            out.push_str(safe_slice_head(trimmed, 12_000));
+            out.push_str("
+</project_summary>
+");
         }
     }
-
-    for candidate in ["AGENTS.md", "CLAUDE.md", ".omniharness/rules.md"] {
-        let p = root.join(candidate);
-        if p.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&p) {
-                let trimmed = content.trim();
-                if !trimmed.is_empty() {
-                    let cap = if trimmed.chars().count() > 6000 {
-                        format!("{}...", safe_slice_head(trimmed, 6000))
-                    } else {
-                        trimmed.to_string()
-                    };
-                    let age_note = std::fs::metadata(&p)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| SystemTime::now().duration_since(t).ok())
-                        .map(|d| d.as_secs() / 86400)
-                        .filter(|days| *days >= 1)
-                        .map(|days| format!("\n<system-reminder>Memory file {} is {} day(s) old. Verify its claims against live files before acting.</system-reminder>", candidate, days))
-                        .unwrap_or_default();
-                    out.push_str(&format!("\n--- PROJECT MEMORY ({}) ---\n{}{}\n", candidate, cap, age_note));
-                    break;
-                }
-            }
+    let mem_index = resolve_auto_memory_dir(workspace_root).join("MEMORY.md");
+    if let Ok(raw) = std::fs::read_to_string(&mem_index) {
+        let lines: Vec<&str> = raw.lines().take(200).collect();
+        let joined = lines.join("
+");
+        let trimmed = joined.trim();
+        if !trimmed.is_empty() {
+            out.push_str("
+<auto_memory_index>
+");
+            out.push_str(safe_slice_head(trimmed, 25_000));
+            out.push_str("
+</auto_memory_index>
+");
         }
     }
     out

@@ -751,3 +751,51 @@ pub fn import_skill_zip(zip_bytes: &[u8], skills_root: &Path) -> Result<String, 
 
     Ok(metadata.name)
 }
+
+pub fn is_always_apply_skill(meta: &SkillMetadata) -> bool {
+    if meta.disable_model_invocation || !meta.enabled {
+        return false;
+    }
+    if meta.auto_start {
+        return true;
+    }
+    let name_l = meta.name.to_lowercase();
+    let desc_l = meta.description.to_lowercase();
+    name_l == "personal-profile"
+        || desc_l.contains("всегда при начале нового разговора")
+        || desc_l.contains("при начале нового разговора")
+        || desc_l.contains("в начале каждого чата")
+        || desc_l.contains("активируй этот навык всегда")
+        || desc_l.contains("always activate")
+        || desc_l.contains("always at the start")
+        || desc_l.contains("always apply")
+}
+
+pub fn build_preactivated_skills_block(workspace_path: &str) -> String {
+    let all = discover_all_skills(workspace_path);
+    let mut out = String::new();
+    for sk in all {
+        if !is_always_apply_skill(&sk.metadata) {
+            continue;
+        }
+        let body = sk.body_content.trim();
+        if body.is_empty() {
+            continue;
+        }
+        if out.is_empty() {
+            out.push_str("
+<preactivated_skills>
+The following user skills are ALWAYS ACTIVE for every conversation. Follow them strictly without needing to call tool_hub:
+");
+        }
+        out.push_str(&format!("
+### Skill: {}
+{}
+", sk.metadata.name, body));
+    }
+    if !out.is_empty() {
+        out.push_str("</preactivated_skills>
+");
+    }
+    out
+}

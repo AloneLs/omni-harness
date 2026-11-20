@@ -90,11 +90,37 @@ pub struct PolicyMatch {
     pub sig_hash: String,
 }
 
+const HARD_FILTER_SIGNATURES: &[&str] = &[
+    "this request was blocked by gemini's filters",
+    "blocked by gemini's filters",
+    "trigger by mistake on safe coding",
+    "policies.google.com/terms/generative-ai",
+    "finishreason: safety",
+    "finish_reason: \"safety\"",
+    "violates the google generative ai",
+    "high severity detected",
+    "запрос заблокирован фильтрами",
+    "заблокирован фильтрами",
+];
+
 pub fn detect_filter_signature(text: &str) -> Option<PolicyMatch> {
-    if text.trim().is_empty() {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    let lower = text.to_lowercase();
+    let lower = trimmed.to_lowercase();
+    for sig in HARD_FILTER_SIGNATURES {
+        if lower.contains(sig) {
+            let h = sha256_hex(sig.as_bytes());
+            return Some(PolicyMatch {
+                category: "FILTER_SIGNATURES",
+                sig_hash: h[..12].to_string(),
+            });
+        }
+    }
+    if trimmed.contains("```") || trimmed.chars().count() > 900 {
+        return None;
+    }
     for sig in FILTER_SIGNATURES {
         if lower.contains(sig) {
             let h = sha256_hex(sig.as_bytes());

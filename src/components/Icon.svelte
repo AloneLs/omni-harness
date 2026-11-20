@@ -25,7 +25,8 @@ export type IconName =
   | 'user'
   | 'terminal'
   | 'copy'
-  | 'check';
+  | 'check'
+  | 'mic';
 
 let {
   name,
@@ -140,6 +141,11 @@ let isImageUrl = $derived(
     <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
   {:else if name === 'check'}
     <polyline points="20 6 9 17 4 12"></polyline>
+  {:else if name === 'mic'}
+    <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+    <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+    <line x1="12" y1="19" x2="12" y2="23"></line>
+    <line x1="8" y1="23" x2="16" y2="23"></line>
   {/if}
 </svg>
 {/if}

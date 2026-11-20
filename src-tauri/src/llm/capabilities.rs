@@ -548,9 +548,14 @@ impl CapabilityRegistry {
         supports_tools: Option<bool>,
     ) {
         let mut caps = self.get(model_id);
+        let default_caps = ModelCapabilities::default_for_model(model_id);
         if let Some(cw) = context_window {
             if cw > 0 {
-                caps.context_window = cw;
+                if cw == 200_000 && default_caps.context_window > 200_000 {
+                    caps.context_window = default_caps.context_window;
+                } else {
+                    caps.context_window = cw;
+                }
             }
         }
         if let Some(mo) = max_output_tokens {

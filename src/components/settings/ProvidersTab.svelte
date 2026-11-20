@@ -271,17 +271,21 @@ async function ensureOAuthProviderRegistered(oauthProv: string) {
   try {
     const raw = await invoke<any[]>(cmdName, px);
     if (Array.isArray(raw)) {
-      models = raw.map((m) => ({
-        id: m.id,
-        name: m.name || m.id,
-        contextWindow: m.contextWindow || 200000,
-        maxOutputTokens: m.maxOutputTokens || 32768,
-        supportsReasoning: Boolean(m.supportsReasoning),
-        supportsVision: m.supportsVision !== false,
-        supportsTools: m.supportsTools !== false,
-        supportsAudio: Boolean(m.supportsAudio),
-        supportsFiles: true
-      }));
+      models = raw.map((m) => {
+        const idLow = (m.id || '').toLowerCase();
+        const defaultCtx = idLow.includes('gemini') ? 1048576 : (idLow.includes('sonnet-4') || idLow.includes('sonnet-5') || idLow.includes('sol') || idLow.includes('astra')) ? 1000000 : 200000;
+        return {
+          id: m.id,
+          name: m.name || m.id,
+          contextWindow: m.contextWindow || defaultCtx,
+          maxOutputTokens: m.maxOutputTokens || 32768,
+          supportsReasoning: Boolean(m.supportsReasoning),
+          supportsVision: m.supportsVision !== false,
+          supportsTools: m.supportsTools !== false,
+          supportsAudio: Boolean(m.supportsAudio),
+          supportsFiles: true
+        };
+      });
     }
   } catch (err: any) {
     oauthStatus = err instanceof Error ? err.message : String(err);
@@ -290,21 +294,31 @@ async function ensureOAuthProviderRegistered(oauthProv: string) {
   if (models.length === 0) {
     const fallbackIds =
       oauthProv === 'antigravity'
-        ? ['gemini-3.8-flash', 'gemini-4-argon', 'claude-opus-5-5', 'claude-sonnet-5-5', 'gpt-oss-120b']
+        ? ['gemini-3.8-flash', 'gemini-3.8-flash-high', 'gemini-3.8-flash-medium', 'gemini-3.8-flash-low', 'claude-sonnet-4-6', 'claude-opus-4-6-thinking', 'gpt-oss-120b', 'gpt-oss-120b-medium', 'gemini-3.1-flash-image']
         : oauthProv === 'openai_codex'
           ? ['gpt-6.1-sol', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6.1-terra', 'gpt-6-luna', 'gpt-6-chat-thinking']
           : ['claude-opus-4-6', 'claude-sonnet-4-6', 'claude-haiku-4-5'];
-    models = fallbackIds.map((id) => ({
-      id,
-      name: id,
-      contextWindow: oauthProv === 'openai_codex' ? 524288 : 200000,
-      maxOutputTokens: 65536,
-      supportsReasoning: true,
-      supportsVision: true,
-      supportsTools: true,
-      supportsAudio: id.includes('gemini'),
-      supportsFiles: true
-    }));
+    models = await Promise.all(
+      fallbackIds.map(async (id) => {
+        try {
+          return await invoke<DetectedModelInfo>('detect_model_capabilities', { modelId: id });
+        } catch {
+          const isGem = id.includes('gemini');
+          const isSonnet = id.includes('sonnet') || id.includes('sol') || id.includes('astra');
+          return {
+            id,
+            name: id,
+            contextWindow: isGem ? 1048576 : isSonnet ? 1000000 : oauthProv === 'openai_codex' ? 524288 : 200000,
+            maxOutputTokens: 65536,
+            supportsReasoning: true,
+            supportsVision: true,
+            supportsTools: true,
+            supportsAudio: isGem,
+            supportsFiles: true
+          };
+        }
+      })
+    );
   }
 
   const capsMap: Record<string, DetectedModelInfo> = {};

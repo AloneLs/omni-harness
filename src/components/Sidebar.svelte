@@ -40,22 +40,46 @@ $effect(() => {
 const INITIAL_LIMIT = 8;
 const [pinSend, pinReceive] = crossfade({ duration: 220, easing: cubicOut });
 
-let visibleRecent = $derived.by(() => {
-  if (showAllSessions || chatStore.filterSearchQuery.trim().length > 0 || chatStore.showArchived) {
-    return chatStore.recentSessions;
+let collapsedProjects = $state<Record<string, boolean>>((() => {
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem('omni_collapsed_projects') : null;
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
   }
-  return chatStore.recentSessions.slice(0, INITIAL_LIMIT);
-});
+})());
+
+function toggleProjectCollapsed(projPath: string) {
+  const k = normProj(projPath);
+  collapsedProjects = { ...collapsedProjects, [k]: !collapsedProjects[k] };
+  try {
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('omni_collapsed_projects', JSON.stringify(collapsedProjects));
+    }
+  } catch {}
+}
 
 function normProj(p?: string): string {
   return (p || '').replace(/[\\/]+$/, '').toLowerCase();
 }
 
+let projectChatsByNorm = $derived.by(() => {
+  const grouped = new Map<string, typeof chatStore.recentSessions>();
+  for (const c of chatStore.recentSessions) {
+    if (!c.projectPath) continue;
+    const k = normProj(c.projectPath);
+    const list = grouped.get(k);
+    if (list) list.push(c);
+    else grouped.set(k, [c]);
+  }
+  for (const list of grouped.values()) {
+    list.sort((a, b) => Number(Boolean(b.pinned)) - Number(Boolean(a.pinned)) || b.updatedAt - a.updatedAt);
+  }
+  return grouped;
+});
+
 let uniqueProjectPaths = $derived.by(() => {
   const map = new Map<string, string>();
-  if (workspaceStore.currentPath) {
-    map.set(normProj(workspaceStore.currentPath), workspaceStore.currentPath);
-  }
   for (const rp of workspaceStore.recentWorkspaces) {
     if (rp) {
       const k = normProj(rp);
@@ -68,28 +92,30 @@ let uniqueProjectPaths = $derived.by(() => {
       if (!map.has(k)) map.set(k, c.projectPath);
     }
   }
-  return Array.from(map.values());
-});
-
-let projectChatsByNorm = $derived.by(() => {
-  const grouped = new Map<string, typeof chatStore.recentSessions>();
-  for (const c of chatStore.recentSessions) {
-    if (!c.projectPath) continue;
-    const k = normProj(c.projectPath);
-    const list = grouped.get(k);
-    if (list) list.push(c);
-    else grouped.set(k, [c]);
+  if (workspaceStore.currentPath) {
+    const k = normProj(workspaceStore.currentPath);
+    if (!map.has(k)) map.set(k, workspaceStore.currentPath);
   }
-  return grouped;
+  return Array.from(map.values()).filter((p) => {
+    const k = normProj(p);
+    return (projectChatsByNorm.get(k)?.length || 0) > 0 || normProj(workspaceStore.currentPath) === k;
+  });
 });
 
-let standaloneChats = $derived(visibleRecent.filter((c) => !c.projectPath));
+let allStandaloneChats = $derived(chatStore.recentSessions.filter((c) => !c.projectPath));
+
+let standaloneChats = $derived.by(() => {
+  if (showAllSessions || chatStore.filterSearchQuery.trim().length > 0 || chatStore.showArchived) {
+    return allStandaloneChats;
+  }
+  return allStandaloneChats.slice(0, INITIAL_LIMIT);
+});
 
 let hasMoreSessions = $derived(
   !showAllSessions &&
   !chatStore.showArchived &&
   chatStore.filterSearchQuery.trim().length === 0 &&
-  chatStore.recentSessions.length > INITIAL_LIMIT
+  allStandaloneChats.length > INITIAL_LIMIT
 );
 
 function handleDragMouseDown(e: MouseEvent) {
@@ -305,15 +331,25 @@ function formatRelativeAge(timestamp: number): string {
         {#each uniqueProjectPaths as projPath (normProj(projPath))}
           {@const projName = projPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || projPath}
           {@const thisProjChats = projectChatsByNorm.get(normProj(projPath)) || []}
-          <div class="mb-2">
+          {@const isProjCollapsed = Boolean(collapsedProjects[normProj(projPath)])}
+          <div data-omni-project-group="" class="mb-2">
             <div
-              class="group/proj flex items-center gap-1 mb-0.5 rounded-[4px] hover:bg-white/[0.04] transition-colors pr-1"
+              data-omni-project-header=""
+              class="group/proj flex items-center gap-0.5 mb-0.5 rounded-[4px] hover:bg-white/[0.04] transition-colors pr-1"
               oncontextmenu={(e) => openProjCtxMenu(e, projPath)}
               role="presentation"
             >
               <button
                 type="button"
-                class="flex-1 min-w-0 px-2 py-1.5 flex items-center gap-2 text-left {normProj(workspaceStore.currentPath) === normProj(projPath) ? 'text-[#EDEDEF]' : 'text-[#A3A3AA] hover:text-white'} transition-colors"
+                class="w-5 h-6 rounded-[4px] flex items-center justify-center text-[#73737A] hover:text-[#EDEDEF] shrink-0"
+                onclick={() => toggleProjectCollapsed(projPath)}
+                title={isProjCollapsed ? 'Expand project' : 'Collapse project'}
+              >
+                <Icon name="chevron-right" class="w-3 h-3 transition-transform duration-150 {isProjCollapsed ? '' : 'rotate-90'}" strokeWidth={1.8} />
+              </button>
+              <button
+                type="button"
+                class="flex-1 min-w-0 px-1 py-1.5 flex items-center gap-2 text-left {normProj(workspaceStore.currentPath) === normProj(projPath) ? 'text-[#EDEDEF]' : 'text-[#A3A3AA] hover:text-white'} transition-colors"
                 onclick={() => workspaceStore.setWorkspaceDir(projPath)}
                 title={projPath}
               >
@@ -330,7 +366,8 @@ function formatRelativeAge(timestamp: number): string {
                 <Icon name="plus" class="w-3.5 h-3.5" strokeWidth={1.8} />
               </button>
             </div>
-            <div class="pl-2 space-y-0.5">
+            {#if !isProjCollapsed}
+            <div data-omni-project-chats="" transition:slide={{ duration: 140 }} class="pl-2 space-y-0.5">
               {#each thisProjChats as chat (chat.id)}
                 <div
                   data-omni-chat-item=""
@@ -407,15 +444,19 @@ function formatRelativeAge(timestamp: number): string {
                 </div>
               {/each}
             </div>
+            {/if}
           </div>
         {/each}
       {/if}
 
-      {#if uniqueProjectPaths.length > 0 && standaloneChats.length > 0 && !chatStore.showArchived}
-        <div class="my-2 border-t border-white/[0.07]"></div>
+      {#if standaloneChats.length > 0 && !chatStore.showArchived}
+        {#if uniqueProjectPaths.length > 0}
+          <div class="my-2 border-t border-white/[0.07]"></div>
+        {/if}
+        <div data-omni-standalone-header="" class="px-2 py-1 text-[11px] font-sans text-[#66666D]">Без проекта</div>
       {/if}
       <div class="space-y-0.5">
-        {#each (chatStore.showArchived ? visibleRecent : standaloneChats) as chat (chat.id)}
+        {#each (chatStore.showArchived ? chatStore.recentSessions : standaloneChats) as chat (chat.id)}
           <div
             data-omni-chat-item=""
             animate:flip={{ duration: 170 }}

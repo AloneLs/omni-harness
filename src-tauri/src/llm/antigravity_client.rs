@@ -250,6 +250,18 @@ pub async fn stream_antigravity(
         gen_cfg.insert("maxOutputTokens".to_string(), serde_json::json!(mt));
     }
 
+    let mut model_clean = model_clean.to_string();
+    let mc_low = model_clean.to_lowercase();
+    if mc_low == "gemini-3.8-flash" {
+        let suf = match request.reasoning_effort.as_deref() {
+            Some("low") => "low",
+            Some("medium") => "medium",
+            _ => "high",
+        };
+        model_clean = format!("{}-{}", model_clean, suf);
+    } else if mc_low == "gpt-oss-120b" {
+        model_clean = "gpt-oss-120b-medium".to_string();
+    }
     let m_low = model_clean.to_lowercase();
     let is_gpt_oss = m_low.contains("gpt-oss");
     let is_claude = m_low.contains("claude");

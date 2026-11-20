@@ -475,7 +475,13 @@ function handleContainerClick(event: MouseEvent) {
     </div>
   {:else}
     <div data-omni-message="assistant" class="w-full space-y-2">
-      {#if message.streaming || message.paused || message.error || message.reasoningContent || (message.toolCalls && message.toolCalls.length > 0) || (message.steps && message.steps.length > 0) || (message.todos && message.todos.length > 0)}
+      {#if message.imageGenerating}
+        <div class="my-1 w-[260px] h-[260px] rounded-[14px] border border-white/[0.1] bg-[#141418] overflow-hidden relative flex flex-col items-center justify-center gap-2.5 select-none">
+          <div class="absolute inset-0 bg-gradient-to-tr from-[#8B5CF6]/15 via-[#38BDF8]/10 to-[#EC4899]/15 animate-pulse"></div>
+          <div class="relative z-10 w-10 h-10 rounded-full border-2 border-white/[0.14] border-t-[#E5E5E8] animate-spin"></div>
+          <span class="relative z-10 font-mono text-[11px] text-[#A3A3AA]">Generating image...</span>
+        </div>
+      {:else if message.streaming || message.paused || message.error || message.reasoningContent || (message.toolCalls && message.toolCalls.length > 0) || (message.steps && message.steps.length > 0) || (message.todos && message.todos.length > 0)}
         <TimelineBlock
           steps={splitPipeline.timelineSteps}
           reasoningContent={message.reasoningContent}
@@ -495,7 +501,7 @@ function handleContainerClick(event: MouseEvent) {
       {/if}
 
       {#if splitPipeline.finalContent}
-        <div class="markdown-prose font-sans text-[13.5px] text-[#EDEDEF] leading-relaxed select-text">
+        <div data-omni-message-prose="" class="markdown-prose font-sans text-[15px] text-[#EDEDEF] leading-relaxed select-text">
           {@html parsedMarkdown.html}
         </div>
       {/if}

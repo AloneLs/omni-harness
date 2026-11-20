@@ -1,7 +1,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import type { ToolExecutionRecord } from '../toolMapper';
 import { formatToolExecution } from '../toolMapper';
-import { settingsStore, resolveModelForReasoning, type ReasoningLevel } from './settings.svelte';
+import { settingsStore, resolveModelForReasoning, isImageGenerationModel, type ReasoningLevel } from './settings.svelte';
 import { workspaceStore } from './workspace.svelte';
 
 export interface ChatAttachment {
@@ -40,6 +40,7 @@ export interface ChatMessage {
   retryReason?: string;
   startedAt?: number;
   finishedAt?: number;
+  imageGenerating?: boolean;
   error?: string;
   createdAt: number;
   streaming?: boolean;
@@ -232,15 +233,15 @@ class ChatStore {
   pinnedSessions = $derived.by(() => {
     const q = this.filterSearchQuery.toLowerCase().trim();
     return this.sessions.filter(
-      (s) => !s.isDraft && !s.isThemeStudio && !s.archived && s.pinned && (!q || s.title.toLowerCase().includes(q) || s.preview.toLowerCase().includes(q))
+      (s) => !s.isThemeStudio && !s.archived && s.pinned && !s.projectPath && (!q || s.title.toLowerCase().includes(q) || s.preview.toLowerCase().includes(q))
     );
   });
 
   recentSessions = $derived.by(() => {
     const q = this.filterSearchQuery.toLowerCase().trim();
     return this.sessions.filter((s) => {
-      if (s.isDraft || s.isThemeStudio) return false;
-      const matchArchive = this.showArchived ? Boolean(s.archived) : !s.archived && !s.pinned;
+      if (s.isThemeStudio) return false;
+      const matchArchive = this.showArchived ? Boolean(s.archived) : !s.archived && !(s.pinned && !s.projectPath);
       return matchArchive && (!q || s.title.toLowerCase().includes(q) || s.preview.toLowerCase().includes(q));
     });
   });
@@ -809,8 +810,8 @@ class ChatStore {
       let sessionsChanged = false;
 
       if (targetChatId && !backendIds.has(targetChatId)) {
-        const had = this.sessions.some((s) => s.id === targetChatId);
-        if (had) {
+        const hadSess = this.sessions.find((s) => s.id === targetChatId);
+        if (hadSess && !hadSess.isDraft) {
           this.sessions = this.sessions.filter((s) => s.id !== targetChatId);
           delete this.messagesByChat[targetChatId];
           sessionsChanged = true;
@@ -1390,7 +1391,8 @@ class ChatStore {
     };
 
     this.showArchived = false;
-    this.sessions = [newSession, ...this.sessions.filter((s) => !s.isDraft)];
+    this.sessions = [newSession, ...this.sessions];
+    this.saveSessions();
     this.messagesByChat[id] = [];
     this.contextTelemetryByChat[id] = {
       usedTokens: 0,
@@ -1759,6 +1761,13 @@ class ChatStore {
 
         const resolvedStreamModel = resolveModelForReasoning(prov, settingsStore.data.activeModel, settingsStore.data.reasoningLevel);
         const resolvedCaps = prov?.modelCapabilities?.[resolvedStreamModel] || detectedInfo;
+        if (isImageGenerationModel(resolvedStreamModel)) {
+          const curList = this.messagesByChat[chatId] || [];
+          const targetMsg = curList.find((m) => m.id === messageId);
+          if (targetMsg) {
+            targetMsg.imageGenerating = true;
+          }
+        }
         await invoke('start_chat_stream', {
           chatId,
           prompt,
@@ -2144,18 +2153,17 @@ class ChatStore {
     }
 
     const settleRunningTools = (status: 'success' | 'error') => {
-      const toolCalls = currentAssistantMsg.toolCalls || [];
-      if (!toolCalls.some((tc) => tc.status === 'running' || tc.status === 'pending')) {
+      const curTools = currentAssistantMsg.toolCalls || [];
+      if (!curTools.some((tc) => tc.status === 'running' || tc.status === 'pending')) {
         return;
       }
       const now = Date.now();
-      currentAssistantMsg.toolCalls = toolCalls.map((tc) =>
+      currentAssistantMsg.toolCalls = curTools.map((tc) =>
         tc.status === 'running' || tc.status === 'pending'
           ? { ...tc, status, finishedAt: tc.finishedAt || now, elapsedMs: tc.elapsedMs ?? (now - tc.startedAt) }
           : tc
       );
-      const steps = currentAssistantMsg.steps || [];
-      currentAssistantMsg.steps = steps.map((s) =>
+      currentAssistantMsg.steps = (currentAssistantMsg.steps || []).map((s) =>
         s.kind === 'tool' && (s.record.status === 'running' || s.record.status === 'pending')
           ? {
               kind: 'tool',
@@ -2174,8 +2182,8 @@ class ChatStore {
       this.turnSnapshotByChat[cid] = {
         contentLen: currentAssistantMsg.content.length,
         reasoningLen: (currentAssistantMsg.reasoningContent || '').length,
-        stepsLen: currentAssistantMsg.steps.length,
-        toolsLen: currentAssistantMsg.toolCalls.length
+        stepsLen: (currentAssistantMsg.steps || []).length,
+        toolsLen: (currentAssistantMsg.toolCalls || []).length
       };
     }
 
@@ -2186,13 +2194,14 @@ class ChatStore {
       if (snap) {
         currentAssistantMsg.content = currentAssistantMsg.content.slice(0, snap.contentLen);
         currentAssistantMsg.reasoningContent = (currentAssistantMsg.reasoningContent || '').slice(0, snap.reasoningLen);
-        currentAssistantMsg.steps = currentAssistantMsg.steps.slice(0, snap.stepsLen);
-        currentAssistantMsg.toolCalls = currentAssistantMsg.toolCalls.slice(0, snap.toolsLen);
+        currentAssistantMsg.steps = (currentAssistantMsg.steps || []).slice(0, snap.stepsLen);
+        currentAssistantMsg.toolCalls = (currentAssistantMsg.toolCalls || []).slice(0, snap.toolsLen);
       }
       return;
     }
 
     if (event.type === 'delta') {
+      currentAssistantMsg.imageGenerating = false;
       settleRunningTools('success');
       const chunk = event.content ?? event.text ?? '';
       if (chunk) {
@@ -2322,11 +2331,12 @@ class ChatStore {
       this.turnSnapshotByChat[cid] = {
         contentLen: currentAssistantMsg.content.length,
         reasoningLen: (currentAssistantMsg.reasoningContent || '').length,
-        stepsLen: currentAssistantMsg.steps.length,
-        toolsLen: currentAssistantMsg.toolCalls.length
+        stepsLen: (currentAssistantMsg.steps || []).length,
+        toolsLen: (currentAssistantMsg.toolCalls || []).length
       };
       this.scheduleStreamingSave(cid);
     } else if (event.type === 'done') {
+      currentAssistantMsg.imageGenerating = false;
       delete this.turnSnapshotByChat[cid];
       settleRunningTools('success');
       this.flushSmoothBuffers(cid);
@@ -2357,6 +2367,7 @@ class ChatStore {
       }
       this.saveSessions(cid);
     } else if (event.type === 'error') {
+      currentAssistantMsg.imageGenerating = false;
       this.flushSmoothBuffers(cid);
       this.streamingChats = { ...this.streamingChats, [cid]: false };
       if (this.reasoningTimers[cid]) {

@@ -280,6 +280,9 @@ function handleHtmlDrop(e: DragEvent) {
 onMount(() => {
   refreshLoadedSkills();
   refreshOAuthTiers();
+  refreshWhisperAvailability();
+  const onWhisperUpdated = () => refreshWhisperAvailability();
+  window.addEventListener('omni-whisper-updated', onWhisperUpdated);
   let unlisten: (() => void) | null = null;
   let unlistenOAuth: (() => void) | null = null;
   listen('oauth-accounts-updated', () => {
@@ -302,6 +305,7 @@ onMount(() => {
     })
     .catch(() => {});
   return () => {
+    window.removeEventListener('omni-whisper-updated', onWhisperUpdated);
     if (unlisten) unlisten();
     if (unlistenOAuth) unlistenOAuth();
   };
@@ -417,6 +421,16 @@ function handleWindowPointerDown(e: PointerEvent) {
 }
 
 let isVoiceActive = $state<boolean>(false);
+let hasWhisperModel = $state<boolean>(false);
+
+async function refreshWhisperAvailability() {
+  try {
+    const res = await invoke<Array<{ isDownloaded?: boolean; is_downloaded?: boolean }>>('get_speech_status');
+    hasWhisperModel = Array.isArray(res) && res.some((m) => Boolean(m.isDownloaded ?? m.is_downloaded));
+  } catch {
+    hasWhisperModel = false;
+  }
+}
 let voiceBands = $state<number[]>(new Array(28).fill(0.1));
 let voiceTimerStr = $state<string>('00:00');
 let voiceCaptureInstance = $state<VoiceCapture | null>(null);
@@ -1219,7 +1233,8 @@ async function stopAndSendVoice() {
             <div class="relative">
               <button
                 type="button"
-                class="px-2 py-1 rounded-[4px] flex items-center gap-1.5 text-[11px] font-mono text-[#A3A3AA] hover:text-[#E5E5E8] hover:bg-white/[0.05] transition-colors max-w-[150px]"
+                data-omni-project-btn=""
+                class="h-6 px-2 rounded-[4px] inline-flex items-center gap-1.5 text-[11px] leading-none font-mono text-[#A3A3AA] hover:text-[#E5E5E8] hover:bg-white/[0.05] transition-colors max-w-[150px]"
                 onclick={() => {
                   const next = !showProjectPopup;
                   closeAllPopups();
@@ -1228,9 +1243,9 @@ async function stopAndSendVoice() {
                 title={workspaceStore.currentPath || 'No project (Full PC)'}
                 use:attachPressScale
               >
-                <Icon name="folder" class="w-3.5 h-3.5 text-[#73737A] shrink-0" strokeWidth={1.6} />
-                <span class="truncate">{workspaceStore.workspaceName || 'Full PC'}</span>
-                <Icon name="chevron-down" class="w-3 h-3 text-[#66666D] shrink-0 transition-transform duration-150 {showProjectPopup ? 'rotate-180' : ''}" strokeWidth={1.8} />
+                <Icon name="folder" class="w-3.5 h-3.5 text-[#73737A] shrink-0 block -translate-y-[0.5px]" strokeWidth={1.6} />
+                <span class="truncate leading-none translate-y-[1px]">{workspaceStore.workspaceName || 'Full PC'}</span>
+                <Icon name="chevron-down" class="w-3 h-3 text-[#66666D] shrink-0 block translate-y-[0.5px] transition-transform duration-150 {showProjectPopup ? 'rotate-180' : ''}" strokeWidth={1.8} />
               </button>
 
               {#if showProjectPopup || projectMenuSpring.current.opacity > 0.02}
@@ -1327,6 +1342,7 @@ async function stopAndSendVoice() {
                 showModelPopup = next;
                 if (next) refreshOAuthTiers();
               }}
+              data-omni-model-btn=""
               title="Model & Reasoning"
               use:attachPressScale
             >
@@ -1429,6 +1445,7 @@ async function stopAndSendVoice() {
                     </div>
 
                     <div
+                      data-omni-reasoning-slider=""
                       class="relative h-7 bg-[#121214] rounded-[4px] border border-white/[0.06] p-0.5 grid items-center"
                       style="grid-template-columns: repeat({supportedReasoningLevels.length}, minmax(0, 1fr));"
                     >
@@ -1451,6 +1468,18 @@ async function stopAndSendVoice() {
               </div>
             {/if}
           </div>
+
+          {#if hasWhisperModel}
+            <button
+              type="button"
+              class="w-7 h-7 rounded-[4px] flex items-center justify-center text-[#8E8E95] hover:text-[#EDEDEF] hover:bg-white/[0.06] transition-colors"
+              onclick={startVoice}
+              title="Voice input (Whisper)"
+              use:attachPressScale
+            >
+              <Icon name="mic" class="w-3.5 h-3.5" strokeWidth={1.7} />
+            </button>
+          {/if}
 
           {#if chatStore.isStreaming}
             <div class="flex items-center gap-1.5">

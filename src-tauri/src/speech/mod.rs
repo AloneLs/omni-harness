@@ -135,36 +135,48 @@ impl SpeechEngine {
         }
     }
 
-    pub fn get_available_models(&self) -> Vec<WhisperModelInfo> {
-        let turbo_path = self.models_dir.join("ggml-large-v3-turbo.bin");
-        let v3_path = self.models_dir.join("ggml-large-v3.bin");
+    fn is_valid_weight_file(path: &Path) -> bool {
+        std::fs::metadata(path).map(|m| m.is_file() && m.len() > 1_000_000).unwrap_or(false)
+    }
 
-        vec![
-            WhisperModelInfo {
-                model_id: "large-v3-turbo".to_string(),
-                filename: "ggml-large-v3-turbo.bin".to_string(),
-                download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin".to_string(),
-                size_bytes: 1_620_000_000,
-                is_downloaded: turbo_path.exists(),
-                local_path: if turbo_path.exists() {
-                    Some(turbo_path.to_string_lossy().to_string())
-                } else {
-                    None
-                },
-            },
-            WhisperModelInfo {
-                model_id: "large-v3".to_string(),
-                filename: "ggml-large-v3.bin".to_string(),
-                download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin".to_string(),
-                size_bytes: 3_100_000_000,
-                is_downloaded: v3_path.exists(),
-                local_path: if v3_path.exists() {
-                    Some(v3_path.to_string_lossy().to_string())
-                } else {
-                    None
-                },
-            },
-        ]
+    pub fn get_available_models(&self) -> Vec<WhisperModelInfo> {
+        let defs = [
+            ("large-v3-turbo", "ggml-large-v3-turbo.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin", 1_620_000_000u64),
+            ("large-v3", "ggml-large-v3.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin", 3_100_000_000u64),
+            ("medium", "ggml-medium.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin", 1_530_000_000u64),
+            ("base", "ggml-base.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin", 148_000_000u64),
+        ];
+        defs.iter()
+            .map(|(id, fname, url, sz)| {
+                let p = self.models_dir.join(fname);
+                let ok = Self::is_valid_weight_file(&p);
+                WhisperModelInfo {
+                    model_id: (*id).to_string(),
+                    filename: (*fname).to_string(),
+                    download_url: (*url).to_string(),
+                    size_bytes: *sz,
+                    is_downloaded: ok,
+                    local_path: if ok { Some(p.to_string_lossy().to_string()) } else { None },
+                }
+            })
+            .collect()
+    }
+
+    pub fn delete_model(&self, model_id: &str) -> Result<(), String> {
+        let models = self.get_available_models();
+        let target = models
+            .into_iter()
+            .find(|m| m.model_id == model_id)
+            .ok_or_else(|| format!("Unknown model ID: {}", model_id))?;
+        let dest = self.models_dir.join(&target.filename);
+        let part = self.models_dir.join(format!("{}.part", target.filename));
+        if dest.exists() {
+            std::fs::remove_file(&dest).map_err(|e| e.to_string())?;
+        }
+        if part.exists() {
+            let _ = std::fs::remove_file(&part);
+        }
+        Ok(())
     }
 
     pub async fn download_model(
@@ -183,7 +195,7 @@ impl SpeechEngine {
             .ok_or_else(|| format!("Unknown model ID: {}", model_id))?;
 
         let dest_path = self.models_dir.join(&target.filename);
-        if dest_path.exists() {
+        if Self::is_valid_weight_file(&dest_path) {
             return Ok(dest_path);
         }
 
