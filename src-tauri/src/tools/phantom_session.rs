@@ -375,14 +375,9 @@ pub fn bind_window_for_chat(
     if stage_offscreen {
         info = stage_window_offscreen(root, false, None, None)?;
     } else if info.is_minimized {
-        let policy = get_policy();
-        if policy.stealth_mode {
-            info = stage_window_offscreen(root, false, None, None)?;
-        } else {
-            desktop_uia::unminimize_no_activate(root);
-            if let Some(updated) = desktop_uia::query_window_info(root) {
-                info = updated;
-            }
+        desktop_uia::unminimize_no_activate(root);
+        if let Some(updated) = desktop_uia::query_window_info(root) {
+            info = updated;
         }
     }
 

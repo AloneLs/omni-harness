@@ -2073,6 +2073,7 @@ impl SingleAgentRunner {
             }
         } else if !session.is_active() {
             let _ = tools.pty_manager.kill_all_for_chat(chat_id);
+            crate::tools::phantom_session::restore_all_staged_windows(true);
             Self::save_checkpoint(db, chat_id, history);
             let _ = event_sender
                 .send(StreamEvent::Error {
@@ -2084,6 +2085,7 @@ impl SingleAgentRunner {
             let _ = state.transition(TaskStateEnum::Completed);
         }
 
+        crate::tools::phantom_session::restore_all_staged_windows(true);
         if let Some(d) = db {
             let _ = d.delete_checkpoint(chat_id);
         }

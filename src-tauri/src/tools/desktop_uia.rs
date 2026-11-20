@@ -644,9 +644,9 @@ pub fn move_window_to_offscreen_stage(
             win32::ShowWindowAsync(h, win32::SW_SHOWNOACTIVATE);
             std::thread::sleep(std::time::Duration::from_millis(90));
         }
-        let mut ex = win32::GetWindowLongPtrW(h, win32::GWL_EXSTYLE) | win32::WS_EX_NOACTIVATE;
+        let mut ex = win32::GetWindowLongPtrW(h, win32::GWL_EXSTYLE);
         if spawned_by_omni {
-            ex |= win32::WS_EX_TOOLWINDOW;
+            ex |= win32::WS_EX_NOACTIVATE | win32::WS_EX_TOOLWINDOW;
         }
         win32::SetWindowLongPtrW(h, win32::GWL_EXSTYLE, ex);
 

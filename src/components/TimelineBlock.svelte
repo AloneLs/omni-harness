@@ -1,7 +1,7 @@
 <script lang="ts">
 import { themeStore } from '../lib/stores/theme.svelte';
 import { slide } from 'svelte/transition';
-import { convertFileSrc } from '@tauri-apps/api/core';
+import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import Icon from './Icon.svelte';
 import FileToolIcon from './FileToolIcon.svelte';
 import type { ToolExecutionRecord } from '../lib/toolMapper';
@@ -65,6 +65,24 @@ $effect(() => {
 let expandedThoughts = $state<Record<string, boolean>>({});
 let expandedTools = $state<Record<string, boolean>>({});
 let expandedCompacts = $state<Record<string, boolean>>({});
+let restoringHwnds = $state<Record<number, boolean>>({});
+let restoredHwnds = $state<Record<number, boolean>>({});
+
+async function handleRestoreWindow(hwnd: number) {
+  if (!hwnd) return;
+  restoringHwnds[hwnd] = true;
+  try {
+    await invoke('cu_stage_window', { hwnd, offscreen: false });
+    restoredHwnds[hwnd] = true;
+    setTimeout(() => {
+      restoredHwnds[hwnd] = false;
+    }, 2500);
+  } catch (e) {
+    console.error('Failed to restore window:', e);
+  } finally {
+    restoringHwnds[hwnd] = false;
+  }
+}
 let showErrorTrace = $state<boolean>(false);
 let confirmRetryErr = $state<boolean>(false);
 let confirmRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -286,24 +304,231 @@ function formatToolLabel(record: ToolExecutionRecord): { verb: string; target: s
   }
   if (n.includes('computer_use')) {
     const act = String(record.args?.action || 'action');
-    if (act === 'launch_app') return { verb: 'Launched', target: String(record.args?.app || 'app') };
-    if (act === 'bind_window' || act === 'focus_window') {
-      return { verb: 'Bound', target: String(record.args?.window_title || record.args?.process_name || record.args?.hwnd || 'window') };
+    let parsedOut: any = null;
+    if (record.output && record.output.trim().startsWith('{')) {
+      try { parsedOut = JSON.parse(record.output); } catch {}
     }
-    if (act === 'screenshot') return { verb: 'Captured', target: String(record.args?.window_title || 'window') };
-    if (act === 'snapshot_ui') return { verb: 'Inspected UI', target: String(record.args?.filter || 'controls') };
+    if (act === 'launch_app') {
+      return { verb: 'Launched', target: String(record.args?.app || parsedOut?.executable || 'app') };
+    }
+    if (act === 'bind_window' || act === 'focus_window' || act === 'attach_window') {
+      const targetName = parsedOut?.title || record.args?.window_title || parsedOut?.processName || record.args?.process_name || (record.args?.hwnd ? `HWND ${record.args.hwnd}` : 'window');
+      return { verb: 'Bound', target: String(targetName) };
+    }
+    if (act === 'list_windows') {
+      const count = parsedOut?.count ?? parsedOut?.windows?.length;
+      return { verb: 'Listed', target: count !== undefined ? `${count} windows` : 'Windows' };
+    }
+    if (act === 'screenshot') {
+      const targetName = record.args?.window_title || parsedOut?.title || 'window';
+      return { verb: 'Captured', target: String(targetName) };
+    }
+    if (act === 'snapshot_ui') {
+      const count = parsedOut?.count ?? parsedOut?.elements?.length;
+      const f = record.args?.filter;
+      const target = f ? `UI: "${f}"` : (count !== undefined ? `${count} UI controls` : 'UI elements');
+      return { verb: 'Inspected', target };
+    }
     if (act === 'uia_action' || act === 'click_element' || act === 'set_value') {
-      const el = record.args?.element_id || record.args?.element_name || record.args?.automation_id || 'element';
+      const el = record.args?.element_name || record.args?.element_id || record.args?.automation_id || 'element';
       return { verb: 'UIA', target: `${record.args?.uia_op || act} ${el}` };
     }
-    if (act === 'type') return { verb: 'Typed', target: `${String(record.args?.text || '').slice(0, 36)}` };
-    if (act === 'hotkey') return { verb: 'Hotkey', target: String(record.args?.keys || '') };
+    if (act === 'type') {
+      const t = String(record.args?.text || '').slice(0, 36);
+      return { verb: 'Typed', target: `"${t}"` };
+    }
+    if (act === 'hotkey') {
+      return { verb: 'Hotkey', target: String(record.args?.keys || '') };
+    }
     if (act.includes('click') || act === 'drag' || act === 'scroll') {
       return { verb: 'Ghost Input', target: `${act} (${record.args?.x ?? 500}, ${record.args?.y ?? 500})` };
+    }
+    if (act === 'restore_window' || act === 'show_window') {
+      return { verb: 'Restored', target: String(parsedOut?.title || record.args?.window_title || 'window') };
+    }
+    if (act === 'close_window') {
+      return { verb: 'Closed', target: String(parsedOut?.title || record.args?.window_title || record.args?.process_name || 'window') };
     }
     return { verb: 'Computer Use', target: act };
   }
   return { verb: record.actionName, target: record.previewArgs || '' };
+}
+
+interface ParsedComputerUseData {
+  action: string;
+  isListWindows?: boolean;
+  windows?: Array<{
+    hwnd: number;
+    pid: number;
+    processName: string;
+    title: string;
+    className?: string;
+    bounds?: { x: number; y: number; width: number; height: number };
+    isMinimized?: boolean;
+    isOffscreen?: boolean;
+    isBound?: boolean;
+  }>;
+  boundHwnd?: number;
+  isBindWindow?: boolean;
+  boundInfo?: {
+    hwnd: number;
+    pid?: number;
+    processName?: string;
+    title?: string;
+    bounds?: { x: number; y: number; width: number; height: number };
+    isOffscreen?: boolean;
+    isMinimized?: boolean;
+    stealthMode?: boolean;
+  };
+  isSnapshotUi?: boolean;
+  elements?: Array<{
+    id: string;
+    name: string;
+    controlType: string;
+    automationId?: string;
+    bounds?: { x: number; y: number; width: number; height: number };
+    enabled?: boolean;
+  }>;
+  count?: number;
+  isGhostInput?: boolean;
+  inputInfo?: {
+    action: string;
+    coords?: { norm_x?: number; norm_y?: number; win_x?: number; win_y?: number };
+    text?: string;
+    keys?: string;
+    status?: string;
+    element?: string;
+    chars?: number;
+  };
+  isRestoreWindow?: boolean;
+  isLaunchApp?: boolean;
+  launchInfo?: {
+    pid?: number;
+    executable?: string;
+    offscreen?: boolean;
+    status?: string;
+    hwnd?: number;
+    title?: string;
+  };
+  isCloseWindow?: boolean;
+  closeInfo?: {
+    title?: string;
+    processName?: string;
+    hwnd?: number;
+  };
+}
+
+function parseComputerUse(call: ToolExecutionRecord): ParsedComputerUseData | null {
+  if (!call.toolName.toLowerCase().includes('computer_use')) return null;
+  const raw = (call.output || '').trim();
+  if (!raw.startsWith('{') && !raw.startsWith('[')) return null;
+  try {
+    const p = JSON.parse(raw);
+    const act = String(call.args?.action || p.action || '').toLowerCase();
+
+    if (act === 'list_windows' || Array.isArray(p.windows)) {
+      return {
+        action: 'list_windows',
+        isListWindows: true,
+        boundHwnd: typeof p.boundHwnd === 'number' ? p.boundHwnd : undefined,
+        count: typeof p.count === 'number' ? p.count : (p.windows?.length || 0),
+        windows: Array.isArray(p.windows) ? p.windows : []
+      };
+    }
+
+    if (act === 'bind_window' || act === 'attach_window' || act === 'focus_window' || p.bound === true) {
+      return {
+        action: 'bind_window',
+        isBindWindow: true,
+        boundInfo: {
+          hwnd: Number(p.hwnd || call.args?.hwnd || 0),
+          pid: p.pid,
+          processName: p.processName || call.args?.process_name,
+          title: p.title || call.args?.window_title,
+          bounds: p.bounds,
+          isOffscreen: p.offscreen ?? p.isOffscreen,
+          isMinimized: p.isMinimized,
+          stealthMode: p.stealthMode
+        }
+      };
+    }
+
+    if (act === 'snapshot_ui' || Array.isArray(p.elements)) {
+      return {
+        action: 'snapshot_ui',
+        isSnapshotUi: true,
+        count: typeof p.count === 'number' ? p.count : (p.elements?.length || 0),
+        elements: Array.isArray(p.elements) ? p.elements : []
+      };
+    }
+
+    if (
+      act.includes('click') ||
+      act === 'type' ||
+      act === 'hotkey' ||
+      act === 'scroll' ||
+      act === 'drag' ||
+      act === 'uia_action' ||
+      act === 'set_value'
+    ) {
+      return {
+        action: act,
+        isGhostInput: true,
+        inputInfo: {
+          action: act,
+          coords: p.coords,
+          text: call.args?.text || p.text,
+          keys: call.args?.keys || p.keys,
+          status: p.status || (call.status === 'success' ? 'ok' : call.status),
+          element: p.element || call.args?.element_name || call.args?.element_id,
+          chars: p.chars
+        }
+      };
+    }
+
+    if (act === 'launch_app' || p.executable) {
+      return {
+        action: 'launch_app',
+        isLaunchApp: true,
+        launchInfo: {
+          pid: p.pid,
+          executable: p.executable || call.args?.app,
+          offscreen: p.offscreen,
+          status: p.status,
+          hwnd: p.window?.hwnd || p.hwnd,
+          title: p.window?.title || p.title
+        }
+      };
+    }
+
+    if (act === 'restore_window' || act === 'show_window' || p.status === 'restored' || p.status === 'restored_all') {
+      return {
+        action: 'restore_window',
+        isRestoreWindow: true,
+        boundInfo: {
+          hwnd: p.hwnd,
+          title: p.title,
+          bounds: p.bounds
+        }
+      };
+    }
+
+    if (act === 'close_window' || p.status === 'close_sent') {
+      return {
+        action: 'close_window',
+        isCloseWindow: true,
+        closeInfo: {
+          title: p.title,
+          processName: p.processName,
+          hwnd: p.hwnd
+        }
+      };
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function extractToolImagePreview(call: ToolExecutionRecord): string | null {
@@ -353,6 +578,19 @@ function formatToolOutputReadable(call: ToolExecutionRecord): string {
       }
       if (Array.isArray(parsed?.items)) {
         return parsed.items.map((it: any) => `[${it.status}] ${it.text}`).join('\n');
+      }
+      if (Array.isArray(parsed?.windows)) {
+        return parsed.windows
+          .map(
+            (w: any) =>
+              `• ${w.title || w.processName} (${w.processName || 'proc'}, PID: ${w.pid}, HWND: ${w.hwnd})${w.isBound ? ' [BOUND]' : ''}${w.isOffscreen ? ' [OFFSCREEN]' : ''}${w.isMinimized ? ' [MINIMIZED]' : ''}`
+          )
+          .join('\n');
+      }
+      if (Array.isArray(parsed?.elements)) {
+        return parsed.elements
+          .map((e: any) => `[${e.id}] ${e.controlType || 'Control'} "${e.name || ''}"${e.automationId ? ` (id: ${e.automationId})` : ''}`)
+          .join('\n');
       }
       const searchArr = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.results) ? parsed.results : null;
       if (searchArr) {
@@ -651,6 +889,185 @@ function toggleTool(id: string) {
                     {:else if call.toolName === 'tool_hub' && call.args?.action === 'load_skill' && call.output}
                       {@const skillContent = (() => { try { const p = JSON.parse(call.output); return typeof p?.content === 'string' ? p.content : readableOut; } catch { return readableOut; } })()}
                       <div class="markdown-prose text-[12px] text-[#C4C4CA] max-h-64 overflow-y-auto pr-1">{@html renderMarkdown(skillContent)}</div>
+                    {:else if parseComputerUse(call)}
+                      {@const cu = parseComputerUse(call)}
+                      {#if cu?.isListWindows}
+                        <div class="rounded-[6px] border border-white/[0.08] bg-[#0E0E11] overflow-hidden">
+                          <div class="px-3 py-1.5 border-b border-white/[0.06] flex items-center justify-between text-[11px]">
+                            <span class="font-medium text-[#EDEDEF]">Доступные окна ({cu.windows?.length || 0})</span>
+                            {#if cu.boundHwnd}
+                              <span class="text-[#A78BFA] font-mono text-[10px]">Текущее окно: HWND {cu.boundHwnd}</span>
+                            {/if}
+                          </div>
+                          {#if cu.windows && cu.windows.length > 0}
+                            <div class="max-h-56 overflow-y-auto divide-y divide-white/[0.04]">
+                              {#each cu.windows as win}
+                                <div class="px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-white/[0.02] transition-colors">
+                                  <div class="flex items-center gap-2 min-w-0">
+                                    <span class="text-[#EDEDEF] text-[11.5px] truncate font-sans">{win.title || win.processName}</span>
+                                    <span class="text-[#71717A] text-[10px] font-mono shrink-0">{win.processName}</span>
+                                    {#if win.isBound || (cu.boundHwnd && win.hwnd === cu.boundHwnd)}
+                                      <span class="px-1.5 py-0.2 rounded-[3px] border border-[#8B5CF6]/50 bg-[#8B5CF6]/15 font-mono text-[9px] text-[#DDD6FE] shrink-0">
+                                        bound
+                                      </span>
+                                    {/if}
+                                    {#if win.isOffscreen}
+                                      <span class="px-1.5 py-0.2 rounded-[3px] border border-white/[0.1] bg-white/[0.05] font-mono text-[9px] text-[#A3A3AA] shrink-0">
+                                        off-screen
+                                      </span>
+                                    {/if}
+                                    {#if win.isMinimized}
+                                      <span class="px-1.5 py-0.2 rounded-[3px] border border-white/[0.08] bg-white/[0.03] font-mono text-[9px] text-[#71717A] shrink-0">
+                                        minimized
+                                      </span>
+                                    {/if}
+                                  </div>
+                                  <div class="flex items-center gap-2 shrink-0 font-mono text-[10px] text-[#71717A]">
+                                    {#if win.bounds}
+                                      <span>{win.bounds.width}×{win.bounds.height}</span>
+                                    {/if}
+                                    {#if win.isOffscreen}
+                                      <button
+                                        type="button"
+                                        class="px-1.5 py-0.5 rounded-[3px] bg-white/[0.08] hover:bg-white/[0.14] text-[#EDEDEF] text-[10px] transition-colors disabled:opacity-50"
+                                        disabled={restoringHwnds[win.hwnd]}
+                                        onclick={() => handleRestoreWindow(win.hwnd)}
+                                      >
+                                        {restoringHwnds[win.hwnd] ? '...' : restoredHwnds[win.hwnd] ? '✓ На экране' : 'На экран'}
+                                      </button>
+                                    {/if}
+                                  </div>
+                                </div>
+                              {/each}
+                            </div>
+                          {:else}
+                            <div class="p-3 text-[11px] text-[#71717A] italic">Окна не найдены</div>
+                          {/if}
+                        </div>
+                      {:else if cu?.isBindWindow}
+                        <div class="rounded-[6px] border border-white/[0.08] bg-[#0E0E11] p-3 space-y-2">
+                          <div class="flex items-center justify-between gap-2">
+                            <div class="min-w-0">
+                              <div class="text-[12.5px] font-medium text-[#EDEDEF] truncate font-sans">
+                                {cu.boundInfo?.title || cu.boundInfo?.processName || 'Целевое окно'}
+                              </div>
+                              <div class="flex items-center gap-2 text-[10.5px] text-[#71717A] font-mono mt-0.5">
+                                {#if cu.boundInfo?.processName}<span>{cu.boundInfo.processName}</span>{/if}
+                                {#if cu.boundInfo?.pid}<span>PID: {cu.boundInfo.pid}</span>{/if}
+                                {#if cu.boundInfo?.hwnd}<span>HWND: {cu.boundInfo.hwnd}</span>{/if}
+                                {#if cu.boundInfo?.bounds}<span>{cu.boundInfo.bounds.width}×{cu.boundInfo.bounds.height}</span>{/if}
+                              </div>
+                            </div>
+                            <div class="flex items-center gap-1.5 shrink-0">
+                              <span class="px-1.5 py-0.5 rounded-[4px] border border-[#8B5CF6]/50 bg-[#8B5CF6]/15 font-mono text-[10px] text-[#DDD6FE]">
+                                Привязано
+                              </span>
+                              {#if cu.boundInfo?.isOffscreen}
+                                <span class="px-1.5 py-0.5 rounded-[4px] border border-white/[0.1] bg-white/[0.05] font-mono text-[10px] text-[#A3A3AA]">
+                                  В фоне
+                                </span>
+                                <button
+                                  type="button"
+                                  class="px-2 py-0.5 rounded-[4px] bg-white/[0.08] hover:bg-white/[0.14] text-[10.5px] text-[#EDEDEF] font-sans transition-colors disabled:opacity-50"
+                                  disabled={restoringHwnds[cu.boundInfo?.hwnd || 0]}
+                                  onclick={() => handleRestoreWindow(cu.boundInfo?.hwnd || 0)}
+                                >
+                                  {restoringHwnds[cu.boundInfo?.hwnd || 0] ? '...' : restoredHwnds[cu.boundInfo?.hwnd || 0] ? '✓ На экране' : 'Вернуть на экран'}
+                                </button>
+                              {/if}
+                              {#if cu.boundInfo?.isMinimized}
+                                <span class="px-1.5 py-0.5 rounded-[4px] border border-white/[0.08] bg-white/[0.03] font-mono text-[10px] text-[#71717A]">
+                                  Свернуто
+                                </span>
+                              {/if}
+                            </div>
+                          </div>
+                        </div>
+                      {:else if cu?.isSnapshotUi}
+                        <div class="rounded-[6px] border border-white/[0.08] bg-[#0E0E11] overflow-hidden">
+                          <div class="px-3 py-1.5 border-b border-white/[0.06] flex items-center justify-between text-[11px]">
+                            <span class="font-medium text-[#EDEDEF]">UI Элементы окна ({cu.elements?.length || 0})</span>
+                            <span class="text-[#71717A] text-[10px] font-mono">UIAutomation</span>
+                          </div>
+                          {#if cu.elements && cu.elements.length > 0}
+                            <div class="max-h-56 overflow-y-auto divide-y divide-white/[0.04]">
+                              {#each cu.elements as el}
+                                <div class="px-3 py-1 flex items-center justify-between gap-2 text-[11px] font-mono">
+                                  <div class="flex items-center gap-2 min-w-0">
+                                    <span class="text-[#A78BFA] font-bold shrink-0">{el.id}</span>
+                                    <span class="px-1.5 py-0.2 rounded-[3px] bg-white/[0.05] text-[#D4D4D8] text-[10px] shrink-0 font-sans">
+                                      {el.controlType}
+                                    </span>
+                                    {#if el.name}
+                                      <span class="text-[#EDEDEF] truncate font-sans">"{el.name}"</span>
+                                    {/if}
+                                    {#if el.automationId}
+                                      <span class="text-[#71717A] text-[10px] truncate">id: {el.automationId}</span>
+                                    {/if}
+                                  </div>
+                                  {#if el.enabled === false}
+                                    <span class="text-[#F87171] text-[9.5px] shrink-0">disabled</span>
+                                  {/if}
+                                </div>
+                              {/each}
+                            </div>
+                          {:else}
+                            <div class="p-3 text-[11px] text-[#71717A] italic">Элементы управления не найдены</div>
+                          {/if}
+                        </div>
+                      {:else if cu?.isGhostInput}
+                        <div class="rounded-[6px] border border-white/[0.08] bg-[#0E0E11] p-2.5 flex items-center justify-between gap-3 text-[11.5px]">
+                          <div class="flex items-center gap-2 min-w-0">
+                            <span class="px-1.5 py-0.5 rounded-[4px] bg-white/[0.06] text-[#EDEDEF] font-mono text-[10.5px]">
+                              {cu.inputInfo?.action}
+                            </span>
+                            {#if cu.inputInfo?.text}
+                              <span class="text-[#EDEDEF] truncate font-sans">Текст: <span class="text-white font-mono">"{cu.inputInfo.text}"</span></span>
+                            {:else if cu.inputInfo?.keys}
+                              <span class="text-[#EDEDEF] font-sans">Клавиши: <span class="text-[#A78BFA] font-mono font-bold">{cu.inputInfo.keys}</span></span>
+                            {:else if cu.inputInfo?.coords}
+                              <span class="text-[#A3A3AA] font-mono text-[11px]">
+                                ({cu.inputInfo.coords.win_x ?? cu.inputInfo.coords.norm_x}, {cu.inputInfo.coords.win_y ?? cu.inputInfo.coords.norm_y})
+                              </span>
+                            {/if}
+                            {#if cu.inputInfo?.element}
+                              <span class="text-[#71717A] text-[10.5px]">({cu.inputInfo.element})</span>
+                            {/if}
+                          </div>
+                          <span class="px-1.5 py-0.5 rounded-[3px] bg-[#22C55E]/10 text-[#4ADE80] font-mono text-[10px] shrink-0">
+                            {cu.inputInfo?.status || 'ok'}
+                          </span>
+                        </div>
+                      {:else if cu?.isLaunchApp}
+                        <div class="rounded-[6px] border border-white/[0.08] bg-[#0E0E11] p-2.5 flex items-center justify-between gap-3 text-[11.5px]">
+                          <div class="flex items-center gap-2 min-w-0">
+                            <span class="text-[#EDEDEF] font-medium font-sans truncate">{cu.launchInfo?.executable}</span>
+                            {#if cu.launchInfo?.pid}<span class="text-[#71717A] font-mono text-[10.5px]">PID: {cu.launchInfo.pid}</span>{/if}
+                            {#if cu.launchInfo?.offscreen}
+                              <span class="px-1.5 py-0.2 rounded-[3px] bg-white/[0.05] text-[#A3A3AA] font-mono text-[9.5px]">off-screen</span>
+                            {/if}
+                          </div>
+                          <span class="px-1.5 py-0.5 rounded-[3px] bg-[#22C55E]/10 text-[#4ADE80] font-mono text-[10px] shrink-0">
+                            {cu.launchInfo?.status || 'запущен'}
+                          </span>
+                        </div>
+                      {:else if cu?.isRestoreWindow}
+                        <div class="rounded-[6px] border border-white/[0.08] bg-[#0E0E11] p-2.5 flex items-center justify-between gap-3 text-[11.5px]">
+                          <div class="flex items-center gap-2 min-w-0">
+                            <span class="text-[#4ADE80] font-medium">✓ Окно возвращено на рабочий экран</span>
+                            {#if cu.boundInfo?.title}<span class="text-[#EDEDEF] font-sans truncate">"{cu.boundInfo.title}"</span>{/if}
+                          </div>
+                        </div>
+                      {:else if cu?.isCloseWindow}
+                        <div class="rounded-[6px] border border-white/[0.08] bg-[#0E0E11] p-2.5 flex items-center justify-between gap-3 text-[11.5px]">
+                          <div class="flex items-center gap-2 min-w-0">
+                            <span class="text-[#EDEDEF] font-sans">Окно закрыто:</span>
+                            <span class="text-[#A3A3AA] font-mono truncate">{cu.closeInfo?.title || cu.closeInfo?.processName || 'окно'}</span>
+                          </div>
+                        </div>
+                      {:else if readableOut}
+                        <pre data-omni-tool-output="" class="text-[#9BA1B0] whitespace-pre-wrap break-all max-h-52 overflow-y-auto">{readableOut}</pre>
+                      {/if}
                     {:else if readableOut}
                       <pre data-omni-tool-output="" class="text-[#9BA1B0] whitespace-pre-wrap break-all max-h-52 overflow-y-auto">{readableOut}</pre>
                     {:else if isToolRunning}
