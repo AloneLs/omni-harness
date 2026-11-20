@@ -1297,12 +1297,16 @@ impl ToolDispatcher {
                     }
                     "fetch" => {
                         let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
-                        let client = reqwest::Client::builder()
+                        let mut b = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(20))
                             .user_agent(ua)
-                            .redirect(reqwest::redirect::Policy::limited(10))
-                            .build()
-                            .map_err(|e| e.to_string())?;
+                            .redirect(reqwest::redirect::Policy::limited(10));
+                        if let Some(sys_proxy) = crate::resolve_windows_system_proxy() {
+                            if let Ok(proxy) = reqwest::Proxy::all(&sys_proxy) {
+                                b = b.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1,*.local,*.internal")));
+                            }
+                        }
+                        let client = b.build().map_err(|e| e.to_string())?;
 
                         let reqwest_res = client
                             .get(target)

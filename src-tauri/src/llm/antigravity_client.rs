@@ -382,18 +382,17 @@ pub async fn stream_antigravity(
         {
             Ok(r) => r,
             Err(err) => {
-                oauth_accounts::mark_account_cooldown(&acc.id, 15, &err.to_string()).await;
-                excluded_ids.insert(acc.id.clone());
                 if attempt == max_attempts {
                     return Err(LlmError::Network(err));
                 }
                 let _ = sender
                     .send(StreamEvent::RetryNotice {
-                        reason: format!("Antigravity network error ({}): {}", acc.email, err),
+                        reason: format!("Antigravity connection retry ({}): {}", acc.email, err),
                         attempt,
                         model: request.model.clone(),
                     })
                     .await;
+                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
                 continue;
             }
         };
@@ -481,6 +480,20 @@ pub async fn stream_antigravity(
                         status: scode,
                         message: smsg,
                     });
+                }
+                Err(LlmError::Network(e)) => {
+                    if attempt < max_attempts {
+                        let _ = sender
+                            .send(StreamEvent::RetryNotice {
+                                reason: format!("Stream network error, retrying: {}", e),
+                                attempt,
+                                model: request.model.clone(),
+                            })
+                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                        continue;
+                    }
+                    return Err(LlmError::Network(e));
                 }
                 Err(e) => return Err(e),
             }

@@ -2928,23 +2928,8 @@ async fn run_telegram_agent_turn(
     } else {
         (Some(provider.proxy_enabled), provider.proxy_url.clone())
     };
-    let http_client = if eff_px_en == Some(true) {
-        if let Some(ref purl) = eff_px_url {
-            if let Ok(proxy) = reqwest::Proxy::all(purl.trim()) {
-                reqwest::Client::builder()
-                    .proxy(proxy)
-                    .connect_timeout(Duration::from_secs(20))
-                    .build()
-                    .unwrap_or_else(|_| ctx.http_client.clone())
-            } else {
-                ctx.http_client.clone()
-            }
-        } else {
-            ctx.http_client.clone()
-        }
-    } else {
-        ctx.http_client.clone()
-    };
+    let http_client = crate::build_http_client(eff_px_en, eff_px_url.as_deref(), Some(&ctx.http_client))
+        .unwrap_or_else(|_| ctx.http_client.clone());
 
     let session = ctx.stream_mgr.create_session(&chat_id).await;
     let contract_mutex = {

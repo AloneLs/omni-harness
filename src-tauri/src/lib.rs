@@ -48,8 +48,20 @@ impl AppManagedState {
 }
 
 #[cfg(target_os = "windows")]
-fn resolve_windows_system_proxy() -> Option<String> {
+static SYS_PROXY_CACHE: std::sync::OnceLock<std::sync::RwLock<(Option<String>, std::time::Instant)>> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "windows")]
+pub fn resolve_windows_system_proxy() -> Option<String> {
+    let cache_lock = SYS_PROXY_CACHE.get_or_init(|| {
+        std::sync::RwLock::new((None, std::time::Instant::now() - std::time::Duration::from_secs(10)))
+    });
+    if let Ok(guard) = cache_lock.read() {
+        if guard.1.elapsed() < std::time::Duration::from_secs(3) {
+            return guard.0.clone();
+        }
+    }
     use std::os::windows::process::CommandExt;
+    let fresh_val = (|| {
     let out = std::process::Command::new("reg")
         .args([
             "query",
@@ -82,28 +94,44 @@ fn resolve_windows_system_proxy() -> Option<String> {
         return None;
     }
     let mut picked = raw.to_string();
+    let mut is_socks = false;
     if raw.contains('=') {
         let parts: Vec<&str> = raw.split(';').collect();
-        picked = parts
-            .iter()
-            .find(|x| x.to_ascii_lowercase().starts_with("https="))
-            .or_else(|| parts.iter().find(|x| x.to_ascii_lowercase().starts_with("http=")))
-            .or_else(|| parts.iter().find(|x| x.to_ascii_lowercase().starts_with("socks=")))
-            .and_then(|x| x.split_once('=').map(|(_, v)| v.to_string()))
-            .unwrap_or_else(|| raw.to_string());
+        if let Some(s) = parts.iter().find(|x| x.to_ascii_lowercase().starts_with("socks=")) {
+            if let Some((_, v)) = s.split_once('=') {
+                picked = v.to_string();
+                is_socks = true;
+            }
+        } else if let Some(h) = parts.iter().find(|x| x.to_ascii_lowercase().starts_with("https=")) {
+            if let Some((_, v)) = h.split_once('=') {
+                picked = v.to_string();
+            }
+        } else if let Some(h) = parts.iter().find(|x| x.to_ascii_lowercase().starts_with("http=")) {
+            if let Some((_, v)) = h.split_once('=') {
+                picked = v.to_string();
+            }
+        }
+    } else if raw.to_ascii_lowercase().contains("socks") {
+        is_socks = true;
     }
     let lower = picked.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("socks") {
         Some(picked)
-    } else if raw.to_ascii_lowercase().contains("socks=") && !raw.to_ascii_lowercase().contains("http=") {
+    } else if is_socks {
         Some(format!("socks5h://{}", picked))
     } else {
         Some(format!("http://{}", picked))
     }
+    })();
+
+    if let Ok(mut guard) = cache_lock.write() {
+        *guard = (fresh_val.clone(), std::time::Instant::now());
+    }
+    fresh_val
 }
 
 #[cfg(not(target_os = "windows"))]
-fn resolve_windows_system_proxy() -> Option<String> {
+pub fn resolve_windows_system_proxy() -> Option<String> {
     None
 }
 
@@ -117,37 +145,43 @@ fn is_direct_image_model(model_id: &str) -> bool {
         || m.contains("imagine-image")
 }
 
-fn build_http_client(
+pub fn build_http_client(
     proxy_enabled: Option<bool>,
     proxy_url: Option<&str>,
     fallback: Option<&reqwest::Client>,
 ) -> Result<reqwest::Client, String> {
-    if proxy_enabled.unwrap_or(false) {
-        if let Some(purl) = proxy_url.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let proxy = reqwest::Proxy::all(purl).map_err(|e| format!("Invalid proxy URL: {}", e))?;
-            return reqwest::Client::builder()
-                .proxy(proxy)
-                .connect_timeout(std::time::Duration::from_secs(20))
-                .build()
-                .map_err(|e| e.to_string());
-        }
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .tcp_keepalive(std::time::Duration::from_secs(15))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(10)
+        .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true);
+    let explicit_proxy = if proxy_enabled.unwrap_or(false) {
+        proxy_url.map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string())
+    } else {
+        None
+    };
+
+    if let Some(ref purl) = explicit_proxy {
+        let proxy = reqwest::Proxy::all(purl)
+            .map_err(|e| format!("Invalid proxy URL: {}", e))?
+            .no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1,*.local,*.internal"));
+        return builder.proxy(proxy).build().map_err(|e| e.to_string());
     }
     if let Some(sys_proxy) = resolve_windows_system_proxy() {
         if let Ok(proxy) = reqwest::Proxy::all(&sys_proxy) {
-            return reqwest::Client::builder()
-                .proxy(proxy)
-                .connect_timeout(std::time::Duration::from_secs(20))
-                .build()
-                .map_err(|e| e.to_string());
+            builder = builder.proxy(
+                proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1,*.local,*.internal"))
+            );
+            return builder.build().map_err(|e| e.to_string());
         }
     }
     if let Some(c) = fallback {
         return Ok(c.clone());
     }
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())
+    builder.build().map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3018,11 +3052,7 @@ pub fn run() {
     let chat_tmp_root = state::AppState::resolve_chat_temp_dir(None);
     let td = Arc::new(tools::ToolDispatcher::new(vec![initial_ws, chat_tmp_root], None));
     td.set_db(app_state_inner.db.clone());
-    let shared_http = reqwest::Client::builder()
-        .pool_max_idle_per_host(8)
-        .connect_timeout(std::time::Duration::from_secs(15))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
+    let shared_http = build_http_client(None, None, None).unwrap_or_else(|_| reqwest::Client::new());
 
     let app_state_arc = Arc::new(app_state_inner);
     let active_contracts_arc = Arc::new(RwLock::new(std::collections::HashMap::new()));

@@ -41,10 +41,20 @@ impl TelegramClient {
             return Err("Telegram bot token is required".to_string());
         }
         let mut builder = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(12))
-            .timeout(Duration::from_secs(45));
-        if let Some(pu) = proxy_url.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let proxy = reqwest::Proxy::all(pu).map_err(|e| format!("Invalid proxy URL: {}", e))?;
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60))
+            .tcp_keepalive(Duration::from_secs(15))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(8);
+        let eff_proxy = proxy_url
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(crate::resolve_windows_system_proxy);
+        if let Some(pu) = eff_proxy {
+            let proxy = reqwest::Proxy::all(&pu)
+                .map_err(|e| format!("Invalid proxy URL: {}", e))?
+                .no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1,*.local,*.internal"));
             builder = builder.proxy(proxy);
         } else {
             builder = builder.local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));

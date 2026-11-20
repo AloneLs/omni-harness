@@ -60,11 +60,15 @@ impl Clone for CdpController {
 }
 
 pub fn duckduckgo_search(query: &str, max_results: usize) -> Result<Vec<SearchResult>, String> {
-    let client = reqwest::blocking::Client::builder()
+    let mut builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(12))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-        .build()
-        .map_err(|e| e.to_string())?;
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+    if let Some(sys_proxy) = crate::resolve_windows_system_proxy() {
+        if let Ok(proxy) = reqwest::Proxy::all(&sys_proxy) {
+            builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1,*.local,*.internal")));
+        }
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
 
     let url = format!(
         "https://html.duckduckgo.com/html/?q={}",
