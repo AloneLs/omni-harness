@@ -1237,6 +1237,7 @@ class ChatStore {
   private applyReasoningChunk(chatId: string, msg: ChatMessage, chunk: string): void {
     if (!chunk) return;
     msg.statusText = undefined;
+    msg.retryReason = undefined;
     msg.reasoningContent = (msg.reasoningContent || '') + chunk;
     if (!msg.steps) msg.steps = [];
     const last = msg.steps[msg.steps.length - 1];
@@ -1259,6 +1260,7 @@ class ChatStore {
   private applyContentChunk(chatId: string, msg: ChatMessage, chunk: string): void {
     if (!chunk) return;
     msg.statusText = undefined;
+    msg.retryReason = undefined;
     msg.content += chunk;
     if (!msg.steps) msg.steps = [];
     const last = msg.steps[msg.steps.length - 1];
@@ -2236,6 +2238,7 @@ class ChatStore {
       this.flushSmoothBuffers(cid);
       if (!event.id) return;
       currentAssistantMsg.statusText = undefined;
+      currentAssistantMsg.retryReason = undefined;
       const existingIdx = currentAssistantMsg.toolCalls.findIndex((c) => c.toolCallId === event.id);
       if (existingIdx === -1) {
         const record = formatToolExecution({
@@ -2251,6 +2254,7 @@ class ChatStore {
     } else if (event.type === 'tool_call_complete' || event.type === 'tool_start') {
       this.flushSmoothBuffers(cid);
       currentAssistantMsg.statusText = undefined;
+      currentAssistantMsg.retryReason = undefined;
       const existingTool = currentAssistantMsg.toolCalls.find((c) => c.toolCallId === event.id);
       const startedAt = existingTool?.startedAt || Date.now();
       const record = formatToolExecution({

@@ -18,6 +18,12 @@ pub enum ToolEntryStatus {
     Failed,
 }
 
+#[derive(Debug, Clone)]
+pub enum LiveTimelineItem {
+    Tool(ToolStreamEntry),
+    Notice(String),
+}
+
 pub struct LiveToolStream {
     client: TelegramClient,
     chat_id: i64,
@@ -25,8 +31,7 @@ pub struct LiveToolStream {
     message_id: Option<i64>,
     last_edit: Instant,
     last_rendered: String,
-    entries: Vec<ToolStreamEntry>,
-    notes: Vec<String>,
+    items: Vec<LiveTimelineItem>,
     total_steps: usize,
     dirty: bool,
 }
@@ -40,8 +45,7 @@ impl LiveToolStream {
             message_id: None,
             last_edit: Instant::now() - Duration::from_secs(5),
             last_rendered: String::new(),
-            entries: Vec::new(),
-            notes: Vec::new(),
+            items: Vec::new(),
             total_steps: 0,
             dirty: false,
         }
@@ -60,50 +64,60 @@ impl LiveToolStream {
     pub fn on_tool_start(&mut self, id: &str, name: &str, args_json: &str) {
         self.total_steps += 1;
         let preview = summarize_tool_args(args_json);
-        if let Some(existing) = self.entries.iter_mut().find(|e| e.id == id && !id.is_empty()) {
-            existing.name = name.to_string();
-            existing.preview = preview;
-            existing.status = ToolEntryStatus::Running;
+        let existing = self.items.iter_mut().rev().find_map(|item| {
+            if let LiveTimelineItem::Tool(t) = item {
+                if t.id == id && !id.is_empty() {
+                    return Some(t);
+                }
+            }
+            None
+        });
+        if let Some(t) = existing {
+            t.name = name.to_string();
+            t.preview = preview;
+            t.status = ToolEntryStatus::Running;
         } else {
-            self.entries.push(ToolStreamEntry {
+            self.items.push(LiveTimelineItem::Tool(ToolStreamEntry {
                 id: id.to_string(),
                 name: name.to_string(),
                 preview,
                 status: ToolEntryStatus::Running,
                 elapsed_ms: None,
-            });
+            }));
         }
         self.dirty = true;
     }
 
     pub fn on_tool_end(&mut self, id: &str, success: bool, elapsed_ms: u64) {
-        if let Some(existing) = self.entries.iter_mut().rev().find(|e| e.id == id && !id.is_empty()) {
-            existing.status = if success {
+        let existing = self.items.iter_mut().rev().find_map(|item| {
+            if let LiveTimelineItem::Tool(t) = item {
+                if t.id == id && !id.is_empty() {
+                    return Some(t);
+                }
+            }
+            None
+        });
+        if let Some(t) = existing {
+            t.status = if success {
                 ToolEntryStatus::Success
             } else {
                 ToolEntryStatus::Failed
             };
-            existing.elapsed_ms = Some(elapsed_ms);
+            t.elapsed_ms = Some(elapsed_ms);
             self.dirty = true;
         }
     }
 
     pub fn on_retry(&mut self, attempt: u32, reason: &str) {
         let short = compact_text(reason, 110);
-        self.notes.push(format!("🔄 Retry #{}: {}", attempt, short));
-        if self.notes.len() > 4 {
-            self.notes.remove(0);
-        }
+        self.items.push(LiveTimelineItem::Notice(format!("🔄 Retry #{}: {}", attempt, short)));
         self.dirty = true;
     }
 
     pub fn on_note(&mut self, note: &str) {
         let short = compact_text(note, 110);
         if !short.is_empty() {
-            self.notes.push(short);
-            if self.notes.len() > 4 {
-                self.notes.remove(0);
-            }
+            self.items.push(LiveTimelineItem::Notice(short));
             self.dirty = true;
         }
     }
@@ -118,9 +132,9 @@ impl LiveToolStream {
         let mut html = self.render_html();
         if html.encode_utf16().count() > 3300 {
             self.trim_for_rollover();
-            if self.entries.len() > 16 {
-                let keep_from = self.entries.len().saturating_sub(12);
-                self.entries.drain(0..keep_from);
+            if self.items.len() > 16 {
+                let keep_from = self.items.len().saturating_sub(12);
+                self.items.drain(0..keep_from);
             }
             html = self.render_html();
         }
@@ -156,7 +170,7 @@ impl LiveToolStream {
     }
 
     pub async fn finish_and_cleanup(&mut self) {
-        if self.entries.is_empty() && self.notes.is_empty() {
+        if self.items.is_empty() {
             if let Some(mid) = self.message_id.take() {
                 self.client.delete_message(self.chat_id, mid).await;
             }
@@ -166,9 +180,9 @@ impl LiveToolStream {
     }
 
     fn trim_for_rollover(&mut self) {
-        if self.entries.len() > 14 {
-            let cut = self.entries.len() - 10;
-            self.entries.drain(0..cut);
+        if self.items.len() > 14 {
+            let cut = self.items.len() - 10;
+            self.items.drain(0..cut);
         }
     }
 
@@ -178,51 +192,55 @@ impl LiveToolStream {
             "<b>⏳ Выполнение</b> · <code>{}</code>",
             escape_html(&compact_text(&self.model_label, 48))
         ));
-        if self.entries.is_empty() && self.notes.is_empty() {
+        if self.items.is_empty() {
             lines.push("Подготовка контекста...".to_string());
         } else {
-            let visible = if self.entries.len() > 18 {
-                let skipped = self.entries.len() - 18;
+            let visible = if self.items.len() > 18 {
+                let skipped = self.items.len() - 18;
                 lines.push(format!("<i>… ещё {} шагов</i>", skipped));
-                &self.entries[self.entries.len() - 18..]
+                &self.items[self.items.len() - 18..]
             } else {
-                &self.entries[..]
+                &self.items[..]
             };
-            for entry in visible {
-                let icon = match entry.status {
-                    ToolEntryStatus::Running => "⚙",
-                    ToolEntryStatus::Success => "✓",
-                    ToolEntryStatus::Failed => "✗",
-                };
-                let time_str = entry
-                    .elapsed_ms
-                    .map(|ms| {
-                        if ms >= 1000 {
-                            format!(" ({:.1}s)", ms as f64 / 1000.0)
+            for item in visible {
+                match item {
+                    LiveTimelineItem::Notice(note) => {
+                        lines.push(escape_html(note));
+                    }
+                    LiveTimelineItem::Tool(entry) => {
+                        let icon = match entry.status {
+                            ToolEntryStatus::Running => "⚙",
+                            ToolEntryStatus::Success => "✓",
+                            ToolEntryStatus::Failed => "✗",
+                        };
+                        let time_str = entry
+                            .elapsed_ms
+                            .map(|ms| {
+                                if ms >= 1000 {
+                                    format!(" ({:.1}s)", ms as f64 / 1000.0)
+                                } else {
+                                    format!(" ({}ms)", ms)
+                                }
+                            })
+                            .unwrap_or_default();
+                        if entry.preview.is_empty() {
+                            lines.push(format!(
+                                "{} <code>{}</code>{}",
+                                icon,
+                                escape_html(&entry.name),
+                                escape_html(&time_str)
+                            ));
                         } else {
-                            format!(" ({}ms)", ms)
+                            lines.push(format!(
+                                "{} <code>{}</code> · {}{}",
+                                icon,
+                                escape_html(&entry.name),
+                                escape_html(&entry.preview),
+                                escape_html(&time_str)
+                            ));
                         }
-                    })
-                    .unwrap_or_default();
-                if entry.preview.is_empty() {
-                    lines.push(format!(
-                        "{} <code>{}</code>{}",
-                        icon,
-                        escape_html(&entry.name),
-                        escape_html(&time_str)
-                    ));
-                } else {
-                    lines.push(format!(
-                        "{} <code>{}</code> · {}{}",
-                        icon,
-                        escape_html(&entry.name),
-                        escape_html(&entry.preview),
-                        escape_html(&time_str)
-                    ));
+                    }
                 }
-            }
-            for note in &self.notes {
-                lines.push(escape_html(note));
             }
         }
         lines.join("\n")
