@@ -3082,6 +3082,28 @@ async fn run_telegram_agent_turn(
                         ));
                     }
                 }
+                crate::llm::StreamEvent::TurnBufferReset => {
+                    final_text.clear();
+                    reasoning_text.clear();
+                    if let Some(ref app) = stream_app_ev {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({ "chatId": stream_chat_id, "type": "turn_buffer_reset" }),
+                        );
+                    }
+                }
+                crate::llm::StreamEvent::RetroactiveReasoningMove { text } => {
+                    if final_text.ends_with(&text) {
+                        final_text.truncate(final_text.len() - text.len());
+                    }
+                    reasoning_text.push_str(&text);
+                    if let Some(ref app) = stream_app_ev {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({ "chatId": stream_chat_id, "type": "retroactive_reasoning_move", "reasoningContent": text }),
+                        );
+                    }
+                }
                 crate::llm::StreamEvent::Error { error } => {
                     if let Some(ref app) = stream_app_ev {
                         let _ = app.emit(
@@ -3545,8 +3567,19 @@ async fn run_telegram_btw(
 
     let mut answer = String::new();
     while let Some(ev) = rx.recv().await {
-        if let crate::llm::StreamEvent::ContentDelta { delta } = ev {
-            answer.push_str(&delta);
+        match ev {
+            crate::llm::StreamEvent::ContentDelta { delta } => {
+                answer.push_str(&delta);
+            }
+            crate::llm::StreamEvent::TurnBufferReset => {
+                answer.clear();
+            }
+            crate::llm::StreamEvent::RetroactiveReasoningMove { text } => {
+                if answer.ends_with(&text) {
+                    answer.truncate(answer.len() - text.len());
+                }
+            }
+            _ => {}
         }
     }
     if answer.trim().is_empty() {
