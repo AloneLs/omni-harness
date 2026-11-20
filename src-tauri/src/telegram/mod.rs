@@ -3039,8 +3039,21 @@ async fn run_telegram_agent_turn(
                 crate::llm::StreamEvent::ContextCompacted {
                     before_tokens,
                     after_tokens,
+                    ref summary,
                     ..
                 } => {
+                    if let Some(ref app) = stream_app_ev {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({
+                                "chatId": stream_chat_id,
+                                "type": "context_compacted",
+                                "beforeTokens": before_tokens,
+                                "afterTokens": after_tokens,
+                                "summary": summary,
+                            }),
+                        );
+                    }
                     tool_stream.on_note(&format!(
                         "📦 Контекст сжат: {} → {} токенов",
                         before_tokens, after_tokens

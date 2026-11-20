@@ -579,6 +579,9 @@ class ChatStore {
           attempt?: number;
           reason?: string;
           error?: string;
+          beforeTokens?: number;
+          afterTokens?: number;
+          summary?: string;
         }>('telegram-chat-stream', (ev) => {
           this.handleTelegramStreamEvent(ev.payload);
         });
@@ -620,6 +623,9 @@ class ChatStore {
     attempt?: number;
     reason?: string;
     error?: string;
+    beforeTokens?: number;
+    afterTokens?: number;
+    summary?: string;
   } | undefined): void {
     const chatId = payload?.chatId;
     const evtType = payload?.type;
@@ -759,6 +765,18 @@ class ChatStore {
             : s
         );
       }
+      this.messagesByChat[chatId] = [...list];
+      return;
+    }
+    if (evtType === 'context_compacted') {
+      if (!msg.steps) msg.steps = [];
+      msg.steps.push({
+        kind: 'compact',
+        id: `cmp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        beforeTokens: payload?.beforeTokens || 0,
+        afterTokens: payload?.afterTokens || 0,
+        summary: payload?.summary || ''
+      });
       this.messagesByChat[chatId] = [...list];
       return;
     }

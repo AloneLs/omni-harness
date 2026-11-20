@@ -66,6 +66,304 @@ fn is_safe_url(url: &str) -> bool {
     lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("tg://")
 }
 
+pub fn char_display_width(c: char) -> usize {
+    let u = c as u32;
+    if u < 0x20 || (0x7f..0xa0).contains(&u) {
+        0
+    } else if (0x1100..=0x115f).contains(&u)
+        || (0x2329..=0x232a).contains(&u)
+        || (0x2e80..=0xa4cf).contains(&u)
+        || (0xac00..=0xd7a3).contains(&u)
+        || (0xf900..=0xfaff).contains(&u)
+        || (0xfe10..=0xfe19).contains(&u)
+        || (0xfe30..=0xfe6f).contains(&u)
+        || (0xff00..=0xff60).contains(&u)
+        || (0xffe0..=0xffe6).contains(&u)
+        || (0x1f300..=0x1faff).contains(&u)
+        || (0x2600..=0x27bf).contains(&u)
+    {
+        2
+    } else {
+        1
+    }
+}
+
+pub fn str_display_width(s: &str) -> usize {
+    s.chars().map(char_display_width).sum()
+}
+
+fn pad_left(s: &str, target_width: usize) -> String {
+    let cur = str_display_width(s);
+    if cur >= target_width {
+        return s.to_string();
+    }
+    let spaces = " ".repeat(target_width - cur);
+    format!("{}{}", spaces, s)
+}
+
+fn pad_right(s: &str, target_width: usize) -> String {
+    let cur = str_display_width(s);
+    if cur >= target_width {
+        return s.to_string();
+    }
+    let spaces = " ".repeat(target_width - cur);
+    format!("{}{}", s, spaces)
+}
+
+fn pad_center(s: &str, target_width: usize) -> String {
+    let cur = str_display_width(s);
+    if cur >= target_width {
+        return s.to_string();
+    }
+    let total = target_width - cur;
+    let left = total / 2;
+    let right = total - left;
+    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+}
+
+fn clean_cell_text(raw: &str) -> String {
+    let s = raw.trim();
+    s.replace("**", "")
+        .replace("__", "")
+        .replace("~~", "")
+        .replace('`', "")
+}
+
+fn split_table_row(line: &str) -> Vec<String> {
+    let mut s = line.trim();
+    if s.starts_with('|') {
+        s = &s[1..];
+    }
+    if s.ends_with('|') && !s.ends_with("\\|") {
+        s = &s[..s.len() - 1];
+    }
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in s.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '|' {
+            cells.push(current.trim().to_string());
+            current.clear();
+        } else {
+            current.push(ch);
+        }
+    }
+    cells.push(current.trim().to_string());
+    cells
+}
+
+fn is_table_delimiter_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.contains('-') || !trimmed.contains('|') {
+        return false;
+    }
+    let cells = split_table_row(trimmed);
+    if cells.is_empty() {
+        return false;
+    }
+    cells.iter().all(|col| {
+        let clean = col.trim_matches(':');
+        !clean.is_empty() && clean.chars().all(|c| c == '-')
+    })
+}
+
+fn parse_table_alignment(cell: &str) -> &'static str {
+    let s = cell.trim();
+    if s.starts_with(':') && s.ends_with(':') {
+        "center"
+    } else if s.ends_with(':') {
+        "right"
+    } else {
+        "left"
+    }
+}
+
+fn render_box_table(header: &[String], aligns: &[&str], rows: &[Vec<String>]) -> String {
+    let num_cols = header.len();
+    if num_cols == 0 {
+        return String::new();
+    }
+    let mut widths: Vec<usize> = header.iter().map(|h| str_display_width(&clean_cell_text(h))).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate().take(num_cols) {
+            widths[i] = widths[i].max(str_display_width(&clean_cell_text(cell)));
+        }
+    }
+    for w in &mut widths {
+        *w = (*w).max(2);
+    }
+
+    let top = format!("┌{}┐", widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┬"));
+    let mut header_cells = Vec::new();
+    for (i, cell) in header.iter().enumerate() {
+        let cleaned = clean_cell_text(cell);
+        let padded = pad_center(&cleaned, widths[i]);
+        header_cells.push(format!(" {} ", escape_html(&padded)));
+    }
+    let header_line = format!("│{}│", header_cells.join("│"));
+    let mid = format!("├{}┤", widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┼"));
+
+    let mut row_lines = Vec::new();
+    for row in rows {
+        let mut row_cells = Vec::new();
+        for i in 0..num_cols {
+            let val = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            let cleaned = clean_cell_text(val);
+            let align = aligns.get(i).copied().unwrap_or("left");
+            let padded = match align {
+                "right" => pad_left(&cleaned, widths[i]),
+                "center" => pad_center(&cleaned, widths[i]),
+                _ => pad_right(&cleaned, widths[i]),
+            };
+            row_cells.push(format!(" {} ", escape_html(&padded)));
+        }
+        row_lines.push(format!("│{}│", row_cells.join("│")));
+    }
+
+    let bot = format!("└{}┘", widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join("┴"));
+
+    let mut lines = Vec::new();
+    lines.push(top);
+    lines.push(header_line);
+    lines.push(mid);
+    lines.extend(row_lines);
+    lines.push(bot);
+    format!("<pre><code>{}</code></pre>", lines.join("\n"))
+}
+
+fn extract_markdown_tables(
+    text: &str,
+    placeholders: &mut HashMap<String, String>,
+    counter: &mut usize,
+) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if i + 1 < lines.len() && line.contains('|') && is_table_delimiter_row(lines[i + 1]) {
+            let header = split_table_row(line);
+            let delim = split_table_row(lines[i + 1]);
+            let aligns: Vec<&str> = delim.iter().map(|d| parse_table_alignment(d)).collect();
+            let mut rows = Vec::new();
+            i += 2;
+            while i < lines.len() && lines[i].contains('|') && !lines[i].trim().is_empty() {
+                rows.push(split_table_row(lines[i]));
+                i += 1;
+            }
+            let rendered = render_box_table(&header, &aligns, &rows);
+            let key = format!("\x00TG{}\x00", *counter);
+            *counter += 1;
+            placeholders.insert(key.clone(), rendered);
+            out_lines.push(key);
+            continue;
+        }
+        out_lines.push(line.to_string());
+        i += 1;
+    }
+    out_lines.join("\n")
+}
+
+fn extract_markdown_blockquotes(
+    text: &str,
+    placeholders: &mut HashMap<String, String>,
+    counter: &mut usize,
+) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if line.trim_start().starts_with('>') {
+            let mut quote_lines = Vec::new();
+            while i < lines.len() {
+                let cur = lines[i].trim_start();
+                if cur.starts_with('>') {
+                    let stripped = cur.strip_prefix('>').unwrap_or("");
+                    let content = stripped.strip_prefix(' ').unwrap_or(stripped);
+                    quote_lines.push(content);
+                    i += 1;
+                } else if !quote_lines.is_empty() && !lines[i].trim().is_empty() && !lines[i].trim().starts_with('#') {
+                    quote_lines.push(lines[i].trim());
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+
+            let raw_body = quote_lines.join("\n").trim().to_string();
+            let mut tag = if quote_lines.len() >= 4 {
+                "blockquote expandable"
+            } else {
+                "blockquote"
+            };
+
+            let mut final_body = escape_html(&raw_body);
+            let upper = raw_body.to_uppercase();
+            for (token, header) in [
+                ("[!NOTE]", "ℹ️ <b>Заметка</b>"),
+                ("[!TIP]", "💡 <b>Совет</b>"),
+                ("[!IMPORTANT]", "📌 <b>Важно</b>"),
+                ("[!WARNING]", "⚠️ <b>Внимание</b>"),
+                ("[!CAUTION]", "🚨 <b>Осторожно</b>"),
+            ] {
+                if upper.starts_with(token) {
+                    tag = "blockquote expandable";
+                    let rest = escape_html(raw_body[token.len()..].trim_start());
+                    final_body = if rest.is_empty() {
+                        header.to_string()
+                    } else {
+                        format!("{}\n{}", header, rest)
+                    };
+                    break;
+                }
+            }
+
+            let rendered = format!(
+                "<{}>{}</{}>",
+                tag,
+                final_body,
+                tag.split_whitespace().next().unwrap_or("blockquote")
+            );
+            let key = format!("\x00TG{}\x00", *counter);
+            *counter += 1;
+            placeholders.insert(key.clone(), rendered);
+            out.push(key);
+            continue;
+        }
+        out.push(line.to_string());
+        i += 1;
+    }
+    out.join("\n")
+}
+
+fn extract_markdown_details(
+    text: &str,
+    placeholders: &mut HashMap<String, String>,
+    counter: &mut usize,
+) -> String {
+    static DETAILS_RE: OnceLock<Regex> = OnceLock::new();
+    let details_re = DETAILS_RE.get_or_init(|| {
+        Regex::new(r"(?is)<details[^>]*>\s*<summary>(.*?)</summary>\s*(.*?)\s*</details>").unwrap()
+    });
+    details_re
+        .replace_all(text, |caps: &regex::Captures| {
+            let summary = escape_html(caps.get(1).map(|m| m.as_str().trim()).unwrap_or("Подробнее"));
+            let body = escape_html(caps.get(2).map(|m| m.as_str().trim()).unwrap_or(""));
+            let rendered = format!("<blockquote expandable><b>{}</b>\n{}</blockquote>", summary, body);
+            let key = format!("\x00TG{}\x00", *counter);
+            *counter += 1;
+            placeholders.insert(key.clone(), rendered);
+            key
+        })
+        .to_string()
+}
+
 pub fn markdown_to_telegram_html(text: &str) -> String {
     static CODE_BLOCK_RE: OnceLock<Regex> = OnceLock::new();
     static INLINE_CODE_RE: OnceLock<Regex> = OnceLock::new();
@@ -132,7 +430,11 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
         key
     });
 
-    let with_inline = inline_code_re.replace_all(&with_blocks, |caps: &regex::Captures| {
+    let with_details = extract_markdown_details(&with_blocks, &mut placeholders, &mut counter);
+    let with_tables = extract_markdown_tables(&with_details, &mut placeholders, &mut counter);
+    let with_quotes = extract_markdown_blockquotes(&with_tables, &mut placeholders, &mut counter);
+
+    let with_inline = inline_code_re.replace_all(&with_quotes, |caps: &regex::Captures| {
         let code = escape_html(caps.get(1).map(|m| m.as_str()).unwrap_or(""));
         let rendered = format!("<code>{}</code>", code);
         let key = format!("\x00TG{}\x00", counter);
