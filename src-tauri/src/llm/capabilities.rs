@@ -404,6 +404,39 @@ impl ModelCapabilities {
     }
 }
 
+pub fn model_supports_native_audio(model: &str) -> bool {
+    let name_lower = model.to_lowercase();
+    let short = name_lower.rsplit('/').next().unwrap_or(&name_lower);
+    if short.contains("whisper")
+        || short.contains("tts")
+        || short.contains("imagine")
+        || short.contains("flux")
+        || short.contains("embedding")
+        || short.contains("dall-e")
+        || short.contains("sora")
+    {
+        return false;
+    }
+    if let Some(md) = crate::llm::models_dev::lookup(model) {
+        if let Some(a) = md.audio {
+            return a;
+        }
+    }
+    if short.contains("gemini") {
+        return !(short.contains("-image") || short.ends_with("image"));
+    }
+    if short.contains("gpt-audio") || short.contains("audio-preview") || short.contains("realtime") {
+        return true;
+    }
+    if short.contains("qwen") && short.contains("audio") {
+        return true;
+    }
+    if short.contains("omni") && (short.contains("qwen") || short.contains("minimax")) {
+        return true;
+    }
+    false
+}
+
 #[derive(Debug, Clone)]
 pub struct CapabilityRegistry {
     entries: Arc<RwLock<HashMap<String, ModelCapabilities>>>,

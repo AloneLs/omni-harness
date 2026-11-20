@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 use tokio::sync::RwLock;
 
 pub struct AppManagedState {
@@ -28,6 +28,7 @@ pub struct AppManagedState {
     pub mcp_catalog: Arc<mcp::McpServerCatalog>,
     pub telegram_mgr: Arc<telegram::TelegramBotManager>,
     pub speech_engine: Arc<speech::SpeechEngine>,
+    pub prompt_queue: Arc<engine::prompt_queue::PromptQueue>,
     pub tool_dispatcher: Arc<tools::ToolDispatcher>,
     pub key_pool: Arc<llm::KeyPool>,
     pub caps_registry: Arc<llm::CapabilityRegistry>,
@@ -1120,7 +1121,51 @@ pub struct AttachmentInput {
     pub data_url: Option<String>,
 }
 
-fn build_user_msg_with_attachments(prompt: &str, attachments: Option<Vec<AttachmentInput>>) -> Option<llm::request_compat::ChatMessage> {
+fn decode_attachment_audio_bytes(att: &AttachmentInput) -> Option<Vec<u8>> {
+    use base64::Engine;
+    if let Some(du) = att.data_url.as_deref() {
+        if let Some(pos) = du.find("base64,") {
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&du[pos + 7..]) {
+                if !bytes.is_empty() {
+                    return Some(bytes);
+                }
+            }
+        }
+    }
+    let path = att.path.as_deref().unwrap_or("").trim();
+    if path.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(path);
+    if speech::convert::is_wav_file(p) {
+        std::fs::read(p).ok()
+    } else {
+        speech::convert::decode_to_wav_16k_mono(p).ok()
+    }
+}
+
+async fn transcribe_attachment_audio(
+    mgr: &AppManagedState,
+    att: &AttachmentInput,
+    preferred_model: Option<&str>,
+) -> Result<String, String> {
+    let bytes = decode_attachment_audio_bytes(att)
+        .ok_or_else(|| "Failed to decode audio attachment".to_string())?;
+    let fallback_key = mgr.app_state.get_credential("openai_api_key").await.ok();
+    let res = mgr
+        .speech_engine
+        .transcribe_audio(&bytes, fallback_key.as_deref(), preferred_model)
+        .await?;
+    Ok(res.text)
+}
+
+async fn build_user_msg_with_attachments(
+    mgr: &AppManagedState,
+    model_id: &str,
+    prompt: &str,
+    attachments: Option<Vec<AttachmentInput>>,
+    whisper_model: Option<&str>,
+) -> Option<llm::request_compat::ChatMessage> {
     use base64::Engine;
     let atts = attachments?;
     if atts.is_empty() {
@@ -1129,13 +1174,22 @@ fn build_user_msg_with_attachments(prompt: &str, attachments: Option<Vec<Attachm
     let mut parts: Vec<llm::request_compat::ContentPart> = vec![
         llm::request_compat::ContentPart::Text { text: prompt.to_string() },
     ];
-    let mut has_image = false;
+    let mut has_media = false;
     let mut extra_notes: Vec<String> = Vec::new();
+    let native_audio = llm::capabilities::model_supports_native_audio(model_id);
     for att in atts {
-        let name = att.name.unwrap_or_else(|| "file".to_string());
-        let path_str = att.path.unwrap_or_default();
-        let kind = att.kind.unwrap_or_default();
+        let name = att.name.clone().unwrap_or_else(|| "file".to_string());
+        let path_str = att.path.clone().unwrap_or_default();
+        let kind = att.kind.clone().unwrap_or_default();
         let low = format!("{} {}", name, path_str).to_lowercase();
+        let is_audio = kind == "audio"
+            || low.ends_with(".wav")
+            || low.ends_with(".mp3")
+            || low.ends_with(".ogg")
+            || low.ends_with(".opus")
+            || low.ends_with(".m4a")
+            || low.ends_with(".webm")
+            || low.ends_with(".flac");
         let is_img = kind == "image"
             || low.ends_with(".png")
             || low.ends_with(".jpg")
@@ -1143,7 +1197,7 @@ fn build_user_msg_with_attachments(prompt: &str, attachments: Option<Vec<Attachm
             || low.ends_with(".webp")
             || low.ends_with(".gif");
         if is_img {
-            let url_opt = if let Some(du) = att.data_url.filter(|u| u.starts_with("data:image/")) {
+            let url_opt = if let Some(du) = att.data_url.clone().filter(|u| u.starts_with("data:image/")) {
                 Some(du)
             } else if !path_str.trim().is_empty() {
                 if let Ok(bytes) = std::fs::read(path_str.trim()) {
@@ -1165,13 +1219,40 @@ fn build_user_msg_with_attachments(prompt: &str, attachments: Option<Vec<Attachm
                 None
             };
             if let Some(u) = url_opt {
-                has_image = true;
+                has_media = true;
                 parts.push(llm::request_compat::ContentPart::ImageUrl {
                     image_url: llm::request_compat::ImageUrlDetail { url: u, detail: None },
                 });
             }
+        } else if is_audio {
+            if native_audio {
+                if let Some(bytes) = decode_attachment_audio_bytes(&att) {
+                    has_media = true;
+                    parts.push(llm::request_compat::ContentPart::InputAudio {
+                        input_audio: llm::request_compat::InputAudioDetail {
+                            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            format: "wav".to_string(),
+                        },
+                    });
+                    extra_notes.push(format!("[Voice message from user: {}]", name));
+                } else {
+                    extra_notes.push(format!("[Voice message attachment could not be decoded: {}]", name));
+                }
+            } else {
+                match transcribe_attachment_audio(mgr, &att, whisper_model).await {
+                    Ok(text) if !text.trim().is_empty() => {
+                        extra_notes.push(format!("[Voice message from user, transcribed]: {}", text.trim()));
+                    }
+                    Ok(_) => {
+                        extra_notes.push(format!("[Voice message from user: {} — transcription is empty]", name));
+                    }
+                    Err(e) => {
+                        extra_notes.push(format!("[Voice message from user: {} — transcription failed: {}]", name, e));
+                    }
+                }
+            }
         } else if !path_str.trim().is_empty() {
-            extra_notes.push(format!("[Attached file: {} ({})]", name, path_str));
+            extra_notes.push(format!("[Attached file sent by user: {} ({})]", name, path_str));
         }
     }
     if !extra_notes.is_empty() {
@@ -1182,7 +1263,7 @@ fn build_user_msg_with_attachments(prompt: &str, attachments: Option<Vec<Attachm
             text.push_str(&extra_notes.join("\n"));
         }
     }
-    if !has_image && extra_notes.is_empty() {
+    if !has_media && extra_notes.is_empty() {
         return None;
     }
     Some(llm::request_compat::ChatMessage {
@@ -1217,6 +1298,7 @@ async fn start_chat_stream(
     resume: Option<bool>,
     history: Option<Vec<HistoryInputItem>>,
     attachments: Option<Vec<AttachmentInput>>,
+    whisper_model: Option<String>,
     theme_id: Option<String>,
     on_event: Channel<serde_json::Value>,
 ) -> Result<String, String> {
@@ -1592,7 +1674,14 @@ async fn start_chat_stream(
         })
         .collect();
 
-    let pending_user_msg = build_user_msg_with_attachments(&prompt, attachments);
+    let pending_user_msg = build_user_msg_with_attachments(
+        &state,
+        &model_id,
+        &prompt,
+        attachments,
+        whisper_model.as_deref(),
+    )
+    .await;
     let api_proto = api_protocol.clone();
     logger::info("ChatStream", &format!("start chat_id={} model={} provider={:?} theme={:?} has_attachments={}", chat_id, model_id, provider_name, theme_id, pending_user_msg.is_some()));
     tokio::spawn(async move {
@@ -2839,14 +2928,139 @@ async fn export_skill_zip(
 #[tauri::command]
 async fn transcribe_audio(
     state: State<'_, AppManagedState>,
-    audio_data: Vec<u8>,
+    audio_base64: Option<String>,
+    audio_data: Option<Vec<u8>>,
+    model: Option<String>,
 ) -> Result<String, String> {
+    use base64::Engine;
+    let bytes = if let Some(b64) = audio_base64.filter(|s| !s.trim().is_empty()) {
+        let payload = match b64.find("base64,") {
+            Some(pos) => b64[pos + 7..].to_string(),
+            None => b64,
+        };
+        base64::engine::general_purpose::STANDARD
+            .decode(payload.trim())
+            .map_err(|e| format!("Invalid base64 audio payload: {}", e))?
+    } else if let Some(raw) = audio_data.filter(|d| !d.is_empty()) {
+        raw
+    } else {
+        return Err("No audio payload received".to_string());
+    };
     let fallback_key = state.app_state.get_credential("openai_api_key").await.ok();
     let res = state
         .speech_engine
-        .transcribe_audio(&audio_data, fallback_key.as_deref())
+        .transcribe_audio(&bytes, fallback_key.as_deref(), model.as_deref())
         .await?;
     Ok(res.text)
+}
+
+#[tauri::command]
+async fn queue_list(
+    state: State<'_, AppManagedState>,
+    chat_id: String,
+) -> Result<Vec<engine::prompt_queue::QueuedPrompt>, String> {
+    Ok(state.prompt_queue.list(&chat_id).await)
+}
+
+#[tauri::command]
+async fn queue_add(
+    app: tauri::AppHandle,
+    state: State<'_, AppManagedState>,
+    chat_id: String,
+    text: String,
+    attachments: Option<Vec<AttachmentInput>>,
+    priority: Option<String>,
+) -> Result<Vec<engine::prompt_queue::QueuedPrompt>, String> {
+    let mut item = engine::prompt_queue::QueuedPrompt::new(&chat_id, text, "app");
+    if let Some(p) = priority.filter(|p| !p.trim().is_empty()) {
+        item.priority = p;
+    }
+    if let Some(atts) = attachments {
+        item.attachments = atts
+            .into_iter()
+            .map(|a| engine::prompt_queue::QueuedAttachment {
+                name: a.name.unwrap_or_default(),
+                path: a.path.unwrap_or_default(),
+                kind: a.kind.unwrap_or_default(),
+                data_url: a.data_url,
+            })
+            .collect();
+    }
+    let items = state.prompt_queue.add(item).await;
+    let _ = app.emit(
+        "prompt-queue-updated",
+        json!({ "chatId": chat_id, "items": items }),
+    );
+    Ok(items)
+}
+
+#[tauri::command]
+async fn queue_remove(
+    app: tauri::AppHandle,
+    state: State<'_, AppManagedState>,
+    chat_id: String,
+    id: String,
+) -> Result<Vec<engine::prompt_queue::QueuedPrompt>, String> {
+    let items = state.prompt_queue.remove(&chat_id, &id).await;
+    let _ = app.emit(
+        "prompt-queue-updated",
+        json!({ "chatId": chat_id, "items": items }),
+    );
+    Ok(items)
+}
+
+#[tauri::command]
+async fn queue_clear(
+    app: tauri::AppHandle,
+    state: State<'_, AppManagedState>,
+    chat_id: String,
+) -> Result<Vec<engine::prompt_queue::QueuedPrompt>, String> {
+    let items = state.prompt_queue.clear(&chat_id).await;
+    let _ = app.emit(
+        "prompt-queue-updated",
+        json!({ "chatId": chat_id, "items": items }),
+    );
+    Ok(items)
+}
+
+#[tauri::command]
+async fn queue_take_next(
+    app: tauri::AppHandle,
+    state: State<'_, AppManagedState>,
+    chat_id: String,
+) -> Result<Option<engine::prompt_queue::QueuedPrompt>, String> {
+    let taken = state.prompt_queue.take_next(&chat_id).await;
+    if taken.is_some() {
+        let items = state.prompt_queue.list(&chat_id).await;
+        let _ = app.emit(
+            "prompt-queue-updated",
+            json!({ "chatId": chat_id, "items": items }),
+        );
+    }
+    Ok(taken)
+}
+
+#[tauri::command]
+async fn queue_take_specific(
+    app: tauri::AppHandle,
+    state: State<'_, AppManagedState>,
+    chat_id: String,
+    id: String,
+) -> Result<Option<engine::prompt_queue::QueuedPrompt>, String> {
+    let taken = state.prompt_queue.take_specific(&chat_id, &id).await;
+    if taken.is_some() {
+        let items = state.prompt_queue.list(&chat_id).await;
+        let _ = app.emit(
+            "prompt-queue-updated",
+            json!({ "chatId": chat_id, "items": items }),
+        );
+    }
+    Ok(taken)
+}
+
+#[tauri::command]
+async fn model_native_audio(model_id: String) -> Result<bool, String> {
+    Ok(llm::capabilities::model_supports_native_audio(&model_id))
 }
 
 #[tauri::command]
@@ -3054,6 +3268,8 @@ pub fn run() {
     td.set_db(app_state_inner.db.clone());
     let shared_http = build_http_client(None, None, None).unwrap_or_else(|_| reqwest::Client::new());
 
+    let prompt_queue_arc = Arc::new(engine::prompt_queue::PromptQueue::new(&data_dir));
+
     let app_state_arc = Arc::new(app_state_inner);
     let active_contracts_arc = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let tg_app_handle = Arc::new(RwLock::new(None));
@@ -3066,7 +3282,9 @@ pub fn run() {
         key_pool: kp.clone(),
         caps_registry: cr.clone(),
         http_client: shared_http.clone(),
+        speech_engine: speech_eng.clone(),
         active_contracts: active_contracts_arc.clone(),
+        prompt_queue: prompt_queue_arc.clone(),
     };
     let md_dir = data_dir.clone();
     tauri::async_runtime::spawn(async move {
@@ -3083,6 +3301,7 @@ pub fn run() {
         mcp_catalog: mcp_cat,
         telegram_mgr: tele_m,
         speech_engine: speech_eng,
+        prompt_queue: prompt_queue_arc,
         tool_dispatcher: td,
         key_pool: kp,
         caps_registry: cr,
@@ -3289,6 +3508,13 @@ pub fn run() {
             import_skill_zip,
             export_skill_zip,
             transcribe_audio,
+            queue_list,
+            queue_add,
+            queue_remove,
+            queue_clear,
+            queue_take_next,
+            queue_take_specific,
+            model_native_audio,
             get_speech_status,
             download_whisper_model,
             delete_whisper_model,

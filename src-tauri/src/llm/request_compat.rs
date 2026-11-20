@@ -64,8 +64,10 @@ impl MessageContent {
             Self::Parts(parts) => {
                 let mut out = String::new();
                 for part in parts {
-                    if let ContentPart::Text { text } = part {
-                        out.push_str(text);
+                    match part {
+                        ContentPart::Text { text } => out.push_str(text),
+                        ContentPart::InputAudio { .. } => out.push_str("[audio input]"),
+                        ContentPart::ImageUrl { .. } => {}
                     }
                 }
                 out
@@ -81,6 +83,8 @@ pub enum ContentPart {
     Text { text: String },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrlDetail },
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudioDetail },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +92,44 @@ pub struct ImageUrlDetail {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputAudioDetail {
+    pub data: String,
+    pub format: String,
+}
+
+impl InputAudioDetail {
+    pub fn mime_type(&self) -> String {
+        match self.format.to_ascii_lowercase().as_str() {
+            "wav" => "audio/wav".to_string(),
+            "mp3" => "audio/mpeg".to_string(),
+            "ogg" | "opus" => "audio/ogg".to_string(),
+            "flac" => "audio/flac".to_string(),
+            "m4a" | "mp4" | "aac" => "audio/aac".to_string(),
+            "webm" => "audio/webm".to_string(),
+            other => format!("audio/{}", other),
+        }
+    }
+
+    pub fn from_file(path: &str, format_hint: &str) -> Option<Self> {
+        use base64::Engine;
+        let bytes = std::fs::read(path).ok()?;
+        if bytes.is_empty() {
+            return None;
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or(format_hint)
+            .to_ascii_lowercase();
+        Some(Self {
+            data: b64,
+            format: if ext.is_empty() { format_hint.to_string() } else { ext },
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,7 +257,38 @@ pub fn normalize_request(req: &mut ChatRequest, caps: &ModelCapabilities) {
                                 text: "[Image omitted: model does not support vision]".to_string(),
                             });
                         }
+                        ContentPart::InputAudio { .. } => {
+                            sanitized_parts.push(ContentPart::InputAudio {
+                                input_audio: InputAudioDetail { data: String::new(), format: String::new() },
+                            });
+                        }
                     }
+                }
+                msg.content = MessageContent::Parts(sanitized_parts);
+            }
+        }
+    }
+
+    if !crate::llm::capabilities::model_supports_native_audio(&req.model) {
+        for msg in req.messages.iter_mut() {
+            if let MessageContent::Parts(parts) = &mut msg.content {
+                let mut sanitized_parts = Vec::new();
+                let mut audio_count = 0usize;
+                for part in parts.drain(..) {
+                    match part {
+                        ContentPart::InputAudio { .. } => {
+                            audio_count += 1;
+                        }
+                        other => sanitized_parts.push(other),
+                    }
+                }
+                if audio_count > 0 {
+                    sanitized_parts.push(ContentPart::Text {
+                        text: format!(
+                            "[{} audio attachment(s) omitted: model does not support native audio input]",
+                            audio_count
+                        ),
+                    });
                 }
                 msg.content = MessageContent::Parts(sanitized_parts);
             }
@@ -307,6 +380,9 @@ pub fn apply_retry_action(req: &mut ChatRequest, action: &RetryAction) {
                             ContentPart::ImageUrl { .. } => sanitized.push(ContentPart::Text {
                                 text: "[Image omitted: model does not support vision]".to_string(),
                             }),
+                            ContentPart::InputAudio { input_audio } => {
+                                sanitized.push(ContentPart::InputAudio { input_audio })
+                            }
                         }
                     }
                     msg.content = MessageContent::Parts(sanitized);

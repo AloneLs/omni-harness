@@ -256,6 +256,7 @@ async fn stream_anthropic_inner(
                                         }
                                     }
                                 }
+                                ContentPart::InputAudio { .. } => {}
                             }
                         }
                         messages_payload.push(serde_json::json!({

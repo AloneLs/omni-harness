@@ -737,11 +737,32 @@ function cancelVoice() {
   voiceBands = new Array(28).fill(0.1);
 }
 
+async function activeModelNativeAudio(): Promise<boolean> {
+  try {
+    return await invoke<boolean>('model_native_audio', { modelId: displayActiveModel });
+  } catch {
+    return false;
+  }
+}
+
 async function stopAndTranscribe() {
   if (!voiceCaptureInstance) return;
   try {
     const result = await voiceCaptureInstance.stop();
     cancelVoice();
+    if (await activeModelNativeAudio()) {
+      attachments = [
+        ...attachments,
+        {
+          id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+          name: `voice_${Date.now()}.wav`,
+          path: '',
+          kind: 'audio',
+          previewUrl: `data:audio/wav;base64,${result.base64}`
+        }
+      ];
+      return;
+    }
     try {
       const transcribed = await invoke<string>('transcribe_audio', {
         audioBase64: result.base64,
@@ -765,6 +786,20 @@ async function stopAndSendVoice() {
   try {
     const result = await voiceCaptureInstance.stop();
     cancelVoice();
+    if (await activeModelNativeAudio()) {
+      await chatStore.sendMessage('', {
+        attachments: [
+          {
+            id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            name: `voice_${Date.now()}.wav`,
+            path: '',
+            kind: 'audio',
+            previewUrl: `data:audio/wav;base64,${result.base64}`
+          }
+        ]
+      });
+      return;
+    }
     let textToSend = '[Voice Command]';
     try {
       const transcribed = await invoke<string>('transcribe_audio', {

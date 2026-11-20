@@ -164,6 +164,15 @@ async fn stream_openai_responses_inner(
                                         "image_url": image_url.url,
                                     }));
                                 }
+                                crate::llm::request_compat::ContentPart::InputAudio { input_audio } => {
+                                    content_parts.push(serde_json::json!({
+                                        "type": "input_audio",
+                                        "input_audio": {
+                                            "data": input_audio.data,
+                                            "format": input_audio.format,
+                                        },
+                                    }));
+                                }
                             }
                         }
                     }

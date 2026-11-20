@@ -142,6 +142,16 @@ pub async fn stream_google_gemini(
                                         }
                                     }
                                 }
+                                ContentPart::InputAudio { input_audio } => {
+                                    if !input_audio.data.trim().is_empty() {
+                                        parts.push(serde_json::json!({
+                                            "inlineData": {
+                                                "mimeType": input_audio.mime_type(),
+                                                "data": input_audio.data,
+                                            }
+                                        }));
+                                    }
+                                }
                             }
                         }
                     }

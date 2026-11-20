@@ -7,6 +7,8 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
+pub mod convert;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WhisperModelInfo {
@@ -314,75 +316,215 @@ impl SpeechEngine {
         Ok((samples, sample_rate))
     }
 
+    fn resolve_model_path(&self, preferred: Option<&str>) -> Option<PathBuf> {
+        let models = self.get_available_models();
+        if let Some(p) = preferred {
+            let raw = p.trim().to_ascii_lowercase();
+            if !raw.is_empty() {
+                let wanted = raw.strip_prefix("ggml-").unwrap_or(raw.as_str()).to_string();
+                if let Some(m) = models.iter().find(|m| {
+                    m.is_downloaded
+                        && (m.model_id.eq_ignore_ascii_case(&wanted)
+                            || m.filename.to_ascii_lowercase().contains(&format!("{}.bin", wanted)))
+                }) {
+                    return m.local_path.clone().map(PathBuf::from);
+                }
+            }
+        }
+        models
+            .into_iter()
+            .find(|m| m.is_downloaded)
+            .and_then(|m| m.local_path)
+            .map(PathBuf::from)
+    }
+
+    fn resample_linear(samples: &[f32], from: u32, to: u32) -> Vec<f32> {
+        if from == to || from == 0 || samples.is_empty() {
+            return samples.to_vec();
+        }
+        let ratio = from as f64 / to as f64;
+        let out_len = ((samples.len() as f64) / ratio).floor() as usize;
+        let mut out = Vec::with_capacity(out_len);
+        for i in 0..out_len {
+            let pos = i as f64 * ratio;
+            let idx = pos.floor() as usize;
+            let frac = (pos - idx as f64) as f32;
+            let a = samples.get(idx).copied().unwrap_or(0.0);
+            let b = samples.get(idx + 1).copied().unwrap_or(a);
+            out.push(a + (b - a) * frac);
+        }
+        out
+    }
+
+    fn encode_wav_16k(samples: &[f32]) -> Vec<u8> {
+        let data_len = samples.len() * 2;
+        let mut buf = Vec::with_capacity(44 + data_len);
+        buf.extend_from_slice(b"RIFF");
+        buf.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
+        buf.extend_from_slice(b"WAVE");
+        buf.extend_from_slice(b"fmt ");
+        buf.extend_from_slice(&16u32.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&1u16.to_le_bytes());
+        buf.extend_from_slice(&16000u32.to_le_bytes());
+        buf.extend_from_slice(&32000u32.to_le_bytes());
+        buf.extend_from_slice(&2u16.to_le_bytes());
+        buf.extend_from_slice(&16u16.to_le_bytes());
+        buf.extend_from_slice(b"data");
+        buf.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for s in samples {
+            let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        buf
+    }
+
+    fn normalize_to_16k(wav_bytes: &[u8]) -> Result<(Vec<f32>, u64), String> {
+        let (samples, sample_rate) = Self::parse_wav_samples(wav_bytes)?;
+        let duration_ms = if sample_rate == 0 {
+            0
+        } else {
+            (samples.len() as u64 * 1000) / sample_rate as u64
+        };
+        let pcm = Self::resample_linear(&samples, sample_rate, 16000);
+        Ok((pcm, duration_ms))
+    }
+
+    fn extract_whisper_text(json_path: &Path, stdout_text: &str) -> String {
+        if let Ok(raw) = std::fs::read_to_string(json_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(arr) = val.get("transcription").and_then(|v| v.as_array()) {
+                    let mut joined = String::new();
+                    for seg in arr {
+                        if let Some(t) = seg.get("text").and_then(|v| v.as_str()) {
+                            let t = t.trim();
+                            if t.is_empty() {
+                                continue;
+                            }
+                            if !joined.is_empty() {
+                                joined.push(' ');
+                            }
+                            joined.push_str(t);
+                        }
+                    }
+                    if !joined.trim().is_empty() {
+                        return joined.trim().to_string();
+                    }
+                }
+                if let Some(t) = val.get("text").and_then(|v| v.as_str()) {
+                    if !t.trim().is_empty() {
+                        return t.trim().to_string();
+                    }
+                }
+            }
+        }
+        let mut cleaned = String::new();
+        for line in stdout_text.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let body = if line.starts_with('[') {
+                match line.find(']') {
+                    Some(pos) => line[pos + 1..].trim(),
+                    None => line,
+                }
+            } else {
+                line
+            };
+            if body.is_empty() {
+                continue;
+            }
+            if !cleaned.is_empty() {
+                cleaned.push(' ');
+            }
+            cleaned.push_str(body);
+        }
+        cleaned.trim().to_string()
+    }
+
+    pub async fn transcribe_file(
+        &self,
+        path: &Path,
+        api_fallback_key: Option<&str>,
+        preferred_model: Option<&str>,
+    ) -> Result<TranscriptionResult, String> {
+        let wav = convert::decode_to_wav_16k_mono(path)?;
+        self.transcribe_audio(&wav, api_fallback_key, preferred_model)
+            .await
+    }
+
     pub async fn transcribe_audio(
         &self,
         wav_bytes: &[u8],
         api_fallback_key: Option<&str>,
+        preferred_model: Option<&str>,
     ) -> Result<TranscriptionResult, String> {
-        let (samples, sample_rate) = Self::parse_wav_samples(wav_bytes)?;
+        let (pcm16k, duration_ms) = Self::normalize_to_16k(wav_bytes)?;
 
-        let vad = VadProcessor::new(sample_rate, 0.015);
-        let speech_segments = vad.detect_segments(&samples);
-
-        let duration_ms = (samples.len() as u64 * 1000) / sample_rate as u64;
-
-        let models = self.get_available_models();
-        let downloaded_model = models.into_iter().find(|m| m.is_downloaded);
+        let vad = VadProcessor::new(16000, 0.015);
+        let speech_segments = vad.detect_segments(&pcm16k);
+        let normalized_wav = Self::encode_wav_16k(&pcm16k);
 
         let whisper_exe = self.models_dir.join("whisper.exe");
-        if whisper_exe.exists() && downloaded_model.is_some() {
-            let model_info = downloaded_model.unwrap();
-            let model_path = model_info.local_path.unwrap();
+        if let Some(model_path) = self.resolve_model_path(preferred_model) {
+            if whisper_exe.exists() {
+                let base = std::env::temp_dir().join(format!("whisper_in_{}", uuid::Uuid::new_v4()));
+                let temp_wav = base.with_extension("wav");
+                std::fs::write(&temp_wav, &normalized_wav)
+                    .map_err(|e| format!("Failed to write temp audio: {}", e))?;
 
-            let temp_wav = std::env::temp_dir().join(format!("whisper_in_{}.wav", uuid::Uuid::new_v4()));
-            std::fs::write(&temp_wav, wav_bytes)
-                .map_err(|e| format!("Failed to write temp audio: {}", e))?;
+                let mut std_cmd = std::process::Command::new(&whisper_exe);
+                std_cmd.creation_flags(0x08000000);
+                std_cmd.arg("-m").arg(&model_path);
+                std_cmd.arg("-f").arg(&temp_wav);
+                std_cmd.arg("-oj");
+                std_cmd.arg("-of").arg(&base);
 
-            let mut std_cmd = std::process::Command::new(&whisper_exe);
-            std_cmd.creation_flags(0x08000000);
-            std_cmd.arg("-m").arg(&model_path);
-            std_cmd.arg("-f").arg(&temp_wav);
-            std_cmd.arg("--output-json");
+                let accel = *self.acceleration.read().await;
+                if accel == AccelerationMode::Cpu {
+                    std_cmd.arg("-t").arg("4");
+                }
 
-            let accel = *self.acceleration.read().await;
-            if accel == AccelerationMode::Cpu {
-                std_cmd.arg("-t").arg("4");
-            }
+                let output = tokio::process::Command::from(std_cmd)
+                    .output()
+                    .await
+                    .map_err(|e| format!("Whisper CLI execution failed: {}", e))?;
 
-            let output = tokio::process::Command::from(std_cmd)
-                .output()
-                .await
-                .map_err(|e| format!("Whisper CLI execution failed: {}", e))?;
+                let json_path = base.with_extension("json");
+                let stdout_text = String::from_utf8_lossy(&output.stdout).to_string();
+                let text = Self::extract_whisper_text(&json_path, &stdout_text);
+                let _ = std::fs::remove_file(&temp_wav);
+                let _ = std::fs::remove_file(&json_path);
 
-            let _ = std::fs::remove_file(&temp_wav);
-
-            if output.status.success() {
-                let stdout_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let mut segments = Vec::new();
-                for (start, end) in speech_segments {
-                    segments.push(TranscriptionSegment {
-                        start_ms: start,
-                        end_ms: end,
-                        text: stdout_text.clone(),
-                        confidence: 0.95,
+                if !text.trim().is_empty() {
+                    let mut segments = Vec::new();
+                    for (start, end) in speech_segments {
+                        segments.push(TranscriptionSegment {
+                            start_ms: start,
+                            end_ms: end,
+                            text: text.clone(),
+                            confidence: 0.95,
+                        });
+                    }
+                    return Ok(TranscriptionResult {
+                        text,
+                        language: "auto".to_string(),
+                        duration_ms,
+                        segments,
                     });
                 }
-                return Ok(TranscriptionResult {
-                    text: stdout_text,
-                    language: "en".to_string(),
-                    duration_ms,
-                    segments,
-                });
             }
         }
 
         if let Some(key) = api_fallback_key {
-            let client = reqwest::Client::new();
+            let client = crate::build_http_client(None, None, None)
+                .unwrap_or_else(|_| reqwest::Client::new());
             let form = reqwest::multipart::Form::new()
                 .text("model", "whisper-1")
                 .part(
                     "file",
-                    reqwest::multipart::Part::bytes(wav_bytes.to_vec())
+                    reqwest::multipart::Part::bytes(normalized_wav.clone())
                         .file_name("audio.wav")
                         .mime_str("audio/wav")
                         .map_err(|e| format!("Mime error: {}", e))?,
@@ -402,23 +544,23 @@ impl SpeechEngine {
                     .await
                     .map_err(|e| format!("Failed to parse Whisper response: {}", e))?;
                 let text = val["text"].as_str().unwrap_or("").to_string();
-
-                let mut segments = Vec::new();
-                for (start, end) in speech_segments {
-                    segments.push(TranscriptionSegment {
-                        start_ms: start,
-                        end_ms: end,
-                        text: text.clone(),
-                        confidence: 0.98,
+                if !text.trim().is_empty() {
+                    let mut segments = Vec::new();
+                    for (start, end) in speech_segments {
+                        segments.push(TranscriptionSegment {
+                            start_ms: start,
+                            end_ms: end,
+                            text: text.clone(),
+                            confidence: 0.98,
+                        });
+                    }
+                    return Ok(TranscriptionResult {
+                        text,
+                        language: "auto".to_string(),
+                        duration_ms,
+                        segments,
                     });
                 }
-
-                return Ok(TranscriptionResult {
-                    text,
-                    language: "auto".to_string(),
-                    duration_ms,
-                    segments,
-                });
             }
         }
 
@@ -432,11 +574,6 @@ impl SpeechEngine {
             });
         }
 
-        Ok(TranscriptionResult {
-            text: "[Audio Voice Activity Detected: Whisper model not downloaded yet]".to_string(),
-            language: "und".to_string(),
-            duration_ms,
-            segments,
-        })
+        Err("Whisper model is not installed and no transcription API key is configured".to_string())
     }
 }

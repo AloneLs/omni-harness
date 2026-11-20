@@ -373,6 +373,8 @@ pub struct TelegramRuntimeContext {
     pub key_pool: Arc<crate::llm::KeyPool>,
     pub caps_registry: Arc<crate::llm::CapabilityRegistry>,
     pub http_client: reqwest::Client,
+    pub speech_engine: Arc<crate::speech::SpeechEngine>,
+    pub prompt_queue: Arc<crate::engine::prompt_queue::PromptQueue>,
     pub active_contracts: Arc<
         RwLock<
             HashMap<
@@ -845,11 +847,11 @@ impl TelegramBotManager {
                                         continue;
                                     };
 
-                                    handle_authorized_message(
+                                    dispatch_tg_message(
                                         &tg_client,
                                         chat_id,
-                                        msg,
-                                        &text,
+                                        msg.clone(),
+                                        text,
                                         &ctx,
                                         &providers_snap_arc,
                                         &projects_snap_arc,
@@ -1353,6 +1355,67 @@ fn tg_pending_input_map() -> &'static tokio::sync::Mutex<std::collections::HashM
     TG_PENDING_INPUT.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+const TG_MERGE_WINDOW_MS: u64 = 1800;
+
+struct TgMergeSlot {
+    generation: u64,
+    text: String,
+    msg: Value,
+}
+
+static TG_MERGE: std::sync::OnceLock<tokio::sync::Mutex<std::collections::HashMap<i64, TgMergeSlot>>> =
+    std::sync::OnceLock::new();
+
+fn tg_merge_map() -> &'static tokio::sync::Mutex<std::collections::HashMap<i64, TgMergeSlot>> {
+    TG_MERGE.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn tg_queue_keyboard(token: &str) -> Value {
+    json!({
+        "inline_keyboard": [[
+            { "text": "▶️ Отправить сейчас", "callback_data": format!("tg:q:send:{}", token) },
+            { "text": "🗑 Удалить", "callback_data": format!("tg:q:del:{}", token) }
+        ]]
+    })
+}
+
+fn tg_queue_preview_text(items: &[crate::engine::prompt_queue::QueuedPrompt]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("<b>Очередь задач ({})</b>\n", items.len());
+    for (idx, it) in items.iter().take(10).enumerate() {
+        let short: String = it.text.chars().take(90).collect();
+        let tail = if it.text.chars().count() > 90 { "…" } else { "" };
+        out.push_str(&format!(
+            "{}. <code>{}</code> <i>({})</i>\n",
+            idx + 1,
+            escape_html(short.trim()),
+            escape_html(&it.source),
+        ));
+        if !tail.is_empty() {
+            out.push_str(&format!("   {}\n", tail));
+        }
+    }
+    if items.len() > 10 {
+        out.push_str(&format!("… ещё {}\n", items.len() - 10));
+    }
+    out
+}
+
+async fn emit_prompt_queue_updated(
+    ctx: &TelegramRuntimeContext,
+    chat_id: &str,
+    items: &[crate::engine::prompt_queue::QueuedPrompt],
+) {
+    if let Some(app) = ctx.app_handle.read().await.as_ref() {
+        let _ = app.emit(
+            "prompt-queue-updated",
+            json!({ "chatId": chat_id, "items": items }),
+        );
+    }
+}
+
 async fn emit_chat_updated(ctx: &TelegramRuntimeContext, chat_id: &str) {
     if let Some(app) = ctx.app_handle.read().await.as_ref() {
         let _ = app.emit("telegram-chat-updated", json!({ "chatId": chat_id }));
@@ -1742,56 +1805,197 @@ async fn send_or_edit(
     let _ = tg_client.send_html(chat_id, html, reply_markup).await;
 }
 
-async fn extract_and_download_attachments(
+#[derive(Debug, Clone)]
+struct TgAttachment {
+    name: String,
+    path: String,
+    kind: String,
+}
+
+async fn collect_tg_attachments(
     tg_client: &TelegramClient,
-    _tg_chat_id: i64,
     msg: &Value,
-    workspace_root: &str,
-) -> Result<Vec<String>, String> {
+    chat_id: &str,
+) -> Result<Vec<TgAttachment>, String> {
     if msg.get("sticker").is_some() {
         return Err("Стикеры не поддерживаются.".to_string());
     }
-    let mut items: Vec<(String, String)> = Vec::new();
+    let mut items: Vec<(String, String, String)> = Vec::new();
     if let Some(doc) = msg.get("document") {
         if let Some(fid) = doc["file_id"].as_str() {
             let name = doc["file_name"].as_str().unwrap_or("document.bin").to_string();
-            items.push((fid.to_string(), name));
+            let mime = doc["mime_type"].as_str().unwrap_or("");
+            let kind = if mime.starts_with("audio/") {
+                "audio"
+            } else if mime.starts_with("image/") {
+                "image"
+            } else {
+                "file"
+            };
+            items.push((fid.to_string(), name, kind.to_string()));
         }
     }
     if let Some(photos) = msg.get("photo").and_then(|v| v.as_array()) {
         if let Some(best) = photos.iter().max_by_key(|p| p["file_size"].as_u64().unwrap_or(0)) {
             if let Some(fid) = best["file_id"].as_str() {
                 let uid = best["file_unique_id"].as_str().unwrap_or("photo");
-                items.push((fid.to_string(), format!("photo_{}.jpg", uid)));
+                items.push((
+                    fid.to_string(),
+                    format!("photo_{}.jpg", uid),
+                    "image".to_string(),
+                ));
             }
         }
     }
-    for (field, fallback) in [
-        ("audio", "audio.mp3"),
-        ("voice", "voice.ogg"),
-        ("video", "video.mp4"),
-        ("video_note", "video_note.mp4"),
+    for (field, fallback, kind) in [
+        ("audio", "audio.mp3", "audio"),
+        ("voice", "voice.ogg", "voice"),
+        ("video", "video.mp4", "video"),
+        ("video_note", "video_note.mp4", "video"),
     ] {
         if let Some(obj) = msg.get(field) {
             if let Some(fid) = obj["file_id"].as_str() {
                 let name = obj["file_name"].as_str().unwrap_or(fallback).to_string();
-                items.push((fid.to_string(), name));
+                items.push((fid.to_string(), name, kind.to_string()));
             }
         }
     }
     if items.is_empty() {
         return Ok(Vec::new());
     }
-    let dest_dir = crate::state::AppState::resolve_project_data_dir(workspace_root).join("tg_uploads");
-    let mut paths = Vec::new();
-    for (idx, (fid, fname)) in items.into_iter().enumerate() {
+    let dest_dir = crate::state::AppState::resolve_chat_temp_dir(Some(chat_id)).join("tg_uploads");
+    let mut out = Vec::new();
+    for (idx, (fid, fname, kind)) in items.into_iter().enumerate() {
         let target_name = format!("{}_{}", idx + 1, fname);
         let p = tg_client
             .download_file(&fid, &dest_dir, &target_name, MAX_UPLOAD_BYTES)
             .await?;
-        paths.push(p.to_string_lossy().to_string());
+        out.push(TgAttachment {
+            name: fname,
+            path: p.to_string_lossy().to_string(),
+            kind,
+        });
     }
-    Ok(paths)
+    Ok(out)
+}
+
+async fn build_tg_user_msg(
+    ctx: &TelegramRuntimeContext,
+    model_id: &str,
+    prompt: &str,
+    attachments: &[TgAttachment],
+) -> Option<crate::llm::request_compat::ChatMessage> {
+    use base64::Engine;
+    if attachments.is_empty() {
+        return None;
+    }
+    let native_audio = crate::llm::capabilities::model_supports_native_audio(model_id);
+    let native_vision = ctx.caps_registry.get(model_id).supports_vision;
+    let fallback_key = ctx.app_state.get_credential("openai_api_key").await.ok();
+    let mut parts: Vec<crate::llm::request_compat::ContentPart> = vec![
+        crate::llm::request_compat::ContentPart::Text { text: prompt.to_string() },
+    ];
+    let mut notes: Vec<String> = Vec::new();
+    for att in attachments {
+        match att.kind.as_str() {
+            "voice" | "audio" => {
+                let path = std::path::Path::new(&att.path);
+                let label = if att.kind == "voice" { "Голосовое сообщение" } else { "Аудиофайл" };
+                if native_audio {
+                    match crate::speech::convert::decode_to_wav_16k_mono(path) {
+                        Ok(bytes) if !bytes.is_empty() => {
+                            parts.push(crate::llm::request_compat::ContentPart::InputAudio {
+                                input_audio: crate::llm::request_compat::InputAudioDetail {
+                                    data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                                    format: "wav".to_string(),
+                                },
+                            });
+                            notes.push(format!("[{} от пользователя (нативный аудиовход): {}]", label, att.name));
+                        }
+                        _ => notes.push(format!(
+                            "[{} от пользователя: {} — не удалось декодировать аудио]",
+                            label, att.name
+                        )),
+                    }
+                } else {
+                    let wav = crate::speech::convert::decode_to_wav_16k_mono(path);
+                    match wav {
+                        Ok(bytes) => {
+                            match ctx
+                                .speech_engine
+                                .transcribe_audio(&bytes, fallback_key.as_deref(), None)
+                                .await
+                            {
+                                Ok(res) if !res.text.trim().is_empty() => notes.push(format!(
+                                    "[{} от пользователя, транскрипт]: {}",
+                                    label,
+                                    res.text.trim()
+                                )),
+                                Ok(_) => notes.push(format!(
+                                    "[{} от пользователя: {} — пустой транскрипт]",
+                                    label, att.name
+                                )),
+                                Err(e) => notes.push(format!(
+                                    "[{} от пользователя: {} — ошибка транскрипции: {}]",
+                                    label, att.name, e
+                                )),
+                            }
+                        }
+                        Err(e) => notes.push(format!(
+                            "[{} от пользователя: {} — не удалось декодировать: {}]",
+                            label, att.name, e
+                        )),
+                    }
+                }
+            }
+            "image" if native_vision => match std::fs::read(&att.path) {
+                Ok(bytes) if !bytes.is_empty() => {
+                    let low = att.path.to_ascii_lowercase();
+                    let mime = if low.ends_with(".jpg") || low.ends_with(".jpeg") {
+                        "image/jpeg"
+                    } else if low.ends_with(".webp") {
+                        "image/webp"
+                    } else if low.ends_with(".gif") {
+                        "image/gif"
+                    } else {
+                        "image/png"
+                    };
+                    parts.push(crate::llm::request_compat::ContentPart::ImageUrl {
+                        image_url: crate::llm::request_compat::ImageUrlDetail {
+                            url: format!(
+                                "data:{};base64,{}",
+                                mime,
+                                base64::engine::general_purpose::STANDARD.encode(&bytes)
+                            ),
+                            detail: None,
+                        },
+                    });
+                    notes.push(format!("[Изображение от пользователя: {}]", att.name));
+                }
+                _ => notes.push(format!("[Изображение от пользователя: {} ({})]", att.name, att.path)),
+            },
+            _ => notes.push(format!(
+                "[Файл, отправленный пользователем: {} -> {}]",
+                att.name, att.path
+            )),
+        }
+    }
+    if let Some(crate::llm::request_compat::ContentPart::Text { text }) = parts.first_mut() {
+        if !notes.is_empty() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&notes.join("\n"));
+        }
+    }
+    Some(crate::llm::request_compat::ChatMessage {
+        role: "user".to_string(),
+        content: crate::llm::request_compat::MessageContent::Parts(parts),
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    })
 }
 
 async fn is_chat_running(
@@ -1809,6 +2013,125 @@ async fn is_chat_running(
     } else {
         false
     }
+}
+
+async fn take_tg_merge(tg_chat_id: i64) -> Option<(String, Value)> {
+    let mut map = tg_merge_map().lock().await;
+    map.remove(&tg_chat_id).map(|s| (s.text, s.msg))
+}
+
+fn tg_message_has_media(msg: &Value) -> bool {
+    msg.get("document").is_some()
+        || msg.get("photo").is_some()
+        || msg.get("audio").is_some()
+        || msg.get("voice").is_some()
+        || msg.get("video").is_some()
+        || msg.get("video_note").is_some()
+        || msg.get("sticker").is_some()
+}
+
+async fn dispatch_tg_message(
+    tg_client: &TelegramClient,
+    tg_chat_id: i64,
+    msg: Value,
+    text: String,
+    ctx: &TelegramRuntimeContext,
+    providers_snap: &Arc<RwLock<ProvidersSnapshotFile>>,
+    projects_snap: &Arc<RwLock<Vec<SyncedProject>>>,
+    sessions: &Arc<RwLock<HashMap<i64, TelegramChatSession>>>,
+    choices_arc: &Arc<RwLock<HashMap<String, Vec<String>>>>,
+    config_arc: &Arc<RwLock<TelegramConfigFile>>,
+    config_path_arc: &Arc<RwLock<Option<PathBuf>>>,
+) {
+    let is_command = text.trim_start().starts_with('/');
+    let has_media = tg_message_has_media(&msg);
+
+    if is_command || has_media || text.trim().is_empty() {
+        if let Some((pending_text, pending_msg)) = take_tg_merge(tg_chat_id).await {
+            handle_authorized_message(
+                tg_client,
+                tg_chat_id,
+                &pending_msg,
+                &pending_text,
+                ctx,
+                providers_snap,
+                projects_snap,
+                sessions,
+                choices_arc,
+                config_arc,
+                config_path_arc,
+            )
+            .await;
+        }
+        handle_authorized_message(
+            tg_client,
+            tg_chat_id,
+            &msg,
+            &text,
+            ctx,
+            providers_snap,
+            projects_snap,
+            sessions,
+            choices_arc,
+            config_arc,
+            config_path_arc,
+        )
+        .await;
+        return;
+    }
+
+    let generation = {
+        let mut map = tg_merge_map().lock().await;
+        let slot = map.entry(tg_chat_id).or_insert_with(|| TgMergeSlot {
+            generation: 0,
+            text: String::new(),
+            msg: msg.clone(),
+        });
+        slot.generation += 1;
+        if !slot.text.is_empty() {
+            slot.text.push('\n');
+        }
+        slot.text.push_str(&text);
+        slot.msg = msg.clone();
+        slot.generation
+    };
+
+    let tg_client_c = tg_client.clone();
+    let ctx_c = ctx.clone();
+    let providers_c = providers_snap.clone();
+    let projects_c = projects_snap.clone();
+    let sessions_c = sessions.clone();
+    let choices_c = choices_arc.clone();
+    let config_c = config_arc.clone();
+    let config_path_c = config_path_arc.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(TG_MERGE_WINDOW_MS)).await;
+        let flushed = {
+            let mut map = tg_merge_map().lock().await;
+            match map.get(&tg_chat_id) {
+                Some(slot) if slot.generation == generation => {
+                    map.remove(&tg_chat_id).map(|s| (s.text, s.msg))
+                }
+                _ => None,
+            }
+        };
+        if let Some((merged_text, merged_msg)) = flushed {
+            handle_authorized_message(
+                &tg_client_c,
+                tg_chat_id,
+                &merged_msg,
+                &merged_text,
+                &ctx_c,
+                &providers_c,
+                &projects_c,
+                &sessions_c,
+                &choices_c,
+                &config_c,
+                &config_path_c,
+            )
+            .await;
+        }
+    });
 }
 
 async fn handle_authorized_message(
@@ -2214,6 +2537,35 @@ async fn handle_authorized_message(
         }
         _ => {
             let prompt_text = text.to_string();
+            if is_chat_running(ctx, sessions, tg_chat_id).await {
+                let active_cid = sessions
+                    .read()
+                    .await
+                    .get(&tg_chat_id)
+                    .and_then(|s| s.active_chat_id.clone());
+                let Some(cid) = active_cid else {
+                    let _ = tg_client
+                        .send_html(tg_chat_id, "Нет активной сессии.", None)
+                        .await;
+                    return;
+                };
+                let mut item =
+                    crate::engine::prompt_queue::QueuedPrompt::new(&cid, prompt_text.clone(), "telegram");
+                item.tg_chat_id = Some(tg_chat_id);
+                item.tg_message_id = msg["message_id"].as_i64();
+                let items = ctx.prompt_queue.add(item.clone()).await;
+                emit_prompt_queue_updated(ctx, &cid, &items).await;
+                let token = store_choices(choices_arc, tg_chat_id, "queue", vec![item.id.clone(), cid.clone()]).await;
+                let short: String = prompt_text.chars().take(120).collect();
+                let html = format!(
+                    "<b>Задача добавлена в очередь</b>\n\n<code>{}</code>\n\n<i>Всего в очереди: {}</i>",
+                    escape_html(short.trim()),
+                    items.len()
+                );
+                let rm = tg_queue_keyboard(&token);
+                let _ = tg_client.send_html(tg_chat_id, &html, Some(&rm)).await;
+                return;
+            }
             let tg_client_owned = tg_client.clone();
             let ctx_owned = ctx.clone();
             let snap_owned = providers_snap.clone();
@@ -2223,7 +2575,7 @@ async fn handle_authorized_message(
             let config_path_owned = config_path_arc.clone();
 
             tokio::spawn(async move {
-                run_telegram_agent_turn(
+                run_tg_turn_draining(
                     tg_client_owned,
                     tg_chat_id,
                     msg_owned,
@@ -2273,6 +2625,80 @@ async fn handle_callback_query(
                 tg_client.delete_message(tg_chat_id, user_mid).await;
             }
         }
+        return;
+    }
+
+    if let Some(token) = cb_data.strip_prefix("tg:q:del:") {
+        let item_id = resolve_choice(choices_arc, tg_chat_id, "queue", token, 0).await;
+        let chat_id = resolve_choice(choices_arc, tg_chat_id, "queue", token, 1).await;
+        let (Some(item_id), Some(chat_id)) = (item_id, chat_id) else {
+            send_or_edit(tg_client, tg_chat_id, Some(msg_id), "Задача уже неактуальна.", None).await;
+            return;
+        };
+        let items = ctx.prompt_queue.remove(&chat_id, &item_id).await;
+        emit_prompt_queue_updated(ctx, &chat_id, &items).await;
+        let text = format!("🗑 <b>Задача удалена из очереди</b>\n\n<i>Осталось: {}</i>", items.len());
+        send_or_edit(tg_client, tg_chat_id, Some(msg_id), &text, None).await;
+        return;
+    }
+
+    if let Some(token) = cb_data.strip_prefix("tg:q:send:") {
+        let item_id = resolve_choice(choices_arc, tg_chat_id, "queue", token, 0).await;
+        let chat_id = resolve_choice(choices_arc, tg_chat_id, "queue", token, 1).await;
+        let (Some(item_id), Some(chat_id)) = (item_id, chat_id) else {
+            send_or_edit(tg_client, tg_chat_id, Some(msg_id), "Задача уже неактуальна.", None).await;
+            return;
+        };
+        let Some(item) = ctx.prompt_queue.take_specific(&chat_id, &item_id).await else {
+            send_or_edit(tg_client, tg_chat_id, Some(msg_id), "Задача уже отправлена.", None).await;
+            return;
+        };
+        let remaining = ctx.prompt_queue.list(&chat_id).await;
+        emit_prompt_queue_updated(ctx, &chat_id, &remaining).await;
+        if ctx.stream_mgr.get_session(&chat_id).await.is_some() {
+            match ctx.stream_mgr.inject_intervention(&chat_id, item.text.clone()).await {
+                Ok(()) => {
+                    let text = format!(
+                        "▶️ <b>Задача отправлена в текущий ход</b>\n\n<code>{}</code>",
+                        escape_html(item.text.chars().take(200).collect::<String>().trim())
+                    );
+                    send_or_edit(tg_client, tg_chat_id, Some(msg_id), &text, None).await;
+                }
+                Err(e) => {
+                    send_or_edit(
+                        tg_client,
+                        tg_chat_id,
+                        Some(msg_id),
+                        &escape_html(&format!("Не удалось доставить задачу: {}", e)),
+                        None,
+                    )
+                    .await;
+                }
+            }
+            return;
+        }
+        send_or_edit(tg_client, tg_chat_id, Some(msg_id), "▶️ <b>Запускаю задачу...</b>", None).await;
+        let tg_client_owned = tg_client.clone();
+        let ctx_owned = ctx.clone();
+        let snap_owned = providers_snap.clone();
+        let sessions_owned = sessions.clone();
+        let config_owned = config_arc.clone();
+        let config_path_owned = config_path_arc.clone();
+        let item_text = item.text.clone();
+        tokio::spawn(async move {
+            run_tg_turn_draining(
+                tg_client_owned,
+                tg_chat_id,
+                json!({ "message_id": msg_id }),
+                item_text,
+                ctx_owned,
+                snap_owned,
+                sessions_owned,
+                config_owned,
+                config_path_owned,
+            )
+            .await;
+        });
         return;
     }
 
@@ -2769,7 +3195,7 @@ async fn run_telegram_agent_turn(
     sessions: Arc<RwLock<HashMap<i64, TelegramChatSession>>>,
     config_arc: Arc<RwLock<TelegramConfigFile>>,
     config_path_arc: Arc<RwLock<Option<PathBuf>>>,
-) {
+) -> String {
     let (provider, model) =
         match resolve_provider_and_model(&ctx, &providers_snap, &sessions, tg_chat_id).await {
             Ok(res) => res,
@@ -2777,7 +3203,7 @@ async fn run_telegram_agent_turn(
                 let _ = tg_client
                     .send_html(tg_chat_id, &escape_html(&format_user_error(&e)), None)
                     .await;
-                return;
+                return String::new();
             }
         };
 
@@ -2799,7 +3225,7 @@ async fn run_telegram_agent_turn(
             let _ = tg_client
                 .send_html(tg_chat_id, &escape_html(&format_user_error(&e)), None)
                 .await;
-            return;
+            return String::new();
         }
     };
 
@@ -2830,29 +3256,37 @@ async fn run_telegram_agent_turn(
     };
     let workspace_str = workspace_path.to_string_lossy().to_string();
 
-    let attached_paths = match extract_and_download_attachments(&tg_client, tg_chat_id, &msg, &workspace_str).await {
-        Ok(paths) => paths,
+    let tg_attachments = match collect_tg_attachments(&tg_client, &msg, &chat_id).await {
+        Ok(items) => items,
         Err(e) => {
             let _ = tg_client.send_html(tg_chat_id, &escape_html(&e), None).await;
-            return;
+            return String::new();
         }
     };
 
-    let mut full_prompt = if prompt_text.trim().is_empty() && !attached_paths.is_empty() {
+    let mut full_prompt = if prompt_text.trim().is_empty() && !tg_attachments.is_empty() {
         "Проанализируй приложенные файлы и выполни задачу полностью.".to_string()
     } else {
         prompt_text
     };
-    if !attached_paths.is_empty() {
+    if !tg_attachments.is_empty() {
         full_prompt.push_str("\n\n[Attached files]\n");
-        for p in &attached_paths {
-            full_prompt.push_str("- ");
-            full_prompt.push_str(p);
-            full_prompt.push('\n');
+        for att in &tg_attachments {
+            full_prompt.push_str(&format!("- {} ({})\n", att.path, att.name));
+        }
+    }
+    let pending_user_msg = build_tg_user_msg(&ctx, &model.id, &full_prompt, &tg_attachments).await;
+    if let Some(crate::llm::request_compat::ChatMessage {
+        content: crate::llm::request_compat::MessageContent::Parts(ref parts),
+        ..
+    }) = pending_user_msg
+    {
+        if let Some(crate::llm::request_compat::ContentPart::Text { text }) = parts.first() {
+            full_prompt = text.clone();
         }
     }
     if full_prompt.trim().is_empty() {
-        return;
+        return String::new();
     }
 
     if ctx.stream_mgr.get_session(&chat_id).await.is_some() {
@@ -2876,7 +3310,7 @@ async fn run_telegram_agent_turn(
                     .await;
             }
         }
-        return;
+        return String::new();
     }
 
     let chat_lock = get_chat_lock(&chat_id).await;
@@ -3186,6 +3620,10 @@ async fn run_telegram_agent_turn(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "medium".to_string());
 
+    if let Some(pu) = pending_user_msg {
+        history.push(pu);
+    }
+
     let is_plan_req = full_prompt
         .split_whitespace()
         .any(|t| t.eq_ignore_ascii_case("/plan"));
@@ -3447,7 +3885,7 @@ async fn run_telegram_agent_turn(
                 );
             }
             emit_chat_updated(&ctx, &chat_id).await;
-            return;
+            return chat_id.clone();
         }
         let asst_msg = crate::db::chats::Message {
             id: uuid::Uuid::new_v4().to_string(),
@@ -3471,6 +3909,57 @@ async fn run_telegram_agent_turn(
         let _ = tg_client
             .send_html(tg_chat_id, &escape_html(&format_user_error(&err_msg)), None)
             .await;
+    }
+
+    chat_id
+}
+
+async fn run_tg_turn_draining(
+    tg_client: TelegramClient,
+    tg_chat_id: i64,
+    msg: Value,
+    prompt_text: String,
+    ctx: TelegramRuntimeContext,
+    providers_snap: Arc<RwLock<ProvidersSnapshotFile>>,
+    sessions: Arc<RwLock<HashMap<i64, TelegramChatSession>>>,
+    config_arc: Arc<RwLock<TelegramConfigFile>>,
+    config_path_arc: Arc<RwLock<Option<PathBuf>>>,
+) {
+    let mut next_msg = msg;
+    let mut next_text = prompt_text;
+    loop {
+        let chat_id = run_telegram_agent_turn(
+            tg_client.clone(),
+            tg_chat_id,
+            next_msg,
+            next_text,
+            ctx.clone(),
+            providers_snap.clone(),
+            sessions.clone(),
+            config_arc.clone(),
+            config_path_arc.clone(),
+        )
+        .await;
+        if chat_id.is_empty() {
+            return;
+        }
+        let Some(item) = ctx.prompt_queue.take_next(&chat_id).await else {
+            return;
+        };
+        let remaining = ctx.prompt_queue.list(&chat_id).await;
+        emit_prompt_queue_updated(&ctx, &chat_id, &remaining).await;
+        let _ = tg_client
+            .send_html(
+                tg_chat_id,
+                &format!(
+                    "▶️ <b>Запускаю следующую задачу из очереди</b>\n\n<code>{}</code>",
+                    escape_html(item.text.chars().take(200).collect::<String>().trim())
+                ),
+                None,
+            )
+            .await;
+        next_msg = json!({ "message_id": item.tg_message_id.unwrap_or(0) });
+        next_text = item.text;
     }
 }
 

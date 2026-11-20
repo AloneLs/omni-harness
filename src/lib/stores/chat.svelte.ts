@@ -9,7 +9,7 @@ export interface ChatAttachment {
   name: string;
   path: string;
   size?: number;
-  kind: 'image' | 'video' | 'file';
+  kind: 'image' | 'video' | 'audio' | 'file';
   previewUrl?: string;
 }
 
@@ -79,6 +79,7 @@ export interface PendingQueueItem {
   text: string;
   createdAt: number;
   priority?: 'normal' | 'intervention';
+  source?: string;
 }
 
 export interface GoalStatusInfo {
@@ -584,6 +585,11 @@ class ChatStore {
           summary?: string;
         }>('telegram-chat-stream', (ev) => {
           this.handleTelegramStreamEvent(ev.payload);
+        });
+        listen<{ chatId?: string; items?: PendingQueueItem[] }>('prompt-queue-updated', (ev) => {
+          const p = ev.payload;
+          if (!p?.chatId) return;
+          this.applyBackendQueue(p.chatId, p.items || []);
         });
       })
       .catch(() => {});
@@ -2043,25 +2049,50 @@ class ChatStore {
     } catch {}
   }
 
-  public enqueueMessage(text: string, priority: 'normal' | 'intervention' = 'normal'): void {
+  public async enqueueMessage(text: string, priority: 'normal' | 'intervention' = 'normal'): Promise<void> {
     const cid = this.activeChatId;
     if (!cid || !text.trim()) return;
     const item: PendingQueueItem = {
       id: `queue-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
       text: text.trim(),
       createdAt: Date.now(),
-      priority
+      priority,
+      source: 'app'
     };
     const cur = this.pendingQueueByChat[cid] || [];
     this.pendingQueueByChat[cid] = priority === 'intervention' ? [item, ...cur] : [...cur, item];
     this.persistPendingQueues();
+    try {
+      const items = await invoke<PendingQueueItem[]>('queue_add', {
+        chatId: cid,
+        text: item.text,
+        attachments: null,
+        priority
+      });
+      this.applyBackendQueue(cid, items);
+    } catch {}
   }
 
-  public dequeueMessage(id: string): void {
+  private applyBackendQueue(chatId: string, items: PendingQueueItem[]): void {
+    this.pendingQueueByChat[chatId] = (items || []).map((it) => ({
+      id: it.id,
+      text: it.text,
+      createdAt: it.createdAt ?? Date.now(),
+      priority: (it.priority as 'normal' | 'intervention') || 'normal',
+      source: it.source
+    }));
+    this.persistPendingQueues();
+  }
+
+  public async dequeueMessage(id: string): Promise<void> {
     const cid = this.activeChatId;
     if (!cid) return;
     this.pendingQueueByChat[cid] = (this.pendingQueueByChat[cid] || []).filter((item) => item.id !== id);
     this.persistPendingQueues();
+    try {
+      const items = await invoke<PendingQueueItem[]>('queue_remove', { chatId: cid, id });
+      this.applyBackendQueue(cid, items);
+    } catch {}
   }
 
   public updatePendingItem(id: string, text: string): void {
@@ -2079,7 +2110,7 @@ class ChatStore {
     if (!cid) return;
     const item = (this.pendingQueueByChat[cid] || []).find((i) => i.id === id);
     if (!item) return;
-    this.dequeueMessage(id);
+    await this.dequeueMessage(id);
     if (this.streamingChats[cid]) await this.stopStreaming(cid, true);
     await this.sendMessage(item.text, { targetChatId: cid });
   }
@@ -2087,11 +2118,28 @@ class ChatStore {
   public async processNextInQueue(targetChatId?: string): Promise<void> {
     const cid = targetChatId || this.activeChatId;
     if (!cid || this.streamingChats[cid]) return;
-    const q = this.pendingQueueByChat[cid] || [];
-    if (q.length === 0) return;
-    const next = q[0];
-    this.pendingQueueByChat[cid] = q.slice(1);
-    this.persistPendingQueues();
+    let next: PendingQueueItem | null = null;
+    try {
+      const taken = await invoke<PendingQueueItem | null>('queue_take_next', { chatId: cid });
+      if (taken) {
+        next = {
+          id: taken.id,
+          text: taken.text,
+          createdAt: taken.createdAt ?? Date.now(),
+          priority: (taken.priority as 'normal' | 'intervention') || 'normal',
+          source: taken.source
+        };
+        const items = await invoke<PendingQueueItem[]>('queue_list', { chatId: cid });
+        this.applyBackendQueue(cid, items);
+      }
+    } catch {}
+    if (!next) {
+      const q = this.pendingQueueByChat[cid] || [];
+      if (q.length === 0) return;
+      next = q[0];
+      this.pendingQueueByChat[cid] = q.slice(1);
+      this.persistPendingQueues();
+    }
     await this.sendMessage(next.text, { targetChatId: cid });
   }
 
