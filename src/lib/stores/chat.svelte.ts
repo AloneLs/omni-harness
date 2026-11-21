@@ -227,6 +227,9 @@ class ChatStore {
       if (list[i].role === 'assistant') {
         return Boolean(list[i].paused);
       }
+      if (list[i].role === 'user') {
+        return true;
+      }
       return false;
     }
     return false;
@@ -289,6 +292,28 @@ class ChatStore {
   });
 
   constructor() {
+    if (typeof localStorage !== 'undefined') {
+      try {
+        const rawDrafts = localStorage.getItem('omni_chat_drafts');
+        if (rawDrafts) {
+          const parsedDrafts = JSON.parse(rawDrafts);
+          if (parsedDrafts && typeof parsedDrafts === 'object') {
+            if (parsedDrafts.texts && typeof parsedDrafts.texts === 'object') {
+              this.draftTextByChat = parsedDrafts.texts;
+            }
+            if (parsedDrafts.attachments && typeof parsedDrafts.attachments === 'object') {
+              this.draftAttachmentsByChat = parsedDrafts.attachments;
+            }
+          }
+        }
+      } catch {}
+      try {
+        const savedActive = localStorage.getItem('omni_active_chat_id');
+        if (savedActive) {
+          this.activeChatId = savedActive;
+        }
+      } catch {}
+    }
     this.init();
   }
 
@@ -545,10 +570,14 @@ class ChatStore {
 
   private async init(): Promise<void> {
     await this.loadSessions();
-    if (this.sessions.length > 0 && !this.activeChatId) {
-      const firstActive = this.sessions.find((s) => !s.archived && !s.isDraft);
-      if (firstActive) {
-        await this.selectSession(firstActive.id);
+    if (this.sessions.length > 0) {
+      if (this.activeChatId && this.sessions.some((s) => s.id === this.activeChatId && !s.archived)) {
+        await this.selectSession(this.activeChatId);
+      } else {
+        const firstActive = this.sessions.find((s) => !s.archived && !s.isDraft);
+        if (firstActive) {
+          await this.selectSession(firstActive.id);
+        }
       }
     }
     await this.pullBackendChats();
@@ -879,9 +908,17 @@ class ChatStore {
             existing.title = bc.title;
             sessionsChanged = true;
           }
-          if (Boolean(bc.isPinned) !== Boolean(existing.pinned)) {
-            existing.pinned = Boolean(bc.isPinned);
-            sessionsChanged = true;
+          if (bc.isPinned !== undefined) {
+            const bcPinned = Boolean(bc.isPinned);
+            const localPinned = Boolean(existing.pinned);
+            if (bcPinned !== localPinned) {
+              if (bcUpdatedMs >= (existing.updatedAt || 0)) {
+                existing.pinned = bcPinned;
+                sessionsChanged = true;
+              } else {
+                invoke('update_chat_pinned', { id: existing.id, isPinned: localPinned }).catch(() => {});
+              }
+            }
           }
           const nextProj = bc.projectId || undefined;
           if (nextProj !== existing.projectPath && (targetChatId === bc.id || bcUpdatedMs > (existing.updatedAt || 0))) {
@@ -931,7 +968,7 @@ class ChatStore {
             if (isTgDoneInDb) {
               this.streamingChats = { ...this.streamingChats, [bc.id]: false };
             }
-            const allowReplace = targetChatId === bc.id ? changed : changed && dbMsgs.length >= localMsgs.length;
+            const allowReplace = dbMsgs.length >= localMsgs.length && changed;
             if (!this.streamingChats[bc.id] && (allowReplace || isTgDoneInDb)) {
               const dedupedDb: typeof dbMsgs = [];
               for (const m of dbMsgs) {
@@ -1086,13 +1123,20 @@ class ChatStore {
     this.safeSetStorage('omni_pending_queues', JSON.stringify(this.pendingQueueByChat));
   }
 
+  private getDraftKey(chatId: string | null): string {
+    if (!chatId) return '__new__';
+    const sess = this.sessions.find((s) => s.id === chatId);
+    if (!sess || sess.isDraft) return '__new__';
+    return chatId;
+  }
+
   public getDraftText(chatId: string | null): string {
-    const key = chatId || '__new__';
+    const key = this.getDraftKey(chatId);
     return this.draftTextByChat[key] || '';
   }
 
   public setDraftText(chatId: string | null, text: string): void {
-    const key = chatId || '__new__';
+    const key = this.getDraftKey(chatId);
     if ((this.draftTextByChat[key] || '') === text) return;
     if (!text) {
       delete this.draftTextByChat[key];
@@ -1103,12 +1147,12 @@ class ChatStore {
   }
 
   public getDraftAttachments(chatId: string | null): ChatAttachment[] {
-    const key = chatId || '__new__';
+    const key = this.getDraftKey(chatId);
     return this.draftAttachmentsByChat[key] ? [...this.draftAttachmentsByChat[key]] : [];
   }
 
   public setDraftAttachments(chatId: string | null, atts: ChatAttachment[]): void {
-    const key = chatId || '__new__';
+    const key = this.getDraftKey(chatId);
     const clean = atts.map((a) => ({
       id: a.id,
       name: a.name,
@@ -1200,7 +1244,8 @@ class ChatStore {
           title: sess.title || cid,
           messagesJson: JSON.stringify(msgs),
           projectPath: sess.projectPath || null,
-          modelId: sess.modelId || settingsStore.data.activeModel || null
+          modelId: sess.modelId || settingsStore.data.activeModel || null,
+          isPinned: Boolean(sess.pinned)
         }).catch(() => {});
       }
     }
@@ -1441,6 +1486,9 @@ class ChatStore {
     this.showArchived = false;
     this.sessions = [newSession, ...this.sessions];
     this.messagesByChat[id] = [];
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('omni_active_chat_id', id);
+    }
     const provId = newSession.providerId || settingsStore.data.activeProvider;
     const modelId = newSession.modelId || settingsStore.data.activeModel;
     const prov = settingsStore.data.providers[provId] || settingsStore.currentProvider;
@@ -1464,6 +1512,9 @@ class ChatStore {
       }
     }
     this.activeChatId = id;
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem('omni_active_chat_id', id);
+    }
     const session = this.sessions.find((s) => s.id === id);
     if (session?.projectPath) {
       if (workspaceStore.currentPath !== session.projectPath) {
@@ -1559,6 +1610,7 @@ class ChatStore {
     const session = this.sessions.find((s) => s.id === id);
     if (session) {
       session.pinned = !session.pinned;
+      invoke('update_chat_pinned', { id, isPinned: session.pinned }).catch(() => {});
       await this.saveSessions(id);
     }
   }
@@ -1608,6 +1660,7 @@ class ChatStore {
     };
 
     this.messagesByChat[chatId] = [...(this.messagesByChat[chatId] || []), assistantMessage];
+    this.saveLocalOnly(chatId);
     this.activeStreamMsgIdByChat[chatId] = assistantMsgId;
     this.streamingChats = { ...this.streamingChats, [chatId]: true };
     this.streamTokenCountByChat[chatId] = 0;
@@ -1897,9 +1950,23 @@ class ChatStore {
     const chatId = this.activeChatId;
     if (!chatId) return;
     const list = this.messagesByChat[chatId] || [];
+    if (list.length === 0) return;
+
+    if (!messageId) {
+      const lastMsg = list[list.length - 1];
+      if (lastMsg.role === 'user' && !this.streamingChats[chatId]) {
+        await this.runAssistantStream(chatId, lastMsg.content, false);
+        return;
+      }
+    }
+
     let targetIdx = -1;
     if (messageId) {
       targetIdx = list.findIndex((m) => m.id === messageId);
+      if (targetIdx !== -1 && list[targetIdx].role === 'user' && !this.streamingChats[chatId]) {
+        await this.runAssistantStream(chatId, list[targetIdx].content, false);
+        return;
+      }
     } else {
       for (let i = list.length - 1; i >= 0; i--) {
         if (list[i].role === 'assistant') {

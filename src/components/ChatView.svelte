@@ -205,7 +205,7 @@ $effect(() => {
           in:fly={{ y: 10, duration: 200, easing: cubicOut }}
           class="max-w-[720px] mx-auto space-y-2"
         >
-          {#each chatStore.messages as message (message.id)}
+          {#each chatStore.messages as message, idx (message.id)}
             <div
               data-user-turn-id={message.role === 'user' ? message.id : undefined}
               data-assistant-turn-id={message.role === 'assistant' ? message.id : undefined}
@@ -213,6 +213,7 @@ $effect(() => {
             <MessageItem
               {message}
               isLatestAssistant={message.id === lastAssistantMsgId}
+              isLastUserUnanswered={idx === chatStore.messages.length - 1 && message.role === 'user' && !chatStore.isStreaming}
               onEditUser={(id: string, newText: string, rollback: boolean) => chatStore.editUserMessage(id, newText, rollback)}
               onRegenerate={(id: string) => chatStore.regenerateAssistantMessage(id)}
               onContinue={(id: string) => chatStore.continueAssistantMessage(id)}

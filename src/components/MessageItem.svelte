@@ -12,12 +12,14 @@ import { isInternalArtifactTool } from '../lib/toolMapper';
 let {
   message,
   isLatestAssistant = true,
+  isLastUserUnanswered = false,
   onEditUser = () => {},
   onRegenerate = () => {},
   onContinue = () => {}
 }: {
   message: ChatMessage;
   isLatestAssistant?: boolean;
+  isLastUserUnanswered?: boolean;
   onEditUser?: (messageId: string, newText: string, rollbackFiles: boolean) => void;
   onRegenerate?: (messageId: string) => void;
   onContinue?: (messageId: string) => void;
@@ -430,22 +432,40 @@ function handleContainerClick(event: MouseEvent) {
           <div
             data-omni-message-bubble=""
             bind:this={userBoxEl}
-            style={isLongUserMessage ? `max-height: ${isUserExpanded ? userFullHeight : 132}px;` : undefined}
-            class="max-w-[78%] rounded-[12px] bg-[#1E1E22] border border-white/[0.07] px-3.5 py-2 font-sans text-[13.5px] text-[#EDEDEF] leading-relaxed select-text relative transition-[max-height] duration-200 ease-out overflow-hidden {isLongUserMessage && !isUserExpanded ? 'pb-6' : isLongUserMessage ? 'pb-7' : ''}">
+            style={isLongUserMessage ? `max-height: ${isUserExpanded ? (userFullHeight || 'none') : '132px'};` : undefined}
+            class="max-w-[78%] rounded-[12px] bg-[#1E1E22] border border-white/[0.07] px-3.5 pt-2 font-sans text-[13.5px] text-[#EDEDEF] leading-relaxed select-text relative transition-[max-height] duration-200 ease-out overflow-hidden {isLongUserMessage && !isUserExpanded ? 'pb-5' : 'pb-2'}">
             <span class="whitespace-pre-wrap">{message.content}</span>
             {#if isLongUserMessage && !isUserExpanded}
-              <div class="absolute inset-x-0 bottom-0 h-12 bg-gradient-to-t from-[#1E1E22] via-[#1E1E22]/85 to-transparent pointer-events-none"></div>
+              <div class="absolute inset-x-0 bottom-0 h-9 bg-gradient-to-t from-[#1E1E22] via-[#1E1E22]/85 to-transparent pointer-events-none"></div>
             {/if}
             {#if isLongUserMessage}
               <button
                 type="button"
-                class="w-full flex items-center justify-center pt-1 text-[#8E8E95] hover:text-[#EDEDEF] transition-colors {isUserExpanded ? 'mt-1' : 'absolute bottom-1 inset-x-0 z-10'}"
-                onclick={() => { if (userBoxEl) userFullHeight = userBoxEl.scrollHeight + 28; isUserExpanded = !isUserExpanded; }}
+                class="flex items-center justify-center text-[#8E8E95] hover:text-[#EDEDEF] transition-colors {isUserExpanded ? 'w-full pt-1 -mb-0.5' : 'w-full absolute bottom-0.5 inset-x-0 z-10'}"
+                onclick={() => { if (userBoxEl) userFullHeight = userBoxEl.scrollHeight; isUserExpanded = !isUserExpanded; }}
                 title={isUserExpanded ? 'Collapse' : 'Expand'}
               >
-                <Icon name="chevron-down" class="w-4 h-4 transition-transform duration-150 {isUserExpanded ? 'rotate-180' : ''}" strokeWidth={1.8} />
+                <Icon name="chevron-down" class="w-3.5 h-3.5 transition-transform duration-150 {isUserExpanded ? 'rotate-180' : ''}" strokeWidth={1.8} />
               </button>
             {/if}
+          </div>
+        {/if}
+
+        {#if isLastUserUnanswered}
+          <div class="mt-2 flex items-center justify-end gap-2 select-none">
+            <span class="inline-flex items-center gap-1.5 font-sans text-[11.5px] text-[#A3A3AA]">
+              <span class="w-1.5 h-1.5 rounded-full bg-[#F59E0B] animate-pulse"></span>
+              Задача прервана
+            </span>
+            <button
+              type="button"
+              class="h-6 px-2.5 rounded-[5px] bg-[#EDEDEF] hover:bg-white text-[11.5px] font-sans font-medium text-[#111113] active:scale-[0.97] transition-all flex items-center gap-1"
+              onclick={() => onContinue(message.id)}
+              title="Продолжить выполнение задачи"
+            >
+              <Icon name="enter" class="w-3 h-3 text-[#111113]" strokeWidth={2.2} />
+              <span>Продолжить</span>
+            </button>
           </div>
         {/if}
 

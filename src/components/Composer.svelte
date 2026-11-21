@@ -24,8 +24,8 @@ interface ComposerOAuthAccount {
   quotaLabel?: string | null;
 }
 
-let inputText = $state<string>('');
-let lastSyncedDraftChatId = $state<string | null | undefined>(undefined);
+let inputText = $state<string>(chatStore.getDraftText(chatStore.activeChatId));
+let lastSyncedDraftChatId = $state<string | null | undefined>(chatStore.activeChatId);
 let textareaEl = $state<HTMLTextAreaElement | null>(null);
 let mirrorEl = $state<HTMLDivElement | null>(null);
 let slashLeadMatch = $derived(inputText.match(/^(\/[a-zA-Z0-9_-]+)([\s\S]*)$/));
@@ -33,7 +33,7 @@ let composerRootEl = $state<HTMLDivElement | null>(null);
 
 let showPlusMenu = $state<boolean>(false);
 let isDraggingOver = $state<boolean>(false);
-let attachments = $state<ChatAttachment[]>([]);
+let attachments = $state<ChatAttachment[]>(chatStore.getDraftAttachments(chatStore.activeChatId));
 let showModelPopup = $state<boolean>(false);
 let showProjectPopup = $state<boolean>(false);
 let activePalette = $state<'slash' | 'at' | 'dollar' | null>(null);
@@ -184,6 +184,7 @@ $effect(() => {
     lastSyncedDraftChatId = cid;
     inputText = chatStore.getDraftText(cid);
     attachments = chatStore.getDraftAttachments(cid);
+    setTimeout(adjustHeight, 0);
   }
 });
 

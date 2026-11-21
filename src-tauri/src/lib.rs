@@ -964,6 +964,7 @@ async fn sync_chat_context(
     messages_json: String,
     project_path: Option<String>,
     model_id: Option<String>,
+    is_pinned: Option<bool>,
 ) -> Result<(), String> {
     let db = &state.app_state.db;
     db.sync_chat_context(&chat_id, &title, &messages_json)
@@ -989,7 +990,7 @@ async fn sync_chat_context(
             title: resolved_title,
             model_id: model_id.clone().unwrap_or_default(),
             system_prompt: String::new(),
-            is_pinned: false,
+            is_pinned: is_pinned.unwrap_or(false),
             created_at: now.clone(),
             updated_at: now.clone(),
         };
@@ -1002,6 +1003,9 @@ async fn sync_chat_context(
         let _ = db.update_chat_project(&chat_id, next_proj);
         if let Some(mid) = model_id.as_deref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
             let _ = db.update_chat_model(&chat_id, mid);
+        }
+        if let Some(pinned) = is_pinned {
+            let _ = db.update_chat_pinned(&chat_id, pinned);
         }
     }
 
