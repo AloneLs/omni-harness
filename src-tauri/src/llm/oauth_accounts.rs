@@ -206,12 +206,36 @@ fn read_accounts_unlocked() -> Vec<OAuthAccount> {
     let Ok(raw) = std::fs::read_to_string(&p) else {
         return Vec::new();
     };
-    serde_json::from_str::<Vec<OAuthAccount>>(&raw).unwrap_or_default()
+    let mut list = serde_json::from_str::<Vec<OAuthAccount>>(&raw).unwrap_or_default();
+    for acc in list.iter_mut() {
+        if acc.refresh_token.starts_with("keyring:") {
+            let key = acc.refresh_token.trim_start_matches("keyring:");
+            if let Ok(entry) = keyring::Entry::new("omni-harness-oauth", key) {
+                if let Ok(sec) = entry.get_password() {
+                    if !sec.is_empty() {
+                        acc.refresh_token = sec;
+                    }
+                }
+            }
+        }
+    }
+    list
 }
 
 fn write_accounts_unlocked(accounts: &[OAuthAccount]) -> Result<(), String> {
     let p = accounts_file_path();
-    let json = serde_json::to_string_pretty(accounts).map_err(|e| e.to_string())?;
+    let mut safe_accounts = accounts.to_vec();
+    for acc in safe_accounts.iter_mut() {
+        if !acc.refresh_token.is_empty() && !acc.refresh_token.starts_with("keyring:") {
+            let key = if !acc.id.is_empty() { acc.id.as_str() } else { "default" };
+            if let Ok(entry) = keyring::Entry::new("omni-harness-oauth", key) {
+                if entry.set_password(&acc.refresh_token).is_ok() {
+                    acc.refresh_token = format!("keyring:{}", key);
+                }
+            }
+        }
+    }
+    let json = serde_json::to_string_pretty(&safe_accounts).map_err(|e| e.to_string())?;
     crate::tools::workspace::atomic_write_bytes(&p, json.as_bytes())
 }
 
@@ -430,7 +454,7 @@ fn extract_chatgpt_claims(id_token: Option<&str>, access_token: &str) -> (Option
     (e, a)
 }
 
-async fn upsert_account(acc: OAuthAccount) -> Result<OAuthAccount, String> {
+pub async fn upsert_account(acc: OAuthAccount) -> Result<OAuthAccount, String> {
     let _guard = store_lock().lock().await;
     let mut list = read_accounts_unlocked();
     if let Some(existing) = list.iter_mut().find(|x| {
@@ -1001,7 +1025,6 @@ async fn exchange_code_for_account(
                 .get("https://www.googleapis.com/oauth2/v3/userinfo")
                 .bearer_auth(&at)
                 .header("User-Agent", antigravity_hub_ua())
-                .header("X-Goog-Api-Client", antigravity_api_client())
                 .send()
                 .await
             {
@@ -1227,11 +1250,7 @@ async fn exchange_code_for_account(
 }
 
 pub fn antigravity_version() -> &'static str {
-    "2.42.0"
-}
-
-pub fn antigravity_changelist() -> &'static str {
-    "1049210482"
+    "2.32.2"
 }
 
 pub fn antigravity_platform_name() -> &'static str {
@@ -1255,11 +1274,10 @@ pub fn antigravity_hub_ua() -> &'static str {
             _ => "amd64",
         };
         format!(
-            "antigravity/hub/{} (aidev_client; os_type={}; arch={}; cl={})",
+            "antigravity/hub/{} (aidev_client; os_type={}; arch={})",
             antigravity_version(),
             os_type,
-            arch,
-            antigravity_changelist()
+            arch
         )
     })
     .as_str()
@@ -1268,6 +1286,15 @@ pub fn antigravity_hub_ua() -> &'static str {
 pub fn persistent_device_id() -> &'static str {
     static DID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     DID.get_or_init(|| {
+        if let Some(home) = dirs::home_dir() {
+            let gemini_inst = home.join(".gemini").join("installation_id");
+            if let Ok(raw) = std::fs::read_to_string(&gemini_inst) {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    return trimmed.to_string();
+                }
+            }
+        }
         let p = crate::state::AppState::resolve_data_dir().join("oauth_device.json");
         if let Ok(raw) = std::fs::read_to_string(&p) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
@@ -1339,25 +1366,10 @@ pub fn machine_session_id() -> &'static str {
     SID.get_or_init(|| account_machine_session_id_by_key("default"))
 }
 
-pub fn antigravity_api_client() -> &'static str {
-    "gl-node/20.18.1 gdcl/20240101"
-}
-
 pub fn antigravity_trace_id() -> String {
     let bytes = uuid::Uuid::new_v4().as_bytes()[0..8].try_into().unwrap_or([0u8; 8]);
     let val = u64::from_le_bytes(bytes);
     format!("0x{:016x}", val)
-}
-
-pub fn antigravity_client_metadata() -> &'static str {
-    static META: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    META.get_or_init(|| {
-        format!(
-            r#"{{"ideType":"ANTIGRAVITY","platform":"{}","pluginType":"GEMINI"}}"#,
-            antigravity_platform_name()
-        )
-    })
-    .as_str()
 }
 
 pub async fn fetch_antigravity_experiments(client: &reqwest::Client, acc: &OAuthAccount) {
@@ -1365,12 +1377,10 @@ pub async fn fetch_antigravity_experiments(client: &reqwest::Client, acc: &OAuth
         return;
     }
     let pid = acc.project_id.as_deref().unwrap_or("");
-    let session_id = account_machine_session_id(acc);
     let trace_id = antigravity_trace_id();
     let body = serde_json::json!({
         "project": pid,
         "ideType": "ANTIGRAVITY",
-        "platform": antigravity_platform_name(),
         "clientVersion": antigravity_version(),
     });
     for ep in [
@@ -1381,9 +1391,6 @@ pub async fn fetch_antigravity_experiments(client: &reqwest::Client, acc: &OAuth
             .post(ep)
             .bearer_auth(&acc.access_token)
             .header("User-Agent", antigravity_hub_ua())
-            .header("X-Goog-Api-Client", antigravity_api_client())
-            .header("Client-Metadata", antigravity_client_metadata())
-            .header("X-Machine-Session-Id", &session_id)
             .header("X-Goog-Request-Reason", "periodic_sync")
             .header("x-cloudaicompanion-trace-id", &trace_id);
         if !pid.is_empty() {
@@ -1401,12 +1408,11 @@ pub async fn fetch_antigravity_account_meta(
     client: &reqwest::Client,
     access_token: &str,
 ) -> (String, Option<String>) {
-    let session_id = account_machine_session_id_by_key(access_token);
     let meta = serde_json::json!({
         "metadata": {
             "ideType": "ANTIGRAVITY",
-            "platform": antigravity_platform_name(),
-            "pluginType": "GEMINI"
+            "pluginType": "GEMINI",
+            "hasShellIntegration": true
         },
         "mode": "FULL_ELIGIBILITY_CHECK"
     });
@@ -1433,9 +1439,6 @@ pub async fn fetch_antigravity_account_meta(
             .post(ep)
             .bearer_auth(access_token)
             .header("User-Agent", antigravity_hub_ua())
-            .header("X-Goog-Api-Client", antigravity_api_client())
-            .header("Client-Metadata", antigravity_client_metadata())
-            .header("X-Machine-Session-Id", &session_id)
             .header("X-Goog-Request-Reason", "user_initiated")
             .header("x-cloudaicompanion-trace-id", antigravity_trace_id())
             .json(&meta)
@@ -1483,14 +1486,10 @@ pub async fn fetch_antigravity_models(client: &reqwest::Client) -> Result<Vec<se
         Some(p) if !p.is_empty() => p,
         _ => fetch_antigravity_project_id(client, &acc.access_token).await,
     };
-    let session_id = account_machine_session_id(&acc);
     let mut req = client
         .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
         .bearer_auth(&acc.access_token)
         .header("User-Agent", antigravity_hub_ua())
-        .header("X-Goog-Api-Client", antigravity_api_client())
-        .header("Client-Metadata", antigravity_client_metadata())
-        .header("X-Machine-Session-Id", &session_id)
         .header("X-Goog-Request-Reason", "user_initiated")
         .header("x-cloudaicompanion-trace-id", antigravity_trace_id());
     if !pid.is_empty() {
@@ -2645,20 +2644,13 @@ async fn fetch_account_quota_inner(client: &reqwest::Client, acc: &mut OAuthAcco
                 }
                 acc.project_id.clone().unwrap_or_default()
             } else {
-                if let (_, Some(fetched_tier)) = fetch_antigravity_account_meta(client, &acc.access_token).await {
-                    acc.quota_label = Some(fetched_tier);
-                }
                 acc.project_id.clone().unwrap_or_default()
             };
-            let session_id = account_machine_session_id(acc);
             let trace_id = antigravity_trace_id();
             let mut req = client
                 .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
                 .bearer_auth(&acc.access_token)
                 .header("User-Agent", antigravity_hub_ua())
-                .header("X-Goog-Api-Client", antigravity_api_client())
-                .header("Client-Metadata", antigravity_client_metadata())
-                .header("X-Machine-Session-Id", &session_id)
                 .header("X-Goog-Request-Reason", "user_initiated")
                 .header("x-cloudaicompanion-trace-id", &trace_id);
             if !pid.is_empty() {

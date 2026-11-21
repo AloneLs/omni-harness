@@ -115,6 +115,15 @@ fn clean_schema_for_antigravity(val: &serde_json::Value) -> serde_json::Value {
     }
 }
 
+fn is_location_not_eligible(status: u16, text: &str) -> bool {
+    (status == 403 || status == 400)
+        && (text.contains("LOCATION_NOT_ELIGIBLE")
+            || text.contains("location is not eligible")
+            || text.contains("User location is not supported")
+            || text.contains("Detected location: BY")
+            || text.contains("Detected location: RU"))
+}
+
 pub async fn stream_antigravity(
     client: &reqwest::Client,
     caps_registry: &CapabilityRegistry,
@@ -331,7 +340,7 @@ pub async fn stream_antigravity(
     if !system_parts.is_empty() {
         inner_req["systemInstruction"] = serde_json::json!({ "role": "user", "parts": system_parts });
     }
-    inner_req["session_id"] = serde_json::json!(oauth_accounts::machine_session_id());
+    inner_req["session_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
     if let Some(ref tools) = request.tools {
         if !tools.is_empty() {
             let decls: Vec<serde_json::Value> = tools
@@ -367,12 +376,22 @@ pub async fn stream_antigravity(
 
         let project_id = match acc.project_id.clone() {
             Some(p) if !p.trim().is_empty() => p,
-            _ => oauth_accounts::fetch_antigravity_project_id(client, &acc.access_token).await,
+            _ => {
+                let pid = oauth_accounts::fetch_antigravity_project_id(client, &acc.access_token).await;
+                if !pid.is_empty() {
+                    acc.project_id = Some(pid.clone());
+                    let acc_to_save = acc.clone();
+                    tokio::spawn(async move {
+                        let _ = oauth_accounts::upsert_account(acc_to_save).await;
+                    });
+                }
+                pid
+            }
         };
 
-        let session_id = oauth_accounts::account_machine_session_id(&acc);
+        let turn_session = uuid::Uuid::new_v4().to_string();
         let mut inner_req_copy = inner_req.clone();
-        inner_req_copy["session_id"] = serde_json::json!(&session_id);
+        inner_req_copy["session_id"] = serde_json::json!(&turn_session);
 
         let envelope = serde_json::json!({
             "project": project_id,
@@ -380,7 +399,7 @@ pub async fn stream_antigravity(
             "request": inner_req_copy,
             "requestType": "agent",
             "userAgent": "antigravity",
-            "requestId": format!("agent-{}-{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8]),
+            "requestId": uuid::Uuid::new_v4().to_string(),
         });
 
         crate::logger::info("Antigravity", &format!("POST {} model={} account={} project={}", target_url, model_clean, acc.email, project_id));
@@ -391,9 +410,6 @@ pub async fn stream_antigravity(
             .header("Content-Type", "application/json")
             .header("Accept", "text/event-stream")
             .header("User-Agent", oauth_accounts::antigravity_hub_ua())
-            .header("X-Goog-Api-Client", oauth_accounts::antigravity_api_client())
-            .header("Client-Metadata", oauth_accounts::antigravity_client_metadata())
-            .header("X-Machine-Session-Id", &session_id)
             .header("X-Goog-Request-Reason", "user_initiated")
             .header("x-cloudaicompanion-trace-id", &trace_id);
         if !project_id.is_empty() {
@@ -426,17 +442,17 @@ pub async fn stream_antigravity(
             if let Ok(refreshed) = oauth_accounts::force_refresh_account(client, &acc.id).await {
                 acc = refreshed;
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                let retry_session = oauth_accounts::account_machine_session_id(&acc);
                 let retry_trace = oauth_accounts::antigravity_trace_id();
+                let retry_turn_session = uuid::Uuid::new_v4().to_string();
                 let mut retry_inner = inner_req.clone();
-                retry_inner["session_id"] = serde_json::json!(&retry_session);
+                retry_inner["session_id"] = serde_json::json!(&retry_turn_session);
                 let retry_envelope = serde_json::json!({
                     "project": project_id,
                     "model": model_clean,
                     "request": retry_inner,
                     "requestType": "agent",
                     "userAgent": "antigravity",
-                    "requestId": format!("agent-{}-{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8]),
+                    "requestId": uuid::Uuid::new_v4().to_string(),
                 });
                 let mut retry_builder = client
                     .post(target_url)
@@ -444,9 +460,6 @@ pub async fn stream_antigravity(
                     .header("Content-Type", "application/json")
                     .header("Accept", "text/event-stream")
                     .header("User-Agent", oauth_accounts::antigravity_hub_ua())
-                    .header("X-Goog-Api-Client", oauth_accounts::antigravity_api_client())
-                    .header("Client-Metadata", oauth_accounts::antigravity_client_metadata())
-                    .header("X-Machine-Session-Id", &retry_session)
                     .header("X-Goog-Request-Reason", "user_initiated")
                     .header("x-cloudaicompanion-trace-id", &retry_trace);
                 if !project_id.is_empty() {
@@ -482,8 +495,18 @@ pub async fn stream_antigravity(
             match parse_antigravity_sse(response, sender.clone()).await {
                 Ok(()) => return Ok(()),
                 Err(LlmError::ProviderError { status: scode, message: smsg }) => {
-                    let cd = if scode == 429 { 120 } else { 30 };
-                    if scode == 429 {
+                    if is_location_not_eligible(scode, &smsg) {
+                        return Err(LlmError::ProviderError {
+                            status: 403,
+                            message: "Antigravity geographic restriction: Detected location is not supported (LOCATION_NOT_ELIGIBLE). Ensure your VPN or Proxy (v2RayTun/Incy) is active and routing Google traffic through a supported region.".to_string(),
+                        });
+                    }
+                    let is_rate_limit = scode == 429
+                        || smsg.contains("RESOURCE_EXHAUSTED")
+                        || smsg.to_ascii_lowercase().contains("quota")
+                        || smsg.to_ascii_lowercase().contains("rate limit");
+                    let cd = if is_rate_limit { 120 } else { 30 };
+                    if is_rate_limit {
                         oauth_accounts::mark_account_quota_exhausted(&acc.id, Some(0.0), None).await;
                     }
                     oauth_accounts::mark_account_cooldown(&acc.id, cd, &smsg).await;
@@ -492,14 +515,24 @@ pub async fn stream_antigravity(
                         status: scode,
                         message: format!("{} ({})", smsg, acc.email),
                     });
-                    if attempt < max_attempts && (scode == 429 || scode >= 500 || scode == 403) {
+                    if attempt < max_attempts && (is_rate_limit || scode >= 500 || scode == 403) {
                         let acc_cnt = oauth_accounts::list_accounts(Some("antigravity")).await.into_iter().filter(|a| a.enabled).count();
-                        let reason = if acc_cnt > 1 {
-                            format!("Antigravity stream {} ({}): switching account", scode, acc.email)
-                        } else if scode == 429 {
-                            format!("Antigravity rate limited (429, {}), retrying...", acc.email)
+                        let (delay_ms, reason) = if is_rate_limit {
+                            use rand::Rng;
+                            let delay_secs = rand::thread_rng().gen_range(12..=34);
+                            let r = if acc_cnt > 1 {
+                                format!("Antigravity quota limit ({}, {}): switching account in {}s...", scode, acc.email, delay_secs)
+                            } else {
+                                format!("Antigravity rate limited ({}, {}): retrying in {}s...", scode, acc.email, delay_secs)
+                            };
+                            (delay_secs * 1000, r)
                         } else {
-                            format!("Antigravity stream {} ({}), retrying...", scode, acc.email)
+                            let r = if acc_cnt > 1 {
+                                format!("Antigravity stream {} ({}): switching account", scode, acc.email)
+                            } else {
+                                format!("Antigravity stream {} ({}), retrying...", scode, acc.email)
+                            };
+                            (450, r)
                         };
                         let _ = sender
                             .send(StreamEvent::RetryNotice {
@@ -508,7 +541,7 @@ pub async fn stream_antigravity(
                                 model: request.model.clone(),
                             })
                             .await;
-                        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         continue;
                     }
                     return Err(LlmError::ProviderError {
@@ -537,8 +570,20 @@ pub async fn stream_antigravity(
         let code = status.as_u16();
         let err_body = response.text().await.unwrap_or_default();
         crate::logger::record_http("Antigravity", "POST", target_url, code, &err_body);
-        let cooldown = if code == 429 { 120 } else { 30 };
-        if code == 429 {
+
+        if is_location_not_eligible(code, &err_body) {
+            return Err(LlmError::ProviderError {
+                status: 403,
+                message: "Antigravity geographic restriction: Detected location is not supported (LOCATION_NOT_ELIGIBLE). Ensure your VPN or Proxy (v2RayTun/Incy) is active and routing Google traffic through a supported region.".to_string(),
+            });
+        }
+
+        let is_rate_limit = code == 429
+            || err_body.contains("RESOURCE_EXHAUSTED")
+            || err_body.to_ascii_lowercase().contains("quota")
+            || err_body.to_ascii_lowercase().contains("rate limit");
+        let cooldown = if is_rate_limit { 120 } else { 30 };
+        if is_rate_limit {
             oauth_accounts::mark_account_quota_exhausted(&acc.id, Some(0.0), None).await;
         }
         oauth_accounts::mark_account_cooldown(&acc.id, cooldown, &err_body).await;
@@ -548,14 +593,24 @@ pub async fn stream_antigravity(
             message: format!("{} ({})", err_body, acc.email),
         });
 
-        if attempt < max_attempts && (code == 429 || code >= 500 || code == 403) {
+        if attempt < max_attempts && (is_rate_limit || code >= 500 || code == 403) {
             let acc_cnt = oauth_accounts::list_accounts(Some("antigravity")).await.into_iter().filter(|a| a.enabled).count();
-            let reason = if acc_cnt > 1 {
-                format!("Antigravity {} ({}): switching account", code, acc.email)
-            } else if code == 429 {
-                format!("Antigravity rate limited (429, {}), retrying...", acc.email)
+            let (delay_ms, reason) = if is_rate_limit {
+                use rand::Rng;
+                let delay_secs = rand::thread_rng().gen_range(12..=34);
+                let r = if acc_cnt > 1 {
+                    format!("Antigravity {} ({}): switching account in {}s...", code, acc.email, delay_secs)
+                } else {
+                    format!("Antigravity rate limited (429, {}): retrying in {}s...", acc.email, delay_secs)
+                };
+                (delay_secs * 1000, r)
             } else {
-                format!("Antigravity {} ({}), retrying...", code, acc.email)
+                let r = if acc_cnt > 1 {
+                    format!("Antigravity {} ({}): switching account", code, acc.email)
+                } else {
+                    format!("Antigravity {} ({}), retrying...", code, acc.email)
+                };
+                (450, r)
             };
             let _ = sender
                 .send(StreamEvent::RetryNotice {
@@ -564,7 +619,7 @@ pub async fn stream_antigravity(
                     model: request.model.clone(),
                 })
                 .await;
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             continue;
         }
 
@@ -790,7 +845,7 @@ pub async fn generate_antigravity_image(
         },
         "requestType": "agent",
         "userAgent": "antigravity",
-        "requestId": format!("img-{}-{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8]),
+        "requestId": uuid::Uuid::new_v4().to_string(),
     });
 
     let url = "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent";
@@ -801,9 +856,6 @@ pub async fn generate_antigravity_image(
         .bearer_auth(&acc.access_token)
         .header("Content-Type", "application/json")
         .header("User-Agent", oauth_accounts::antigravity_hub_ua())
-        .header("X-Goog-Api-Client", oauth_accounts::antigravity_api_client())
-        .header("Client-Metadata", oauth_accounts::antigravity_client_metadata())
-        .header("X-Machine-Session-Id", &session_id)
         .header("X-Goog-Request-Reason", "user_initiated")
         .header("x-cloudaicompanion-trace-id", &trace_id);
     if !project_id.is_empty() {
