@@ -303,3 +303,19 @@ pub fn audit_event(chat_id: &str, event: &str, detail: &str) {
         &format!("chat=sha256:{} event={} {}", cid_hash, event, detail),
     );
 }
+
+pub fn is_internal_artifact_tool(tool_name: &str, args_json: &str) -> bool {
+    if tool_name == "artifact_read" {
+        return true;
+    }
+    if tool_name == "read_file" {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args_json) {
+            if let Some(p) = v.get("path").and_then(|s| s.as_str()) {
+                if p.starts_with("artifact://") || p.contains("sha256_") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}

@@ -62,6 +62,9 @@ impl LiveToolStream {
     }
 
     pub fn on_tool_start(&mut self, id: &str, name: &str, args_json: &str) {
+        if crate::engine::policy_guard::is_internal_artifact_tool(name, args_json) {
+            return;
+        }
         self.total_steps += 1;
         let preview = summarize_tool_args(args_json);
         let existing = self.items.iter_mut().rev().find_map(|item| {

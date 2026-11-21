@@ -969,12 +969,24 @@ async fn sync_chat_context(
     db.sync_chat_context(&chat_id, &title, &messages_json)
         .map_err(|e| e.to_string())?;
 
+    let has_messages = serde_json::from_str::<Vec<serde_json::Value>>(&messages_json)
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let resolved_title = if title.trim().is_empty() || title == "New task" {
+        if !has_messages {
+            return Ok(());
+        }
+        "Chat".to_string()
+    } else {
+        title.clone()
+    };
+
     let now = chrono::Utc::now().to_rfc3339();
     if db.get_chat(&chat_id).is_err() {
         let chat = db::chats::Chat {
             id: chat_id.clone(),
             project_id: project_path.clone().filter(|s| !s.trim().is_empty()),
-            title: title.clone(),
+            title: resolved_title,
             model_id: model_id.clone().unwrap_or_default(),
             system_prompt: String::new(),
             is_pinned: false,
@@ -983,7 +995,7 @@ async fn sync_chat_context(
         };
         let _ = db.create_chat(&chat);
     } else {
-        if !title.trim().is_empty() {
+        if !title.trim().is_empty() && title != "New task" {
             let _ = db.update_chat_title(&chat_id, &title);
         }
         let next_proj = project_path.as_deref().map(|x| x.trim()).filter(|x| !x.is_empty());

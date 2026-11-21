@@ -7,6 +7,7 @@ import { renderMarkdown, extractVizBlocks } from '../lib/markdown';
 import TimelineBlock from './TimelineBlock.svelte';
 import InteractiveVizCard from './InteractiveVizCard.svelte';
 import { attachPressScale } from '../lib/motion';
+import { isInternalArtifactTool } from '../lib/toolMapper';
 
 let {
   message,
@@ -33,8 +34,8 @@ let diffSummaryExpanded = $state<boolean>(false);
 let confirmRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 let hasHeavyHistory = $derived(
-  (message.toolCalls && message.toolCalls.length > 0) ||
-  (message.steps && message.steps.filter((s) => s.kind === 'tool' || s.kind === 'thought').length > 1) ||
+  (message.toolCalls && message.toolCalls.filter((tc) => !isInternalArtifactTool(tc.toolName, tc.rawArgs || tc.args)).length > 0) ||
+  (message.steps && message.steps.filter((s) => (s.kind === 'tool' && !isInternalArtifactTool(s.record.toolName, s.record.rawArgs || s.record.args)) || s.kind === 'thought').length > 1) ||
   Boolean(message.reasoningContent && message.reasoningContent.length > 200)
 );
 
@@ -66,7 +67,8 @@ let splitPipeline = $derived.by(() => {
   if (message.role !== 'assistant') {
     return { timelineSteps: [], finalContent: '' };
   }
-  const allSteps = message.steps || [];
+  const rawSteps = message.steps || [];
+  const allSteps = rawSteps.filter((s) => s.kind !== 'tool' || !isInternalArtifactTool(s.record?.toolName || '', s.record?.rawArgs || s.record?.args));
   if (allSteps.length === 0) {
     return { timelineSteps: [], finalContent: message.content };
   }

@@ -1,6 +1,6 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import type { ToolExecutionRecord } from '../toolMapper';
-import { formatToolExecution } from '../toolMapper';
+import { formatToolExecution, isInternalArtifactTool } from '../toolMapper';
 import { settingsStore, resolveModelForReasoning, isImageGenerationModel, type ReasoningLevel } from './settings.svelte';
 import { workspaceStore } from './workspace.svelte';
 
@@ -206,9 +206,14 @@ class ChatStore {
     if (this.activeChatId && this.contextTelemetryByChat[this.activeChatId]) {
       return this.contextTelemetryByChat[this.activeChatId];
     }
+    const sess = this.activeSession;
+    const provId = sess?.providerId || settingsStore.data.activeProvider;
+    const modelId = sess?.modelId || settingsStore.data.activeModel;
+    const prov = settingsStore.data.providers[provId] || settingsStore.currentProvider;
+    const caps = prov?.modelCapabilities?.[modelId] || settingsStore.currentModelCapabilities;
     return {
       usedTokens: 0,
-      contextWindow: settingsStore.currentModelCapabilities.contextWindow || 128000,
+      contextWindow: caps.contextWindow || 128000,
       cachedTokens: 0,
       cacheHitRate: 0
     };
@@ -234,14 +239,15 @@ class ChatStore {
   pinnedSessions = $derived.by(() => {
     const q = this.filterSearchQuery.toLowerCase().trim();
     return this.sessions.filter(
-      (s) => !s.isThemeStudio && !s.archived && s.pinned && !s.projectPath && (!q || s.title.toLowerCase().includes(q) || s.preview.toLowerCase().includes(q))
+      (s) => !s.isThemeStudio && !s.isDraft && !s.archived && s.pinned && !s.projectPath && Boolean(s.title) && (!q || s.title.toLowerCase().includes(q) || s.preview.toLowerCase().includes(q))
     );
   });
 
   recentSessions = $derived.by(() => {
     const q = this.filterSearchQuery.toLowerCase().trim();
     return this.sessions.filter((s) => {
-      if (s.isThemeStudio) return false;
+      if (s.isThemeStudio || s.isDraft || !s.title) return false;
+      if (s.title === 'New task' && (!this.messagesByChat[s.id] || this.messagesByChat[s.id].length === 0)) return false;
       const matchArchive = this.showArchived ? Boolean(s.archived) : !s.archived && !(s.pinned && !s.projectPath);
       return matchArchive && (!q || s.title.toLowerCase().includes(q) || s.preview.toLowerCase().includes(q));
     });
@@ -293,6 +299,12 @@ class ChatStore {
     if (sess) {
       sess.providerId = providerId;
       sess.modelId = modelId;
+      this.sessions = [...this.sessions];
+      const prov = settingsStore.data.providers[providerId] || settingsStore.currentProvider;
+      const caps = prov?.modelCapabilities?.[modelId] || settingsStore.currentModelCapabilities;
+      if (this.contextTelemetryByChat[cid]) {
+        this.contextTelemetryByChat[cid].contextWindow = caps.contextWindow || 128000;
+      }
       this.saveSessions(cid);
     }
   }
@@ -1396,12 +1408,22 @@ class ChatStore {
     }
   }
 
-  public async createSession(title = 'New task', projectPath?: string): Promise<string> {
-    const id = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+  public async createSession(title = '', projectPath?: string): Promise<string> {
     const resolvedProject = projectPath !== undefined ? projectPath : (workspaceStore.currentPath || undefined);
+    const existingDraft = this.sessions.find(
+      (s) => s.isDraft && (!this.messagesByChat[s.id] || this.messagesByChat[s.id].length === 0)
+    );
+    if (existingDraft) {
+      if (resolvedProject !== undefined) existingDraft.projectPath = resolvedProject;
+      if (title && title !== 'New task') existingDraft.title = title;
+      this.activeChatId = existingDraft.id;
+      return existingDraft.id;
+    }
+
+    const id = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const newSession: ChatSession = {
       id,
-      title,
+      title: (title && title !== 'New task') ? title : '',
       createdAt: Date.now(),
       updatedAt: Date.now(),
       pinned: false,
@@ -1418,11 +1440,14 @@ class ChatStore {
 
     this.showArchived = false;
     this.sessions = [newSession, ...this.sessions];
-    this.saveSessions();
     this.messagesByChat[id] = [];
+    const provId = newSession.providerId || settingsStore.data.activeProvider;
+    const modelId = newSession.modelId || settingsStore.data.activeModel;
+    const prov = settingsStore.data.providers[provId] || settingsStore.currentProvider;
+    const caps = prov?.modelCapabilities?.[modelId] || settingsStore.currentModelCapabilities;
     this.contextTelemetryByChat[id] = {
       usedTokens: 0,
-      contextWindow: settingsStore.currentModelCapabilities.contextWindow || 128000,
+      contextWindow: caps.contextWindow || 128000,
       cachedTokens: 0,
       cacheHitRate: 0
     };
@@ -1431,6 +1456,13 @@ class ChatStore {
   }
 
   public async selectSession(id: string): Promise<void> {
+    if (this.activeChatId && this.activeChatId !== id) {
+      const prev = this.sessions.find((s) => s.id === this.activeChatId);
+      if (prev && prev.isDraft && (!this.messagesByChat[prev.id] || this.messagesByChat[prev.id].length === 0)) {
+        this.sessions = this.sessions.filter((s) => s.id !== prev.id);
+        delete this.messagesByChat[prev.id];
+      }
+    }
     this.activeChatId = id;
     const session = this.sessions.find((s) => s.id === id);
     if (session?.projectPath) {
@@ -1439,9 +1471,6 @@ class ChatStore {
       }
     } else if (session && !session.isThemeStudio && workspaceStore.currentPath) {
       workspaceStore.clearWorkspace().catch(() => {});
-    }
-    if (session?.providerId && session?.modelId) {
-      settingsStore.setActiveModel(session.providerId, session.modelId);
     }
     if (session && session.hasUnreadCompletion) {
       session.hasUnreadCompletion = false;
@@ -1650,7 +1679,7 @@ class ChatStore {
       return;
     }
 
-    const titleSeed = text.trim() || options.attachments?.[0]?.name || 'New task';
+    const titleSeed = text.trim() || options.attachments?.[0]?.name || 'Chat';
     const prevActive = this.activeChatId;
     let chatId = options.targetChatId || this.activeChatId;
     if (!chatId) {
@@ -1700,7 +1729,7 @@ class ChatStore {
       currentSession.hasError = false;
       currentSession.isPaused = false;
       currentSession.hasUnreadCompletion = false;
-      if (this.messagesByChat[chatId].length <= 2 && currentSession.title.startsWith('New')) {
+      if (!currentSession.title || currentSession.title === 'New task' || currentSession.title.startsWith('New task')) {
         currentSession.title = titleSeed.slice(0, 36);
       }
     }
@@ -1716,10 +1745,14 @@ class ChatStore {
     resume = false,
     forceExecute = false
   ): Promise<void> {
-    const prov = settingsStore.currentProvider;
-    const modelCaps = settingsStore.currentModelCapabilities;
-    const detectedInfo = prov?.modelCapabilities?.[settingsStore.data.activeModel];
     const sess = this.sessions.find((s) => s.id === chatId);
+    const targetProvId = sess?.providerId || settingsStore.data.activeProvider;
+    const targetModel = sess?.modelId || settingsStore.data.activeModel;
+    const prov = settingsStore.data.providers[targetProvId] || settingsStore.currentProvider;
+    const detectedInfo = prov?.modelCapabilities?.[targetModel];
+    const resolvedStreamModel = resolveModelForReasoning(prov, targetModel, settingsStore.data.reasoningLevel);
+    const resolvedCaps = prov?.modelCapabilities?.[resolvedStreamModel] || detectedInfo;
+    const modelCaps = resolvedCaps || settingsStore.currentModelCapabilities;
 
     await new Promise<void>(async (resolve, reject) => {
       let settled = false;
@@ -1785,8 +1818,6 @@ class ChatStore {
           data_url: a.previewUrl || null
         }));
 
-        const resolvedStreamModel = resolveModelForReasoning(prov, settingsStore.data.activeModel, settingsStore.data.reasoningLevel);
-        const resolvedCaps = prov?.modelCapabilities?.[resolvedStreamModel] || detectedInfo;
         if (isImageGenerationModel(resolvedStreamModel)) {
           const curList = this.messagesByChat[chatId] || [];
           const targetMsg = curList.find((m) => m.id === messageId);
@@ -2265,6 +2296,12 @@ class ChatStore {
         currentAssistantMsg.steps = (currentAssistantMsg.steps || []).slice(0, snap.stepsLen);
         currentAssistantMsg.toolCalls = (currentAssistantMsg.toolCalls || []).slice(0, snap.toolsLen);
       }
+      currentAssistantMsg.toolCalls = (currentAssistantMsg.toolCalls || []).filter(
+        (tc) => !isInternalArtifactTool(tc.toolName, tc.rawArgs || tc.args)
+      );
+      currentAssistantMsg.steps = (currentAssistantMsg.steps || []).filter(
+        (s) => s.kind !== 'tool' || !isInternalArtifactTool(s.record.toolName, s.record.rawArgs || s.record.args)
+      );
       return;
     }
 
@@ -2301,6 +2338,7 @@ class ChatStore {
         ];
       }
     } else if (event.type === 'tool_call_delta') {
+      if (isInternalArtifactTool(event.name, event.argumentsDelta || event.arguments)) return;
       this.flushSmoothBuffers(cid);
       if (!event.id) return;
       currentAssistantMsg.statusText = undefined;
@@ -2318,6 +2356,7 @@ class ChatStore {
         currentAssistantMsg.steps = [...currentAssistantMsg.steps, { kind: 'tool', record }];
       }
     } else if (event.type === 'tool_call_complete' || event.type === 'tool_start') {
+      if (isInternalArtifactTool(event.name, event.arguments)) return;
       this.flushSmoothBuffers(cid);
       currentAssistantMsg.statusText = undefined;
       currentAssistantMsg.retryReason = undefined;

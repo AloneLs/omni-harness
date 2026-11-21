@@ -359,7 +359,7 @@ function formatRelativeAge(timestamp: number): string {
               <button
                 type="button"
                 class="w-6 h-6 rounded-[4px] flex items-center justify-center text-[#73737A] hover:text-[#EDEDEF] hover:bg-white/[0.08] transition-colors shrink-0"
-                onclick={() => { workspaceStore.setWorkspaceDir(projPath); chatStore.createSession('New task', projPath); }}
+                onclick={() => { workspaceStore.setWorkspaceDir(projPath); chatStore.createSession('', projPath); }}
                 title="New task in {projName}"
                 use:attachPressScale
               >
@@ -593,7 +593,7 @@ function formatRelativeAge(timestamp: number): string {
     </button>
     <button
       type="button"
-      onclick={() => { if (projCtxMenu) { workspaceStore.setWorkspaceDir(projCtxMenu.path); chatStore.createSession('New task', projCtxMenu.path); } projCtxMenu = null; }}
+      onclick={() => { if (projCtxMenu) { workspaceStore.setWorkspaceDir(projCtxMenu.path); chatStore.createSession('', projCtxMenu.path); } projCtxMenu = null; }}
       class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07]"
     >
       Новый чат в проекте

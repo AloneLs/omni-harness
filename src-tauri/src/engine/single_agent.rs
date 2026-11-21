@@ -1017,6 +1017,11 @@ impl SingleAgentRunner {
                 assistant_reasoning.clear();
                 active_tool_calls.clear();
                 let mut in_stream_error: Option<String> = None;
+                let mut content_prefix_buffer = String::new();
+                let mut content_prefix_flushed = false;
+                let mut suppress_content_stream = false;
+                let mut delta_tool_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+                let mut delta_tool_args: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
                 loop {
                     let evt = tokio::select! {
@@ -1043,16 +1048,45 @@ impl SingleAgentRunner {
                         if usage.is_some() {
                             turn_usage = usage.clone();
                         }
-                    } else {
-                        let _ = event_sender.send(evt.clone()).await;
                     }
 
                     match &evt {
                         StreamEvent::ContentDelta { delta } => {
                             assistant_text.push_str(delta);
+                            if !suppress_content_stream {
+                                if !content_prefix_flushed {
+                                    content_prefix_buffer.push_str(delta);
+                                    if crate::engine::policy_guard::detect_filter_signature(&content_prefix_buffer).is_some() {
+                                        suppress_content_stream = true;
+                                        content_prefix_buffer.clear();
+                                    } else if content_prefix_buffer.len() >= 800 || content_prefix_buffer.contains("```") {
+                                        let _ = event_sender.send(StreamEvent::ContentDelta { delta: content_prefix_buffer.clone() }).await;
+                                        content_prefix_flushed = true;
+                                    }
+                                } else {
+                                    let _ = event_sender.send(evt.clone()).await;
+                                }
+                            }
                         }
                         StreamEvent::ReasoningDelta { delta } => {
                             assistant_reasoning.push_str(delta);
+                            let _ = event_sender.send(evt.clone()).await;
+                        }
+                        StreamEvent::ToolCallDelta { id, name, arguments_delta, .. } => {
+                            if let Some(i) = id {
+                                if let Some(n) = name {
+                                    delta_tool_names.insert(i.clone(), n.clone());
+                                }
+                                delta_tool_args.entry(i.clone()).or_default().push_str(arguments_delta);
+                            }
+                            let effective_name = id.as_ref().and_then(|i| delta_tool_names.get(i)).cloned().or_else(|| name.clone());
+                            let effective_args = id.as_ref().and_then(|i| delta_tool_args.get(i)).map(|s| s.as_str()).unwrap_or(arguments_delta.as_str());
+                            let is_art = effective_name.as_deref() == Some("artifact_read")
+                                || crate::engine::policy_guard::is_internal_artifact_tool(effective_name.as_deref().unwrap_or(""), effective_args)
+                                || effective_args.contains("artifact://") || effective_args.contains("sha256_");
+                            if !is_art {
+                                let _ = event_sender.send(evt.clone()).await;
+                            }
                         }
                         StreamEvent::ToolCallComplete {
                             id,
@@ -1060,6 +1094,7 @@ impl SingleAgentRunner {
                             arguments,
                             ..
                         } => {
+                            let is_art = crate::engine::policy_guard::is_internal_artifact_tool(name, arguments);
                             active_tool_calls.push(ToolCall {
                                 id: id.clone(),
                                 call_type: "function".to_string(),
@@ -1068,8 +1103,21 @@ impl SingleAgentRunner {
                                     arguments: arguments.clone(),
                                 },
                             });
+                            if is_art {
+                                content_prefix_buffer.clear();
+                                content_prefix_flushed = true;
+                            } else if !content_prefix_flushed && !suppress_content_stream && !content_prefix_buffer.is_empty() {
+                                let _ = event_sender.send(StreamEvent::ContentDelta { delta: content_prefix_buffer.clone() }).await;
+                                content_prefix_flushed = true;
+                            }
+                            if !is_art {
+                                let _ = event_sender.send(evt.clone()).await;
+                            }
                         }
-                        _ => {}
+                        StreamEvent::Finish { .. } | StreamEvent::Error { .. } => {}
+                        _ => {
+                            let _ = event_sender.send(evt.clone()).await;
+                        }
                     }
                 }
 
@@ -1096,6 +1144,15 @@ impl SingleAgentRunner {
                             !active_tool_calls.is_empty(),
                         )
                     });
+
+                if policy_hit.is_none() {
+                    if !content_prefix_flushed && !suppress_content_stream && !content_prefix_buffer.is_empty() {
+                        let _ = event_sender.send(StreamEvent::ContentDelta { delta: content_prefix_buffer.clone() }).await;
+                    }
+                } else {
+                    content_prefix_buffer.clear();
+                    suppress_content_stream = true;
+                }
 
                 if let Some(pm) = policy_hit {
                     crate::engine::policy_guard::audit_event(
@@ -1915,17 +1972,20 @@ impl SingleAgentRunner {
                 };
 
                 let bounded_output = spill_tool_output_if_needed(workspace_root, &tc.id, &raw_output);
-                let ui_output = ui_output_override.unwrap_or_else(|| bounded_output.clone());
+                let is_art = crate::engine::policy_guard::is_internal_artifact_tool(tool_name, &tc.function.arguments);
 
-                let _ = event_sender
-                    .send(StreamEvent::ToolExecEnd {
-                        id: tc.id.clone(),
-                        success: exec_result.success,
-                        output: ui_output,
-                        error: exec_result.error.clone(),
-                        elapsed_ms,
-                    })
-                    .await;
+                if !is_art {
+                    let ui_output = ui_output_override.unwrap_or_else(|| bounded_output.clone());
+                    let _ = event_sender
+                        .send(StreamEvent::ToolExecEnd {
+                            id: tc.id.clone(),
+                            success: exec_result.success,
+                            output: ui_output,
+                            error: exec_result.error.clone(),
+                            elapsed_ms,
+                        })
+                        .await;
+                }
 
                 let tool_msg = ChatMessage {
                     role: "tool".to_string(),
@@ -1936,6 +1996,11 @@ impl SingleAgentRunner {
                     reasoning_content: None,
                 };
                 history.push(tool_msg);
+                if is_art {
+                    let _ = event_sender.send(StreamEvent::TurnBufferReset).await;
+                    Self::save_checkpoint(db, chat_id, history);
+                    continue;
+                }
                 if exec_result.success {
                     if let Some(d) = db {
                         match tool_name.as_str() {

@@ -4,7 +4,7 @@ import { slide } from 'svelte/transition';
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import Icon from './Icon.svelte';
 import FileToolIcon from './FileToolIcon.svelte';
-import type { ToolExecutionRecord } from '../lib/toolMapper';
+import { type ToolExecutionRecord, isInternalArtifactTool } from '../lib/toolMapper';
 import type { TimelineStep } from '../lib/stores/chat.svelte';
 import { renderMarkdown } from '../lib/markdown';
 import { chatStore } from '../lib/stores/chat.svelte';
@@ -146,21 +146,31 @@ $effect(() => {
 });
 
 let normalizedSteps = $derived.by<TimelineStep[]>(() => {
-  if (steps && steps.length > 0) return steps;
-  const fallback: TimelineStep[] = [];
-  if (reasoningContent) {
-    fallback.push({
-      kind: 'thought',
-      id: 'legacy-thought',
-      text: reasoningContent,
-      startedAt: startedAt || Date.now(),
-      finishedAt: finishedAt || Date.now()
-    });
+  let list: TimelineStep[] = [];
+  if (steps && steps.length > 0) {
+    list = steps;
+  } else {
+    const fallback: TimelineStep[] = [];
+    if (reasoningContent) {
+      fallback.push({
+        kind: 'thought',
+        id: 'legacy-thought',
+        text: reasoningContent,
+        startedAt: startedAt || Date.now(),
+        finishedAt: finishedAt || Date.now()
+      });
+    }
+    for (const tc of toolCalls || []) {
+      fallback.push({ kind: 'tool', record: tc });
+    }
+    list = fallback;
   }
-  for (const tc of toolCalls || []) {
-    fallback.push({ kind: 'tool', record: tc });
-  }
-  return fallback;
+  return list.filter((s) => {
+    if (s.kind === 'tool' && s.record) {
+      return !isInternalArtifactTool(s.record.toolName, s.record.rawArgs || s.record.args);
+    }
+    return true;
+  });
 });
 
 function formatDuration(diffMs: number, allowMs = false): string {

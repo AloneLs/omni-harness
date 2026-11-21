@@ -357,3 +357,22 @@ export function formatToolExecution(raw: {
     terminalData
   };
 }
+
+export function isInternalArtifactTool(toolName: string, rawArgs?: string | Record<string, any>): boolean {
+  if (toolName === 'artifact_read') return true;
+  if (toolName === 'read_file') {
+    let p = '';
+    if (typeof rawArgs === 'string') {
+      try {
+        const parsed = JSON.parse(rawArgs);
+        p = parsed.path || '';
+      } catch {
+        p = rawArgs;
+      }
+    } else if (rawArgs && typeof rawArgs === 'object') {
+      p = rawArgs.path || '';
+    }
+    if (p.startsWith('artifact://') || p.includes('sha256_')) return true;
+  }
+  return false;
+}

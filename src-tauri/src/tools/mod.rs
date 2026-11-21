@@ -747,6 +747,15 @@ impl ToolDispatcher {
         match name {
             "read_file" => {
                 let raw_path = args.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
+                if raw_path.starts_with("artifact://") {
+                    let content = crate::engine::policy_guard::ArtifactStore::read_artifact(raw_path)?;
+                    return Ok(json!({
+                        "path": raw_path,
+                        "content": content,
+                        "totalLines": 1,
+                        "truncated": false
+                    }));
+                }
                 let resolved_path = self.resolve_read_path(raw_path)?.to_string_lossy().to_string();
                 let offset = args.get("offset").and_then(|v| v.as_u64()).map(|u| u as usize);
                 let limit = args.get("limit").and_then(|v| v.as_u64()).map(|u| u as usize);

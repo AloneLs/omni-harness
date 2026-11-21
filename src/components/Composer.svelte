@@ -137,12 +137,17 @@ const REASONING_LABELS: Record<ReasoningLevel, string> = {
   MAX: 'MAX'
 };
 
+let currentChatSession = $derived(chatStore.activeSession);
+let currentProviderId = $derived(currentChatSession?.providerId || settingsStore.data.activeProvider);
+let currentProvider = $derived(settingsStore.data.providers[currentProviderId] || settingsStore.currentProvider);
+let currentModelId = $derived(currentChatSession?.modelId || settingsStore.data.activeModel);
+
 let supportedReasoningLevels = $derived(
-  getSupportedReasoningLevels(settingsStore.currentProvider, settingsStore.data.activeModel)
+  getSupportedReasoningLevels(currentProvider, currentModelId)
 );
 
 let displayActiveModel = $derived(
-  getDisplayModelId(settingsStore.currentProvider, settingsStore.data.activeModel)
+  getDisplayModelId(currentProvider, currentModelId)
 );
 
 let reasoningIndex = $derived(
@@ -410,6 +415,7 @@ function closeAllPopups() {
   showPlusMenu = false;
   showModelPopup = false;
   showProjectPopup = false;
+  localPopupProviderId = null;
 }
 
 function handleWindowPointerDown(e: PointerEvent) {
@@ -459,7 +465,15 @@ let enabledProviders = $derived(
   Object.values(settingsStore.data.providers).filter((p) => p.enabled)
 );
 
+let localPopupProviderId = $state<string | null>(null);
+
 let popupProviderId = $derived.by(() => {
+  if (localPopupProviderId && settingsStore.data.providers[localPopupProviderId]?.enabled) {
+    return localPopupProviderId;
+  }
+  if (currentProviderId && settingsStore.data.providers[currentProviderId]?.enabled) {
+    return currentProviderId;
+  }
   const active = settingsStore.data.activeProvider;
   if (active && settingsStore.data.providers[active]?.enabled) return active;
   return enabledProviders[0]?.id || '';
@@ -1423,7 +1437,11 @@ async function stopAndSendVoice() {
                         <button
                           type="button"
                           class="shrink-0 h-full px-2.5 rounded-[3px] font-mono text-[10px] whitespace-nowrap transition-colors {popupProviderId === prov.id ? 'bg-white/[0.12] border-t border-white/[0.18] text-[#EDEDEF] font-semibold' : 'text-[#73737A] hover:text-[#D4D4D8]'}"
-                          onclick={() => settingsStore.setProvider(prov.id)}
+                          onclick={() => {
+                            localPopupProviderId = prov.id;
+                            const defModel = prov.defaultModel || prov.availableModels[0] || '';
+                            chatStore.setSessionModel(prov.id, defModel);
+                          }}
                           title={provTier ? `${prov.name} · ${provTier}` : prov.name}
                         >
                           {prov.name}
@@ -1448,13 +1466,12 @@ async function stopAndSendVoice() {
                     {#key popupProviderId}
                       <div in:fly={{ y: 4, duration: 140 }} class="max-h-40 overflow-y-auto space-y-0.5">
                         {#each availableModels as item (item.model)}
-                          {@const isSelected = settingsStore.data.activeProvider === item.providerId && (displayActiveModel === item.model || item.rawIds.includes(settingsStore.data.activeModel))}
+                          {@const isSelected = currentProviderId === item.providerId && (displayActiveModel === item.model || item.rawIds.includes(currentModelId))}
                           <button
                             type="button"
                             class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {isSelected ? 'bg-white/[0.09] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.04] hover:text-white'}"
                             onclick={() => {
-                              const prev = getDisplayModelId(settingsStore.currentProvider, chatStore.activeSession?.modelId || settingsStore.data.activeModel);
-                              settingsStore.setActiveModel(item.providerId, item.model);
+                              const prev = displayActiveModel;
                               chatStore.setSessionModel(item.providerId, item.model);
                               if (prev && prev !== item.model) {
                                 chatStore.recordModelChanged(item.model);

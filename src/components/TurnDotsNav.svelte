@@ -43,11 +43,52 @@ let turns = $derived.by<TurnItem[]>(() => {
   return list;
 });
 
+const MAX_VISIBLE = 16;
+let windowStart = $state(0);
 let hoveredIdx = $state<number | null>(null);
-let dotEls = $state<(HTMLButtonElement | null)[]>([]);
 let navContainerEl = $state<HTMLDivElement | null>(null);
 
 const cardSpring = new Spring({ opacity: 0, scale: 0.96, x: -6 }, SPRING_POPUP);
+
+$effect(() => {
+  const len = turns.length;
+  if (len <= MAX_VISIBLE) {
+    windowStart = 0;
+    return;
+  }
+  const maxStart = len - MAX_VISIBLE;
+  if (activeIndex < windowStart) {
+    windowStart = Math.max(0, activeIndex);
+  } else if (activeIndex >= windowStart + MAX_VISIBLE) {
+    windowStart = Math.min(maxStart, activeIndex - MAX_VISIBLE + 1);
+  } else {
+    windowStart = Math.max(0, Math.min(windowStart, maxStart));
+  }
+});
+
+function handleWheel(e: WheelEvent) {
+  if (turns.length <= MAX_VISIBLE) return;
+  const maxStart = turns.length - MAX_VISIBLE;
+  const dir = e.deltaY > 0 ? 1 : -1;
+  const nextStart = Math.max(0, Math.min(maxStart, windowStart + dir));
+  if (nextStart !== windowStart) {
+    e.preventDefault();
+    e.stopPropagation();
+    windowStart = nextStart;
+  }
+}
+
+let visibleTurns = $derived.by(() => {
+  if (turns.length <= MAX_VISIBLE) {
+    return turns.map((turn, idx) => ({ turn, idx }));
+  }
+  const maxStart = Math.max(0, turns.length - MAX_VISIBLE);
+  const start = Math.max(0, Math.min(windowStart, maxStart));
+  return turns.slice(start, start + MAX_VISIBLE).map((turn, i) => ({
+    turn,
+    idx: start + i
+  }));
+});
 
 $effect(() => {
   cardSpring.target = hoveredIdx !== null
@@ -80,17 +121,19 @@ let hoveredTurn = $derived(hoveredIdx !== null ? turns[hoveredIdx] || null : nul
     role="navigation"
     aria-label="Conversation turns"
   >
-    <div class="flex flex-col items-center gap-1.5 py-2 px-1">
-      {#each turns as turn, idx (turn.id)}
-        {@const isActive = idx === activeIndex}
-        {@const isHovered = idx === hoveredIdx}
+    <div
+      onwheel={handleWheel}
+      class="flex flex-col items-center gap-1.5 py-2 px-1 overflow-hidden select-none"
+    >
+      {#each visibleTurns as item (item.turn.id)}
+        {@const isActive = item.idx === activeIndex}
+        {@const isHovered = item.idx === hoveredIdx}
         <button
-          bind:this={dotEls[idx]}
           type="button"
           class="w-3.5 h-3.5 flex items-center justify-center group/dot focus:outline-none"
-          onmouseenter={() => (hoveredIdx = idx)}
-          onclick={() => onSelectTurn(turn.id)}
-          aria-label="Jump to message {idx + 1}"
+          onmouseenter={() => (hoveredIdx = item.idx)}
+          onclick={() => onSelectTurn(item.turn.id)}
+          aria-label="Jump to message {item.idx + 1}"
         >
           <span
             class="rounded-full transition-all duration-200 {isActive
