@@ -3119,11 +3119,29 @@ async fn download_whisper_model(
             }
         }
     });
-    let path = state
+    let app_done = app.clone();
+    let mid_done = model_id.clone();
+    let res = state
         .speech_engine
         .download_model(&model_id, Some(tx))
-        .await?;
-    Ok(path.to_string_lossy().to_string())
+        .await;
+    match res {
+        Ok(path) => {
+            let _ = tauri::Emitter::emit(&app_done, "whisper-download-finished", serde_json::json!({
+                "modelId": mid_done,
+                "status": "installed"
+            }));
+            Ok(path.to_string_lossy().to_string())
+        }
+        Err(e) => {
+            let _ = tauri::Emitter::emit(&app_done, "whisper-download-finished", serde_json::json!({
+                "modelId": mid_done,
+                "status": "error",
+                "error": e
+            }));
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]

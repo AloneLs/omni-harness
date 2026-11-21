@@ -12,7 +12,22 @@ let {
 let kind = $derived.by(() => {
   const n = (name || '').toLowerCase();
   const t = (toolName || '').toLowerCase();
+
+  if (t === 'generate_image') return 'generate_image';
   if (t.includes('tool_hub') || t.includes('skill')) return 'skill';
+
+  if (
+    n.endsWith('.png') ||
+    n.endsWith('.jpg') ||
+    n.endsWith('.jpeg') ||
+    n.endsWith('.webp') ||
+    n.endsWith('.gif') ||
+    n.endsWith('.bmp') ||
+    n.endsWith('.ico')
+  ) {
+    return 'image_file';
+  }
+
   if (n.endsWith('.cpp') || n.endsWith('.cc') || n.endsWith('.cxx') || n.endsWith('.hpp') || n.endsWith('.hh') || n.endsWith('.hxx')) return 'cpp';
   if (n.endsWith('.c') || n.endsWith('.h')) return 'c';
   if (n.endsWith('.cs')) return 'cs';
@@ -34,129 +49,204 @@ let kind = $derived.by(() => {
   if (n.endsWith('.css') || n.endsWith('.scss')) return 'css';
   if (n.endsWith('.html') || n.endsWith('.htm')) return 'html';
   if (n.endsWith('.md') || n.endsWith('.txt')) return 'md';
+
   if (t.includes('terminal') || t.includes('pty') || t.includes('run_command')) return 'terminal';
   if (t.includes('web_research') || t.includes('browser') || t.includes('inspect_preview')) return 'web';
   if (t.includes('grep') || t.includes('glob') || t.includes('search')) return 'search';
   if (t.includes('cross_chat')) return 'chat';
   if (t.includes('computer_use') || t.includes('uia')) return 'desktop';
   if (t.includes('task_board')) return 'board';
-  if (t.includes('read') || t.includes('edit') || t.includes('write') || t.includes('fs_ops')) return 'file';
-  return 'tool';
+  if (t.includes('write')) return 'write';
+  if (t.includes('edit') || t.includes('patch')) return 'edit';
+  if (t.includes('read')) return 'read';
+  if (t.includes('fs_ops')) return 'file';
+  return 'file';
 });
 </script>
 
-{#if kind === 'cpp'}
+{#if kind === 'generate_image'}
+  <!-- AI Image Generator: Sparkles & Palette -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <path d="M12 2L20.5 6.9V17.1L12 22L3.5 17.1V6.9L12 2Z" fill="#00599C" fill-opacity="0.22" stroke="#3B82F6" stroke-width="1.5" />
-    <text x="12" y="14.7" text-anchor="middle" font-size="8" font-weight="800" font-family="sans-serif" fill="#60A5FA">C++</text>
+    <path d="M12 2L14.2 7.8L20 10L14.2 12.2L12 18L9.8 12.2L4 10L9.8 7.8L12 2Z" fill="#C084FC" />
+    <path d="M19 16L20.2 19.2L23.4 20.4L20.2 21.6L19 24.8L17.8 21.6L14.6 20.4L17.8 19.2L19 16Z" fill="#F472B6" />
+    <path d="M4 17L4.8 19.1L6.9 19.9L4.8 20.7L4 22.8L3.2 20.7L1.1 19.9L3.2 19.1L4 17Z" fill="#60A5FA" />
   </svg>
-{:else if kind === 'c'}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <path d="M12 2L20.5 6.9V17.1L12 22L3.5 17.1V6.9L12 2Z" fill="#283593" fill-opacity="0.25" stroke="#5C8DBC" stroke-width="1.5" />
-    <text x="12" y="15.2" text-anchor="middle" font-size="10.5" font-weight="800" font-family="sans-serif" fill="#93C5FD">C</text>
+{:else if kind === 'image_file'}
+  <!-- Clean Image / Photo Icon -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+    <rect x="3" y="3" width="18" height="18" rx="3.5" stroke="#38BDF8" stroke-width="1.6" fill="#38BDF8" fill-opacity="0.12" />
+    <circle cx="8.5" cy="8.5" r="1.75" fill="#38BDF8" />
+    <path d="M21 15.5L15.5 10L6.5 19" stroke="#38BDF8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
   </svg>
-{:else if kind === 'cs'}
+{:else if kind === 'py'}
+  <!-- Official Python interlocking snakes logo -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <path d="M12 2L20.5 6.9V17.1L12 22L3.5 17.1V6.9L12 2Z" fill="#68217A" fill-opacity="0.25" stroke="#A855F7" stroke-width="1.5" />
-    <text x="12" y="14.8" text-anchor="middle" font-size="8.5" font-weight="800" font-family="sans-serif" fill="#D8B4FE">C#</text>
+    <path d="M11.9 2C8.6 2 6.7 3.4 6.7 6.1v2.1h5.3v.7H4.4C2.3 8.9 1 10.7 1 13.8c0 3.3 1.5 5.1 4.5 5.1h1.5v-2.3c0-2.3 1.9-4.2 4.2-4.2h5.2c1.7 0 3-1.4 3-3V6.1c0-2.7-2.6-4.1-7.5-4.1zm-2.1 2.3c.7 0 1.2.5 1.2 1.2 0 .7-.5 1.2-1.2 1.2-.7 0-1.2-.5-1.2-1.2 0-.7.5-1.2 1.2-1.2z" fill="#387EB8" />
+    <path d="M12.1 22c3.3 0 5.2-1.4 5.2-4.1v-2.1H12v-.7h7.6c2.1 0 3.4-1.8 3.4-4.9 0-3.3-1.5-5.1-4.5-5.1H17v2.3c0 2.3-1.9 4.2-4.2 4.2H7.6c-1.7 0-3 1.4-3 3v3.3c0 2.7 2.6 4.1 7.5 4.1zm2.1-2.3c-.7 0-1.2-.5-1.2-1.2 0-.7.5-1.2 1.2-1.2.7 0 1.2.5 1.2 1.2 0 .7-.5 1.2-1.2 1.2z" fill="#FFE873" />
+  </svg>
+{:else if kind === 'ts'}
+  <!-- Official TypeScript Logo -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
+    <rect width="24" height="24" rx="4" fill="#3178C6" />
+    <path d="M5.5 8.2h7.8v2.2H10.5v8.1H7.8v-8.1H5.5V8.2zm9.1 7.3c.6.5 1.4.8 2.3.8 1 0 1.6-.4 1.6-1 0-.6-.4-.9-1.5-1.3-1.8-.6-2.9-1.3-2.9-2.7 0-1.7 1.4-2.8 3.5-2.8 1.4 0 2.5.4 3.2 1l-1 1.9c-.6-.4-1.3-.7-2.1-.7-.8 0-1.4.4-1.4.9 0 .5.4.8 1.4 1.2 1.9.7 3 1.4 3 2.8 0 1.8-1.4 2.9-3.7 2.9-1.6 0-2.8-.5-3.6-1.2l1.2-1.8z" fill="#FFFFFF" />
+  </svg>
+{:else if kind === 'js'}
+  <!-- Official JavaScript Logo -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
+    <rect width="24" height="24" rx="4" fill="#F7DF1E" />
+    <path d="M6 18.5l2.2-1.3c.5.8.9 1.4 1.7 1.4.8 0 1.3-.3 1.3-1.5v-7.8h2.7v7.9c0 2.5-1.5 3.6-3.8 3.6-2.1 0-3.3-1-4.1-2.3zm8.5-.2l2.2-1.3c.6.9 1.4 1.6 2.6 1.6 1.1 0 1.8-.5 1.8-1.3 0-.9-.7-1.3-2-1.8-1.8-.8-3-1.8-3-3.6 0-1.8 1.4-3.2 3.6-3.2 1.6 0 2.7.6 3.5 1.9l-2.1 1.4c-.4-.8-1-1.2-1.6-1.2-.7 0-1.2.4-1.2 1 0 .7.5 1 1.7 1.5 2.1.9 3.3 1.8 3.3 3.8 0 2.2-1.7 3.4-4.2 3.4-2.4 0-3.8-1-4.6-2.2z" fill="#000000" />
   </svg>
 {:else if kind === 'rs'}
+  <!-- Official Rust Gear & Serif R Logo -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <circle cx="12" cy="12" r="7.5" stroke="#DEA584" stroke-width="1.8" fill="#DEA584" fill-opacity="0.12" />
-    <path d="M12 2.2v2.2M12 19.6v2.2M2.2 12h2.2M19.6 12h2.2M5.1 5.1l1.6 1.6M17.3 17.3l1.6 1.6M18.9 5.1l-1.6 1.6M6.7 17.3l-1.6 1.6" stroke="#DEA584" stroke-width="1.8" stroke-linecap="round" />
-    <text x="12" y="15.1" text-anchor="middle" font-size="9.5" font-weight="800" font-family="serif" fill="#F3C6A5">R</text>
+    <circle cx="12" cy="12" r="9.5" fill="#DEA584" fill-opacity="0.2" stroke="#DEA584" stroke-width="1.4" />
+    <path d="M12 1.5l1 1.8 2-.6.4 2.1 2 .2-.2 2.1 1.8.9-.8 1.9 1.4 1.5-1.3 1.6.8 1.9-1.8.9.2 2.1-2 .2-.4 2.1-2-.6-1 1.8-1-1.8-2 .6-.4-2.1-2-.2.2-2.1-1.8-.9.8-1.9-1.4-1.5 1.3-1.6-.8-1.9 1.8-.9-.2-2.1 2-.2.4-2.1 2 .6 1-1.8z" fill="#E59966" />
+    <circle cx="12" cy="12" r="7.5" fill="#18181B" />
+    <path d="M8.5 7.5h4.2c1.8 0 2.9 1 2.9 2.5 0 1.2-.7 2-1.7 2.3l2.2 4.2h-2.3l-1.9-3.8H10.5v3.8H8.5V7.5zm2 3.5h2.1c.7 0 1.1-.4 1.1-.9 0-.6-.4-.9-1.1-.9h-2.1V11z" fill="#FFFFFF" />
   </svg>
 {:else if kind === 'go'}
+  <!-- Official Go Gopher / Speed Letters Logo -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <rect x="2.5" y="5" width="19" height="14" rx="4" fill="#00ADD8" fill-opacity="0.18" stroke="#00ADD8" stroke-width="1.5" />
-    <text x="12" y="15" text-anchor="middle" font-size="9" font-weight="800" font-family="sans-serif" fill="#22D3EE">GO</text>
+    <path d="M1.5 10.5h4.5M1 12.5h5.5M2 14.5h4" stroke="#00ADD8" stroke-width="1.3" stroke-linecap="round" />
+    <path d="M10.8 11.2c-.3-.5-.7-.8-1.4-.8-1.3 0-2.2 1.1-2.2 2.5 0 1.5.9 2.6 2.3 2.6.9 0 1.5-.4 1.8-.9v-.8H9.7v-1.1h3v2.8h-.8l-.2-.5c-.5.5-1.2.8-2.2.8-2.1 0-3.6-1.6-3.6-3.8 0-2.2 1.6-3.8 3.6-3.8 1.3 0 2.2.5 2.8 1.3l-1.5.7zm7.5 1.1c0 1.4-1 2.5-2.4 2.5-1.4 0-2.4-1.1-2.4-2.5s1-2.5 2.4-2.5c1.4 0 2.4 1.1 2.4 2.5zm-3.6 0c0 .9.5 1.5 1.2 1.5.7 0 1.2-.6 1.2-1.5 0-.8-.5-1.5-1.2-1.5-.7 0-1.2.7-1.2 1.5z" fill="#00ADD8" />
   </svg>
 {:else if kind === 'java'}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M10 4c0 1.2-1.5 1.8-1.5 3M14 3.5c0 1.3-1.5 2-1.5 3.3" stroke="#F89820" stroke-width="1.6" />
-    <path d="M6 10h10v4a4 4 0 0 1-4 4h-2a4 4 0 0 1-4-4v-4z" stroke="#5382A1" stroke-width="1.7" fill="#5382A1" fill-opacity="0.18" />
-    <path d="M16 11h1.8a1.7 1.7 0 0 1 0 3.4H16" stroke="#5382A1" stroke-width="1.6" />
-    <path d="M5 20.5h12" stroke="#F89820" stroke-width="1.7" />
+  <!-- Official Java Coffee Mark -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
+    <path d="M10 2.5c1.5 1.8-1 3.2 0 4.8M13.5 2c2 1.8-1 3.2 0 4.8" stroke="#F89820" stroke-width="1.5" stroke-linecap="round" />
+    <path d="M6 9.5h9.5c.8 0 1.5.7 1.5 1.5v3.5c0 2.8-2.2 5-5 5H9.5c-2.8 0-5-2.2-5-5V11c0-.8.7-1.5 1.5-1.5z" fill="#5382A1" />
+    <path d="M16 11.5h1.8c1.2 0 2.2 1 2.2 2.2s-1 2.2-2.2 2.2H16" stroke="#5382A1" stroke-width="1.6" stroke-linecap="round" />
+    <path d="M4 21.5h14" stroke="#F89820" stroke-width="1.8" stroke-linecap="round" />
+  </svg>
+{:else if kind === 'cpp'}
+  <!-- Official ISO C++ Blue Hexagon -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
+    <path d="M12 2L20.6 7V17L12 22L3.4 17V7L12 2Z" fill="#00599C" stroke="#659AD2" stroke-width="1.2" />
+    <path d="M10.2 14.8c-.8.5-1.7.6-2.5.2-1-.5-1.4-1.7-1.4-2.8s.5-2.4 1.5-2.8c.8-.4 1.7-.3 2.4.2l-.7 1.2c-.5-.3-1-.4-1.5-.1-.5.3-.8.9-.8 1.5s.3 1.3.8 1.5c.5.2 1 .1 1.4-.1l.8 1.2zm3.3-2.1h1.1v-1.1h.9v1.1h1.1v.9h-1.1v1.1h-.9v-1.1h-1.1v-.9zm4.2 0h1.1v-1.1h.9v1.1h1.1v.9h-1.1v1.1h-.9v-1.1h-1.1v-.9z" fill="#FFFFFF" />
+  </svg>
+{:else if kind === 'c'}
+  <!-- Official C Shield -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
+    <path d="M12 2L20.6 7V17L12 22L3.4 17V7L12 2Z" fill="#283593" stroke="#5C8DBC" stroke-width="1.2" />
+    <path d="M14.5 15.2c-1 .7-2.2.8-3.3.3-1.4-.7-2-2.2-2-3.8s.7-3.1 2-3.8c1.1-.6 2.3-.4 3.2.3l-1 1.5c-.6-.5-1.3-.6-2-.2-.8.4-1.1 1.2-1.1 2.2s.3 1.8 1.1 2.2c.7.4 1.4.3 2-.2l1.1 1.5z" fill="#FFFFFF" />
+  </svg>
+{:else if kind === 'cs'}
+  <!-- Official C# Hexagon -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
+    <path d="M12 2L20.6 7V17L12 22L3.4 17V7L12 2Z" fill="#68217A" stroke="#A855F7" stroke-width="1.2" />
+    <path d="M9.8 14.8c-.8.5-1.7.6-2.5.2-1-.5-1.4-1.7-1.4-2.8s.5-2.4 1.5-2.8c.8-.4 1.7-.3 2.4.2l-.7 1.2c-.5-.3-1-.4-1.5-.1-.5.3-.8.9-.8 1.5s.3 1.3.8 1.5c.5.2 1 .1 1.4-.1l.8 1.2zm3.7-4.5h.9l-.3 1.5h1.2l.3-1.5h.9l-.3 1.5h.8v.8h-.9l-.3 1.4h.9v.8h-1l-.4 1.6h-.9l.4-1.6h-1.2l-.4 1.6h-.9l.4-1.6h-.8v-.8h.9l.3-1.4h-.9v-.8h1l.3-1.5zm.9 2.3l-.3 1.4h1.2l.3-1.4h-1.2z" fill="#FFFFFF" />
   </svg>
 {:else if kind === 'kt'}
+  <!-- Official JetBrains Kotlin Flag -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <polygon points="4,4 20,4 12,12 20,20 4,20" fill="#7F52FF" fill-opacity="0.22" stroke="#A78BFA" stroke-width="1.6" stroke-linejoin="round" />
+    <path d="M22 2H2v20h20L12 12l10-10z" fill="url(#kt-grad)" />
+    <defs>
+      <linearGradient id="kt-grad" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+        <stop offset="0%" stop-color="#7F52FF" />
+        <stop offset="50%" stop-color="#C711E1" />
+        <stop offset="100%" stop-color="#F88909" />
+      </linearGradient>
+    </defs>
   </svg>
 {:else if kind === 'swift'}
+  <!-- Official Swift Bird Logo -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <rect x="3" y="3" width="18" height="18" rx="4.5" fill="#F05138" fill-opacity="0.2" stroke="#F05138" stroke-width="1.5" />
-    <path d="M7.5 15.5c3.5 1.8 7 .5 9-3-1-2.5-3.2-4.5-6-5.5 1.5 1.8 2 3.5 1.2 5-1.5-.8-3-2-4.2-3.5 1 2.2 2.2 3.8 3.6 4.8-1.3.4-2.5.3-3.6-.2z" fill="#FB923C" />
+    <rect width="24" height="24" rx="4" fill="#F05138" />
+    <path d="M6 18c5.8 2.2 11.2-.5 13.5-5.5-1.5-2.8-4.5-5.2-8.5-6.5 2 2.2 2.5 4.5 1.5 6.2-2-1-4-2.5-5.5-4.5 1.2 2.8 2.8 4.8 4.8 6-1.8.5-3.5.3-5-1-.5 1.8-.7 3.5-.8 5.3z" fill="#FFFFFF" />
   </svg>
 {:else if kind === 'rb'}
+  <!-- Official Ruby Gemstone Logo -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <polygon points="7,4 17,4 21,9 12,20 3,9" fill="#CC342D" fill-opacity="0.22" stroke="#F87171" stroke-width="1.6" stroke-linejoin="round" />
-    <line x1="3" y1="9" x2="21" y2="9" stroke="#F87171" stroke-width="1.2" />
+    <polygon points="6,3 18,3 22,9 12,22 2,9" fill="#CC342D" />
+    <polygon points="6,3 12,9 2,9" fill="#E53935" />
+    <polygon points="18,3 12,9 22,9" fill="#B71C1C" />
+    <polygon points="6,3 12,9 18,3" fill="#EF5350" />
+    <polygon points="2,9 12,9 12,22" fill="#D32F2F" />
+    <polygon points="22,9 12,9 12,22" fill="#880E4F" />
   </svg>
 {:else if kind === 'php'}
+  <!-- Official PHP Oval Logo -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <ellipse cx="12" cy="12" rx="10" ry="6.5" fill="#777BB4" fill-opacity="0.22" stroke="#818CF8" stroke-width="1.5" />
-    <text x="12" y="14.5" text-anchor="middle" font-size="7" font-weight="800" font-family="sans-serif" fill="#A5B4FC">PHP</text>
+    <ellipse cx="12" cy="12" rx="11" ry="7" fill="#777BB4" />
+    <path d="M6.2 14.5l.8-4.8h2c1 0 1.6.4 1.4 1.4-.2 1.1-.9 1.6-1.8 1.6H7.3l-.4 1.8H6.2zm1.4-2.6h.9c.5 0 .8-.2.9-.8.1-.5-.1-.7-.6-.7h-.8l-.4 1.5zm4.8 2.6l.8-4.8h1.1l-.3 1.8h.1c.4-.6.9-.9 1.6-.9.9 0 1.3.5 1.1 1.5l-.4 2.4h-1.1l.4-2.2c.1-.5-.1-.8-.6-.8-.5 0-.9.4-1.1 1.2l-.3 1.8h-1.4zm5.5 0l.8-4.8h2c1 0 1.6.4 1.4 1.4-.2 1.1-.9 1.6-1.8 1.6h-1.3l-.4 1.8h-1.1zm1.4-2.6h.9c.5 0 .8-.2.9-.8.1-.5-.1-.7-.6-.7h-.8l-.4 1.5z" fill="#FFFFFF" />
   </svg>
 {:else if kind === 'lua'}
+  <!-- Official Lua Globe Logo -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <circle cx="12" cy="12" r="8" fill="#000080" fill-opacity="0.25" stroke="#60A5FA" stroke-width="1.6" />
-    <circle cx="15" cy="9" r="2" fill="#93C5FD" />
+    <circle cx="12" cy="12" r="8.5" fill="#000080" />
+    <circle cx="16.5" cy="7.5" r="2.2" fill="#0000C8" stroke="#FFFFFF" stroke-width="0.8" />
+    <circle cx="8" cy="15" r="1.5" fill="#FFFFFF" />
+  </svg>
+{:else if kind === 'html'}
+  <!-- Official W3C HTML5 Shield -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
+    <polygon points="3,2 21,2 19.3,19.5 12,22 4.7,19.5" fill="#E34F26" />
+    <polygon points="12,3.8 17.7,3.8 16.3,18.2 12,19.8" fill="#EF652A" />
+    <path d="M7.8 7h8.4l-.3 3.5h-5.4l.3 3.5H16l-.5 4.8-3.5 1-3.5-1-.2-2.3H6.5l.3 3.8 5.2 1.5 5.2-1.5 1-8.8H6.2L7.8 7z" fill="#FFFFFF" />
+  </svg>
+{:else if kind === 'css'}
+  <!-- Official W3C CSS3 Shield -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
+    <polygon points="3,2 21,2 19.3,19.5 12,22 4.7,19.5" fill="#1572B6" />
+    <polygon points="12,3.8 17.7,3.8 16.3,18.2 12,19.8" fill="#33A9DC" />
+    <path d="M7.8 7h8.4l-.3 3.5h-5.4l.3 3.5H16l-.5 4.8-3.5 1-3.5-1-.2-2.3H6.5l.3 3.8 5.2 1.5 5.2-1.5 1-8.8H6.2L7.8 7z" fill="#FFFFFF" />
+  </svg>
+{:else if kind === 'svelte'}
+  <!-- Official Svelte Logo -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
+    <path d="M19.3 5.4c-1.8-2.5-5.3-3.1-7.8-1.3L7 7.2c-2 1.5-2.7 4.3-1.4 6.5.4.7 1 1.3 1.7 1.7-.3 1-.2 2.1.4 3 1.4 2 4.1 2.5 6.1 1.1l4.4-3.1c2-1.5 2.7-4.3 1.4-6.5-.4-.7-1-1.3-1.7-1.7.3-1 .2-2.1-.4-3z" fill="#FF3E00" />
+  </svg>
+{:else if kind === 'json'}
+  <!-- Clean JSON Brackets -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#F59E0B" stroke-width="2" stroke-linecap="round">
+    <path d="M8 4c-2 0-2 2-2 4v2c0 1.2-1 2-2 2 1 0 2 .8 2 2v2c0 2 0 4 2 4" />
+    <path d="M16 4c2 0 2 2 2 4v2c0 1.2 1 2 2 2-1 0-2 .8-2 2v2c0 2 0 4-2 4" />
   </svg>
 {:else if kind === 'sql'}
+  <!-- Database Stack -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#38BDF8" stroke-width="1.6">
-    <ellipse cx="12" cy="6" rx="7" ry="2.8" fill="#38BDF8" fill-opacity="0.16" />
+    <ellipse cx="12" cy="6" rx="7" ry="2.8" fill="#38BDF8" fill-opacity="0.2" />
     <path d="M5 6v12c0 1.5 3.1 2.8 7 2.8s7-1.3 7-2.8V6" />
     <path d="M5 12c0 1.5 3.1 2.8 7 2.8s7-1.3 7-2.8" />
   </svg>
 {:else if kind === 'shell'}
+  <!-- Terminal Prompt -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#4ADE80" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
     <rect x="3" y="4" width="18" height="16" rx="3" fill="#22C55E" fill-opacity="0.12" />
     <polyline points="7 15 11 11 7 7" />
     <line x1="12.5" y1="15" x2="17" y2="15" />
   </svg>
-{:else if kind === 'js'}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <rect x="3" y="3" width="18" height="18" rx="3.5" stroke="#F7DF1E" stroke-width="1.6" fill="#F7DF1E" fill-opacity="0.16" />
-    <text x="12" y="15.5" text-anchor="middle" font-size="8.5" font-weight="800" font-family="sans-serif" fill="#FDE047">JS</text>
-  </svg>
-{:else if kind === 'ts'}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <rect x="3" y="3" width="18" height="18" rx="3.5" stroke="#3178C6" stroke-width="1.6" fill="#3178C6" fill-opacity="0.2" />
-    <text x="12" y="15.5" text-anchor="middle" font-size="8.5" font-weight="800" font-family="sans-serif" fill="#60A5FA">TS</text>
-  </svg>
-{:else if kind === 'svelte'}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <path d="M17.5 6.5c-1.8-2.4-5.2-2.9-7.6-1.1L6.6 7.9c-2 1.5-2.6 4.2-1.4 6.4.4.7 1 1.3 1.7 1.7-.3.9-.2 2 .4 2.9 1.3 1.9 3.9 2.3 5.8 1l3.3-2.5c2-1.5 2.6-4.2 1.4-6.4-.4-.7-1-1.3-1.7-1.7.3-.9.2-2-.4-2.8z" stroke="#FF3E00" stroke-width="1.7" fill="#FF3E00" fill-opacity="0.18" />
-  </svg>
-{:else if kind === 'py'}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <path d="M12 3c-3.3 0-3 1.4-3 3v2h6v1H7.5C5.6 9 4 10.6 4 13s1.6 4 3.5 4H9v-2c0-1.7 1.3-3 3-3h4c1.4 0 2.5-1.1 2.5-2.5V6c0-1.7-1.3-3-3-3H12z" fill="#3776AB" fill-opacity="0.28" stroke="#60A5FA" stroke-width="1.3" />
-    <path d="M12 21c3.3 0 3-1.4 3-3v-2H9v-1h7.5c1.9 0 3.5-1.6 3.5-4s-1.6-4-3.5-4H15v2c0 1.7-1.3 3-3 3H8c-1.4 0-2.5 1.1-2.5 2.5V18c0 1.7 1.3 3 3 3h3.5z" fill="#FFD43B" fill-opacity="0.22" stroke="#FACC15" stroke-width="1.3" />
-  </svg>
-{:else if kind === 'json'}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#FBBF24" stroke-width="1.8" stroke-linecap="round">
-    <path d="M8 4c-2 0-2 2-2 4v2c0 1.2-1 2-2 2 1 0 2 .8 2 2v2c0 2 0 4 2 4" />
-    <path d="M16 4c2 0 2 2 2 4v2c0 1.2 1 2 2 2-1 0-2 .8-2 2v2c0 2 0 4-2 4" />
-  </svg>
-{:else if kind === 'css'}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
-    <rect x="3" y="3" width="18" height="18" rx="3.5" stroke="#A855F7" stroke-width="1.6" fill="#A855F7" fill-opacity="0.16" />
-    <text x="12" y="15" text-anchor="middle" font-size="7.2" font-weight="800" font-family="sans-serif" fill="#C084FC">CSS</text>
-  </svg>
-{:else if kind === 'html'}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#F97316" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-    <polyline points="8 7 3 12 8 17" />
-    <polyline points="16 7 21 12 16 17" />
-    <line x1="14" y1="5" x2="10" y2="19" />
-  </svg>
 {:else if kind === 'md'}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#94A3B8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <!-- Official Markdown Logo -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none">
+    <rect x="2" y="4" width="20" height="16" rx="3" stroke="#94A3B8" stroke-width="1.6" />
+    <path d="M5 16V8l3 3.5L11 8v8M14 12l2.5 3.5L19 12M16.5 8v6" stroke="#94A3B8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+  </svg>
+{:else if kind === 'write'}
+  <!-- Document with Writing Pen -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke="#60A5FA" stroke-width="1.6" />
+    <polyline points="14 2 14 8 20 8" stroke="#60A5FA" stroke-width="1.6" />
+    <line x1="16" y1="13" x2="8" y2="13" stroke="#60A5FA" stroke-width="1.6" stroke-linecap="round" />
+    <line x1="16" y1="17" x2="8" y2="17" stroke="#60A5FA" stroke-width="1.6" stroke-linecap="round" />
+    <line x1="10" y1="9" x2="8" y2="9" stroke="#60A5FA" stroke-width="1.6" stroke-linecap="round" />
+  </svg>
+{:else if kind === 'edit'}
+  <!-- Edit Pen File -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#A78BFA" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+    <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+  </svg>
+{:else if kind === 'read'}
+  <!-- Read File -->
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#94A3B8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
     <polyline points="14 2 14 8 20 8" />
-    <line x1="8" y1="13" x2="16" y2="13" />
-    <line x1="8" y1="17" x2="13" y2="17" />
+    <line x1="12" y1="18" x2="12" y2="12" />
+    <polyline points="9 15 12 18 15 15" />
   </svg>
 {:else if kind === 'skill'}
+  <!-- Skill Book -->
   <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#C084FC" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
     <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
     <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" fill="#A855F7" fill-opacity="0.14" />
@@ -168,8 +258,8 @@ let kind = $derived.by(() => {
     <line x1="13" y1="15" x2="17" y2="15" />
   </svg>
 {:else if kind === 'web'}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#D4D4D8" stroke-width="1.7">
-    <circle cx="12" cy="12" r="9" fill="#D4D4D8" fill-opacity="0.1" />
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#38BDF8" stroke-width="1.7">
+    <circle cx="12" cy="12" r="9" fill="#38BDF8" fill-opacity="0.1" />
     <line x1="3" y1="12" x2="21" y2="12" />
     <path d="M12 3a14 14 0 0 1 3.5 9 14 14 0 0 1-3.5 9 14 14 0 0 1-3.5-9A14 14 0 0 1 12 3z" />
   </svg>
@@ -194,7 +284,7 @@ let kind = $derived.by(() => {
     <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
   </svg>
 {:else}
-  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#D4D4D8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+  <svg class="{className} shrink-0" viewBox="0 0 24 24" fill="none" stroke="#94A3B8" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
     <polyline points="14 2 14 8 20 8" />
   </svg>

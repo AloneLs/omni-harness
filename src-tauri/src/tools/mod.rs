@@ -1665,7 +1665,7 @@ impl ToolDispatcher {
                         base64::engine::general_purpose::STANDARD.encode(&bytes)
                     );
                     let mut theme = crate::themes::load_theme(theme_id)?;
-                    theme.assets.insert(safe_name.clone(), data_uri);
+                    theme.assets.insert(safe_name.clone(), data_uri.clone());
                     let saved = crate::themes::save_theme(theme)?;
                     let _ = tauri::Emitter::emit(app_handle, "theme-studio-patch", &saved);
                     Ok(json!({
@@ -1673,6 +1673,8 @@ impl ToolDispatcher {
                         "model": used_model,
                         "asset_name": safe_name,
                         "asset_url": format!("omni-asset://{}", safe_name),
+                        "dataUrl": data_uri,
+                        "prompt": prompt,
                         "bytes": bytes.len()
                     }))
                 } else {
@@ -1693,10 +1695,18 @@ impl ToolDispatcher {
                     }
                     std::fs::write(&out_path, &bytes).map_err(|e| e.to_string())?;
                     let path_str = out_path.to_string_lossy().to_string();
+                    let data_uri = format!(
+                        "data:{};base64,{}",
+                        mime,
+                        base64::engine::general_purpose::STANDARD.encode(&bytes)
+                    );
                     Ok(json!({
                         "status": "ok",
                         "model": used_model,
                         "path": path_str,
+                        "dataUrl": data_uri,
+                        "prompt": prompt,
+                        "aspect_ratio": aspect_ratio.unwrap_or("1:1"),
                         "bytes": bytes.len()
                     }))
                 }

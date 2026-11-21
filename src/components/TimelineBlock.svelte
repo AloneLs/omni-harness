@@ -289,10 +289,31 @@ function formatToolLabel(record: ToolExecutionRecord): { verb: string; target: s
   const { filePath, added, removed } = extractEditTexts(record);
   const fileName = filePath ? (filePath.split(/[\\/]/).pop() || filePath) : '';
 
-  if (n.includes('edit') || n.includes('write')) {
+  if (n === 'generate_image') {
     const isErr = record.status === 'error';
+    const isRunning = isStreaming && (record.status === 'running' || record.status === 'pending');
+    const p = String(record.args?.prompt || '').trim();
+    const shortPrompt = p ? `"${p.slice(0, 48)}${p.length > 48 ? '...' : ''}"` : 'Image';
     return {
-      verb: isErr ? 'Edit' : 'Edited',
+      verb: isRunning ? 'Generating' : isErr ? 'Generate' : 'Generated',
+      target: shortPrompt
+    };
+  }
+  if (n.includes('write')) {
+    const isErr = record.status === 'error';
+    const isRunning = isStreaming && (record.status === 'running' || record.status === 'pending');
+    return {
+      verb: isRunning ? 'Writing' : isErr ? 'Write' : 'Wrote',
+      target: fileName || record.actionName,
+      added: isErr ? 0 : added,
+      removed: 0
+    };
+  }
+  if (n.includes('edit') || n.includes('patch')) {
+    const isErr = record.status === 'error';
+    const isRunning = isStreaming && (record.status === 'running' || record.status === 'pending');
+    return {
+      verb: isRunning ? 'Editing' : isErr ? 'Edit' : 'Edited',
       target: fileName || record.actionName,
       added: isErr ? 0 : added,
       removed: isErr ? 0 : removed
@@ -552,9 +573,12 @@ function extractToolImagePreview(call: ToolExecutionRecord): string | null {
       if (typeof parsed?.previewUrl === 'string' && parsed.previewUrl) {
         return parsed.previewUrl;
       }
+      if (typeof parsed?.path === 'string' && /\.(png|jpg|jpeg|webp|gif|bmp)$/i.test(parsed.path)) {
+        try { return convertFileSrc(parsed.path); } catch {}
+      }
     } catch {}
   }
-  const p = typeof call.args?.path === 'string' ? call.args.path.trim() : '';
+  const p = typeof call.args?.path === 'string' ? call.args.path.trim() : (typeof call.args?.output_path === 'string' ? call.args.output_path.trim() : '');
   if (p && /\.(png|jpg|jpeg|webp|gif|bmp)$/i.test(p)) {
     try {
       return convertFileSrc(p);
@@ -563,12 +587,123 @@ function extractToolImagePreview(call: ToolExecutionRecord): string | null {
   return null;
 }
 
+function parseGenerateImage(call: ToolExecutionRecord): {
+  prompt: string;
+  dataUrl?: string;
+  path?: string;
+  model?: string;
+  aspectRatio?: string;
+  bytes?: number;
+} | null {
+  if (call.toolName !== 'generate_image') return null;
+  const prompt = String(call.args?.prompt || '');
+  let dataUrl: string | undefined;
+  let path: string | undefined = typeof call.args?.output_path === 'string' ? call.args.output_path : undefined;
+  let model: string | undefined = typeof call.args?.model === 'string' ? call.args.model : undefined;
+  let aspectRatio: string | undefined = typeof call.args?.aspect_ratio === 'string' ? call.args.aspect_ratio : undefined;
+  let bytes: number | undefined;
+
+  const raw = (call.output || '').trim();
+  if (raw.startsWith('{')) {
+    try {
+      const p = JSON.parse(raw);
+      if (p.dataUrl) dataUrl = p.dataUrl;
+      if (p.path) path = p.path;
+      if (p.model) model = p.model;
+      if (p.aspect_ratio || p.aspectRatio) aspectRatio = p.aspect_ratio || p.aspectRatio;
+      if (typeof p.bytes === 'number') bytes = p.bytes;
+    } catch {}
+  }
+  if (!dataUrl && path) {
+    try { dataUrl = convertFileSrc(path); } catch {}
+  }
+  return { prompt, dataUrl, path, model, aspectRatio, bytes };
+}
+
+function parseImageFile(call: ToolExecutionRecord): {
+  path: string;
+  dataUrl?: string;
+  bytes?: number;
+} | null {
+  const raw = (call.output || '').trim();
+  const filePath = String(call.args?.path || call.args?.Path || '');
+  const isImgPath = /\.(png|jpg|jpeg|webp|gif|bmp|svg)$/i.test(filePath);
+  if (raw.startsWith('{')) {
+    try {
+      const p = JSON.parse(raw);
+      if (p.kind === 'image' || (p.dataUrl && p.dataUrl.startsWith('data:image/'))) {
+        return {
+          path: p.path || filePath,
+          dataUrl: p.dataUrl || (filePath ? convertFileSrc(filePath) : undefined),
+          bytes: p.bytes
+        };
+      }
+    } catch {}
+  }
+  if (isImgPath) {
+    return {
+      path: filePath,
+      dataUrl: convertFileSrc(filePath)
+    };
+  }
+  return null;
+}
+
+function parseWriteFile(call: ToolExecutionRecord): {
+  filePath: string;
+  content?: string;
+  linesCount?: number;
+  ext: string;
+} | null {
+  if (call.toolName !== 'write_file') return null;
+  const filePath = String(call.args?.path || call.args?.Path || '');
+  const content = typeof call.args?.content === 'string' ? call.args.content : undefined;
+  const linesCount = content ? content.split('\n').length : undefined;
+  const ext = filePath.split(/[\\/]/).pop()?.split('.').pop()?.toLowerCase() || 'text';
+  return { filePath, content, linesCount, ext };
+}
+
+function parseReadFile(call: ToolExecutionRecord): {
+  filePath: string;
+  content?: string;
+  startLine?: number;
+  endLine?: number;
+  totalLines?: number;
+  ext: string;
+} | null {
+  if (call.toolName !== 'read_file') return null;
+  const filePath = String(call.args?.path || call.args?.Path || '');
+  if (/\.(png|jpg|jpeg|webp|gif|bmp|svg)$/i.test(filePath)) return null;
+  let content: string | undefined;
+  let startLine: number | undefined;
+  let endLine: number | undefined;
+  let totalLines: number | undefined;
+
+  const raw = (call.output || '').trim();
+  if (raw.startsWith('{')) {
+    try {
+      const p = JSON.parse(raw);
+      if (typeof p.content === 'string') content = p.content;
+      if (typeof p.startLine === 'number') startLine = p.startLine;
+      if (typeof p.endLine === 'number') endLine = p.endLine;
+      if (typeof p.totalLines === 'number') totalLines = p.totalLines;
+    } catch {}
+  }
+  if (!content && raw && !raw.startsWith('{')) {
+    content = raw;
+  }
+  const ext = filePath.split(/[\\/]/).pop()?.split('.').pop()?.toLowerCase() || 'text';
+  return { filePath, content, startLine, endLine, totalLines, ext };
+}
+
 function formatToolOutputReadable(call: ToolExecutionRecord): string {
   const raw = (call.output || '').trim();
   if (!raw) return '';
+  if (call.toolName === 'generate_image') return '';
   if (raw.startsWith('{') || raw.startsWith('[')) {
     try {
       const parsed = JSON.parse(raw);
+      if (parsed?.kind === 'image' || parsed?.dataUrl) return '';
       if (typeof parsed?.content === 'string') return parsed.content;
       if (typeof parsed?.output === 'string') return parsed.output;
       if (typeof parsed?.text === 'string') return parsed.text;
@@ -847,7 +982,7 @@ function toggleTool(id: string) {
                     {/if}
                   </span>
                   {#if info.added || info.removed}
-                    <span class="font-mono text-[11px] shrink-0 flex items-center gap-1">
+                    <span class="font-mono text-[11px] shrink-0 inline-flex items-center gap-1 leading-none self-center tabular-nums">
                       {#if info.added}<span class="text-[#4ADE80]">+{info.added}</span>{/if}
                       {#if info.removed}<span class="text-[#F87171]">-{info.removed}</span>{/if}
                     </span>
@@ -867,12 +1002,110 @@ function toggleTool(id: string) {
                 </button>
 
                 {#if expandedTools[call.toolCallId]}
-                  {@const toolImg = extractToolImagePreview(call)}
+                  {@const genImg = parseGenerateImage(call)}
+                  {@const imgFile = parseImageFile(call)}
+                  {@const writeFile = parseWriteFile(call)}
+                  {@const readFile = parseReadFile(call)}
+                  {@const toolImg = genImg?.dataUrl || imgFile?.dataUrl || extractToolImagePreview(call)}
                   <div transition:slide={{ duration: 150 }} class="mt-1 mb-1.5 pl-3 border-l border-white/[0.08] font-mono text-[11px] text-[#8E8E95] space-y-1.5 select-text">
-                    {#if toolImg}
+                    {#if genImg}
+                      <div class="rounded-[8px] border border-white/[0.08] bg-[#0E0E11] p-3 space-y-2.5">
+                        {#if genImg.dataUrl}
+                          <div class="flex justify-center p-2 rounded-[6px] bg-[#0A0A0C] border border-white/[0.04]">
+                            <img
+                              src={genImg.dataUrl}
+                              alt={genImg.prompt || 'Generated image'}
+                              class="rounded-[6px] border border-white/[0.08] max-h-80 w-auto object-contain shadow-md"
+                            />
+                          </div>
+                        {/if}
+                        {#if genImg.prompt}
+                          <div class="p-2.5 rounded-[6px] bg-[#141417] border border-white/[0.06] text-[12px] text-[#EDEDEF] font-sans italic leading-relaxed">
+                            "{genImg.prompt}"
+                          </div>
+                        {/if}
+                        <div class="flex flex-wrap items-center gap-2 text-[10.5px] font-mono">
+                          {#if genImg.aspectRatio}
+                            <span class="px-1.5 py-0.5 rounded-[4px] bg-white/[0.06] text-[#A3A3AA]">
+                              {genImg.aspectRatio}
+                            </span>
+                          {/if}
+                          {#if genImg.model}
+                            <span class="px-1.5 py-0.5 rounded-[4px] bg-[#8B5CF6]/15 text-[#DDD6FE]">
+                              {genImg.model}
+                            </span>
+                          {/if}
+                          {#if genImg.bytes}
+                            <span class="text-[#71717A]">
+                              {(genImg.bytes / 1024).toFixed(0)} KB
+                            </span>
+                          {/if}
+                          {#if genImg.path}
+                            <span class="text-[#A3A3AA] truncate max-w-xs" title={genImg.path}>
+                              {genImg.path}
+                            </span>
+                          {/if}
+                        </div>
+                      </div>
+                    {:else if imgFile}
+                      <div class="rounded-[8px] border border-white/[0.08] bg-[#0E0E11] p-3 space-y-2.5">
+                        {#if imgFile.dataUrl}
+                          <div class="flex justify-center p-2 rounded-[6px] bg-[#0A0A0C] border border-white/[0.04]">
+                            <img
+                              src={imgFile.dataUrl}
+                              alt={imgFile.path}
+                              class="rounded-[6px] border border-white/[0.08] max-h-80 w-auto object-contain shadow-md"
+                            />
+                          </div>
+                        {/if}
+                        <div class="flex items-center justify-between text-[11px] font-mono text-[#A3A3AA]">
+                          <span class="truncate">{imgFile.path}</span>
+                          {#if imgFile.bytes}
+                            <span class="shrink-0 text-[#71717A]">{(imgFile.bytes / 1024).toFixed(0)} KB</span>
+                          {/if}
+                        </div>
+                      </div>
+                    {:else if writeFile && writeFile.content}
+                      <div class="rounded-[8px] border border-white/[0.08] bg-[#0E0E11] overflow-hidden">
+                        <div class="px-3 py-1.5 border-b border-white/[0.06] flex items-center justify-between text-[11px]">
+                          <div class="flex items-center gap-2 truncate">
+                            <FileToolIcon name={writeFile.filePath} class="w-3.5 h-3.5" />
+                            <span class="text-[#EDEDEF] font-mono truncate">{writeFile.filePath}</span>
+                          </div>
+                          <span class="px-1.5 py-0.5 rounded-[4px] bg-white/[0.06] text-[#A3A3AA] font-mono text-[10px] shrink-0">
+                            {writeFile.linesCount} lines
+                          </span>
+                        </div>
+                        <div class="p-2 max-h-60 overflow-y-auto font-mono text-[11px] leading-relaxed bg-[#0A0A0C]">
+                          {#each writeFile.content.slice(0, 10000).split('\n') as line, li}
+                            <div class="flex gap-3 px-1 hover:bg-white/[0.02]">
+                              <span class="w-6 text-right text-[#52525B] select-none shrink-0">{li + 1}</span>
+                              <span class="text-[#D4D4D8] whitespace-pre-wrap break-all">{line || ' '}</span>
+                            </div>
+                          {/each}
+                        </div>
+                      </div>
+                    {:else if readFile && readFile.content}
+                      <div class="rounded-[8px] border border-white/[0.08] bg-[#0E0E11] overflow-hidden">
+                        <div class="px-3 py-1.5 border-b border-white/[0.06] flex items-center justify-between text-[11px]">
+                          <div class="flex items-center gap-2 truncate">
+                            <FileToolIcon name={readFile.filePath} class="w-3.5 h-3.5" />
+                            <span class="text-[#EDEDEF] font-mono truncate">{readFile.filePath}</span>
+                          </div>
+                          {#if readFile.totalLines}
+                            <span class="px-1.5 py-0.5 rounded-[4px] bg-white/[0.06] text-[#A3A3AA] font-mono text-[10px] shrink-0">
+                              {readFile.startLine && readFile.endLine ? `L${readFile.startLine}-${readFile.endLine} of ${readFile.totalLines}` : `${readFile.totalLines} lines`}
+                            </span>
+                          {/if}
+                        </div>
+                        <div class="p-2 max-h-60 overflow-y-auto font-mono text-[11px] leading-relaxed bg-[#0A0A0C]">
+                          <pre class="text-[#C4C4CA] whitespace-pre-wrap break-all">{readFile.content}</pre>
+                        </div>
+                      </div>
+                    {:else if toolImg}
                       <img
                         src={toolImg}
-                        alt="Captured target window"
+                        alt="Captured preview"
                         class="rounded-[6px] border border-white/[0.08] max-h-72 w-auto object-contain bg-[#0B0B0D]"
                       />
                     {/if}

@@ -41,7 +41,9 @@ export interface ToolExecutionRecord {
 const TOOL_ICONS: Record<string, string> = {
   write_file: 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6 M16 13H8 M16 17H8 M10 9H8',
   edit_file: 'M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7 M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z',
+  patch_file: 'M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7 M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z',
   read_file: 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6 M12 18v-6 M9 15l3 3 3-3',
+  generate_image: 'M12 2l2.4 6 6 2.4-6 2.4L12 19l-2.4-6.2L3.4 10.4l6.2-2.4L12 2z M19 16l1.2 3.2 3.2 1.2-3.2 1.2L19 24.8l-1.2-3.2-3.2-1.2 3.2-1.2L19 16z',
   list_directory: 'M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z',
   file_search: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z M21 21l-4.35-4.35',
   search_files: 'M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16z M21 21l-4.35-4.35',
@@ -100,7 +102,11 @@ const ACTION_NAMES: Record<string, string> = {
   subagent_builder: 'Subagent Builder',
   task_board: 'Task Board',
   tool_hub: 'Tool Hub',
-  computer_use: 'Computer Use'
+  computer_use: 'Computer Use',
+  generate_image: 'Generate Image',
+  patch_file: 'Patch File',
+  tg_send_file: 'Send Telegram File',
+  wait: 'Wait'
 };
 
 export function getActionName(toolName: string): string {
@@ -124,7 +130,11 @@ export function formatArgPreview(args: any, maxLen = 72): string {
   if (typeof args === 'string') {
     preview = args.trim();
   } else if (typeof args === 'object') {
-    if (args.path || args.Path) {
+    if (args.prompt) {
+      const p = String(args.prompt);
+      const ar = args.aspect_ratio ? ` (${args.aspect_ratio})` : '';
+      preview = `"${p}"${ar}`;
+    } else if (args.path || args.Path) {
       const p = String(args.path || args.Path);
       preview = p;
       if (args.line || args.StartLine) {
@@ -132,6 +142,8 @@ export function formatArgPreview(args: any, maxLen = 72): string {
       }
     } else if (args.command || args.CommandLine) {
       preview = String(args.command || args.CommandLine);
+    } else if (args.seconds !== undefined) {
+      preview = `${args.seconds}s${args.message ? ': ' + args.message : ''}`;
     } else if (args.action && (args.task_id || args.session_id)) {
       preview = `${args.action} ${args.task_id || args.session_id}`;
     } else if (args.action && (args.app || args.element_id || args.element_name || args.keys || args.window_title || args.process_name)) {

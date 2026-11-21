@@ -1,7 +1,8 @@
 <script lang="ts">
 import { onMount, tick } from 'svelte';
 import { Spring } from 'svelte/motion';
-import { fly, slide } from 'svelte/transition';
+import { fly, slide, scale } from 'svelte/transition';
+import { cubicOut } from 'svelte/easing';
 import Icon from './Icon.svelte';
 import FileToolIcon from './FileToolIcon.svelte';
 import { themeStore } from '../lib/stores/theme.svelte';
@@ -1153,13 +1154,16 @@ async function stopAndSendVoice() {
     </div>
   {:else}
     {#if attachments.length > 0}
-      <div class="mb-2 flex flex-wrap gap-1.5">
+      <div transition:slide={{ duration: 150 }} class="mb-2 flex flex-wrap gap-1.5">
         {#each attachments as att (att.id)}
-          <div class="flex items-center gap-2 pl-1.5 pr-2 py-1 rounded-[8px] bg-[#18181B] border border-white/[0.08] text-xs max-w-[220px]">
+          <div
+            transition:scale={{ duration: 160, start: 0.9, opacity: 0, easing: cubicOut }}
+            class="group/att flex items-center gap-2 pl-1.5 pr-2 py-1 rounded-[8px] bg-[#18181B] hover:bg-[#202024] border border-white/[0.08] hover:border-white/[0.16] text-xs max-w-[220px] transition-all duration-150"
+          >
             {#if att.kind === 'image' && att.previewUrl}
-              <img src={att.previewUrl} alt={att.name} class="w-7 h-7 rounded-[5px] object-cover shrink-0 bg-[#121214]" />
+              <img src={att.previewUrl} alt={att.name} class="w-7 h-7 rounded-[5px] object-cover shrink-0 bg-[#121214] border border-white/[0.06]" />
             {:else if att.kind === 'video' && att.previewUrl}
-              <video src={att.previewUrl} class="w-7 h-7 rounded-[5px] object-cover shrink-0 bg-[#121214]" muted></video>
+              <video src={att.previewUrl} class="w-7 h-7 rounded-[5px] object-cover shrink-0 bg-[#121214] border border-white/[0.06]" muted></video>
             {:else}
               <div class="w-7 h-7 rounded-[5px] bg-[#121214] border border-white/[0.06] flex items-center justify-center shrink-0">
                 <FileToolIcon name={att.name} class="w-4 h-4" />
@@ -1168,7 +1172,7 @@ async function stopAndSendVoice() {
             <span class="font-mono text-[11px] text-[#D4D4D8] truncate">{att.name}</span>
             <button
               type="button"
-              class="text-[#73737A] hover:text-[#EF4444] text-xs shrink-0 ml-0.5"
+              class="w-4 h-4 rounded-full flex items-center justify-center text-[#73737A] hover:text-[#EF4444] hover:bg-white/[0.08] text-xs shrink-0 ml-0.5 transition-colors"
               onclick={() => removeAttachment(att.id)}
               title="Remove"
             >

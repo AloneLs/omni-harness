@@ -18,6 +18,19 @@ pub struct WhisperModelInfo {
     pub size_bytes: u64,
     pub is_downloaded: bool,
     pub local_path: Option<String>,
+    pub is_downloading: bool,
+    pub download_progress: Option<u32>,
+    pub downloaded_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveWhisperDownload {
+    pub model_id: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub percent: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,6 +129,7 @@ pub struct SpeechEngine {
     current_model: Arc<RwLock<String>>,
     acceleration: Arc<RwLock<AccelerationMode>>,
     is_downloading: Arc<AtomicBool>,
+    active_download: Arc<std::sync::RwLock<Option<ActiveWhisperDownload>>>,
 }
 
 impl SpeechEngine {
@@ -134,6 +148,7 @@ impl SpeechEngine {
             current_model: Arc::new(RwLock::new("large-v3-turbo".to_string())),
             acceleration: Arc::new(RwLock::new(acceleration)),
             is_downloading: Arc::new(AtomicBool::new(false)),
+            active_download: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -142,6 +157,7 @@ impl SpeechEngine {
     }
 
     pub fn get_available_models(&self) -> Vec<WhisperModelInfo> {
+        let active = self.active_download.read().ok().and_then(|g| g.clone());
         let defs = [
             ("large-v3-turbo", "ggml-large-v3-turbo.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin", 1_620_000_000u64),
             ("large-v3", "ggml-large-v3.bin", "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin", 3_100_000_000u64),
@@ -152,6 +168,24 @@ impl SpeechEngine {
             .map(|(id, fname, url, sz)| {
                 let p = self.models_dir.join(fname);
                 let ok = Self::is_valid_weight_file(&p);
+                let is_active_dl = active.as_ref().map(|a| a.model_id == *id).unwrap_or(false);
+                let part_path = self.models_dir.join(format!("{}.part", fname));
+                let part_len = std::fs::metadata(&part_path).map(|m| m.len()).ok();
+                
+                let (dl_bytes, total_bytes, pct) = if let Some(ref a) = active {
+                    if a.model_id == *id {
+                        (Some(a.downloaded_bytes), Some(a.total_bytes), Some(a.percent))
+                    } else {
+                        (None, None, None)
+                    }
+                } else if self.is_downloading.load(Ordering::SeqCst) && part_len.is_some() {
+                    let dl = part_len.unwrap_or(0);
+                    let p = if *sz > 0 { ((dl as f64 / *sz as f64) * 100.0).round() as u32 } else { 0 };
+                    (Some(dl), Some(*sz), Some(p.min(100)))
+                } else {
+                    (None, None, None)
+                };
+
                 WhisperModelInfo {
                     model_id: (*id).to_string(),
                     filename: (*fname).to_string(),
@@ -159,6 +193,10 @@ impl SpeechEngine {
                     size_bytes: *sz,
                     is_downloaded: ok,
                     local_path: if ok { Some(p.to_string_lossy().to_string()) } else { None },
+                    is_downloading: is_active_dl || (self.is_downloading.load(Ordering::SeqCst) && part_len.is_some()),
+                    download_progress: pct,
+                    downloaded_bytes: dl_bytes,
+                    total_bytes,
                 }
             })
             .collect()
@@ -202,18 +240,36 @@ impl SpeechEngine {
         }
 
         self.is_downloading.store(true, Ordering::SeqCst);
-        let client = reqwest::Client::new();
+        let total_hint = target.size_bytes;
+        if let Ok(mut g) = self.active_download.write() {
+            *g = Some(ActiveWhisperDownload {
+                model_id: model_id.to_string(),
+                downloaded_bytes: 0,
+                total_bytes: total_hint,
+                percent: 0,
+            });
+        }
+
+        let mut builder = reqwest::Client::builder();
+        if let Some(sys_proxy) = crate::resolve_windows_system_proxy() {
+            if let Ok(px) = reqwest::Proxy::all(&sys_proxy) {
+                builder = builder.proxy(px);
+            }
+        }
+        let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
 
         let resp = match client.get(&target.download_url).send().await {
             Ok(r) => r,
             Err(e) => {
                 self.is_downloading.store(false, Ordering::SeqCst);
+                if let Ok(mut g) = self.active_download.write() { *g = None; }
                 return Err(format!("Download failed: {}", e));
             }
         };
 
         if !resp.status().is_success() {
             self.is_downloading.store(false, Ordering::SeqCst);
+            if let Ok(mut g) = self.active_download.write() { *g = None; }
             return Err(format!("HTTP error downloading model: {}", resp.status()));
         }
 
@@ -224,6 +280,7 @@ impl SpeechEngine {
             Ok(f) => f,
             Err(e) => {
                 self.is_downloading.store(false, Ordering::SeqCst);
+                if let Ok(mut g) = self.active_download.write() { *g = None; }
                 return Err(format!("Failed to create model file: {}", e));
             }
         };
@@ -236,15 +293,25 @@ impl SpeechEngine {
                 Ok(chunk) => {
                     if let Err(e) = file.write_all(&chunk).await {
                         self.is_downloading.store(false, Ordering::SeqCst);
+                        if let Ok(mut g) = self.active_download.write() { *g = None; }
                         return Err(format!("Failed to write chunk: {}", e));
                     }
                     downloaded += chunk.len() as u64;
+                    let pct = if total_size > 0 { ((downloaded as f64 / total_size as f64) * 100.0).round() as u32 } else { 0 };
+                    if let Ok(mut g) = self.active_download.write() {
+                        if let Some(ref mut ad) = *g {
+                            ad.downloaded_bytes = downloaded;
+                            ad.total_bytes = total_size;
+                            ad.percent = pct.min(100);
+                        }
+                    }
                     if let Some(tx) = &progress_tx {
                         let _ = tx.send((downloaded, total_size)).await;
                     }
                 }
                 Err(e) => {
                     self.is_downloading.store(false, Ordering::SeqCst);
+                    if let Ok(mut g) = self.active_download.write() { *g = None; }
                     return Err(format!("Stream error during model download: {}", e));
                 }
             }
@@ -255,10 +322,12 @@ impl SpeechEngine {
 
         if let Err(e) = tokio::fs::rename(&part_path, &dest_path).await {
             self.is_downloading.store(false, Ordering::SeqCst);
+            if let Ok(mut g) = self.active_download.write() { *g = None; }
             return Err(format!("Failed to finalize model file: {}", e));
         }
 
         self.is_downloading.store(false, Ordering::SeqCst);
+        if let Ok(mut g) = self.active_download.write() { *g = None; }
         Ok(dest_path)
     }
 
