@@ -13,21 +13,29 @@ fn sig_store() -> &'static Mutex<HashMap<String, String>> {
 }
 
 fn save_thought_sig(call_id: &str, sig: String) {
+    if sig.is_empty() {
+        return;
+    }
     if let Ok(mut map) = sig_store().lock() {
-        if map.len() > 2000 {
-            map.clear();
+        if map.len() > 5000 {
+            let keys_to_remove: Vec<String> = map.keys().take(2000).cloned().collect();
+            for k in keys_to_remove {
+                map.remove(&k);
+            }
         }
         map.insert(call_id.to_string(), sig);
     }
 }
 
-fn get_thought_sig(call_id: &str) -> String {
+fn get_thought_sig(call_id: &str) -> Option<String> {
     if let Ok(map) = sig_store().lock() {
         if let Some(sig) = map.get(call_id) {
-            return sig.clone();
+            if !sig.is_empty() {
+                return Some(sig.clone());
+            }
         }
     }
-    "skip_thought_signature_validator".to_string()
+    None
 }
 
 pub async fn stream_google_gemini(
@@ -78,14 +86,16 @@ pub async fn stream_google_gemini(
                         call_id_to_name.insert(tc.id.clone(), tc.function.name.clone());
                         let parsed_args: serde_json::Value =
                             serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
-                        let sig = get_thought_sig(&tc.id);
-                        parts.push(serde_json::json!({
+                        let mut part_val = serde_json::json!({
                             "functionCall": {
                                 "name": tc.function.name,
                                 "args": parsed_args,
-                            },
-                            "thoughtSignature": sig,
-                        }));
+                            }
+                        });
+                        if let Some(sig) = get_thought_sig(&tc.id) {
+                            part_val["thoughtSignature"] = serde_json::Value::String(sig);
+                        }
+                        parts.push(part_val);
                     }
                 }
                 if !parts.is_empty() {

@@ -13,21 +13,29 @@ fn sig_store() -> &'static Mutex<HashMap<String, String>> {
 }
 
 fn save_thought_sig(call_id: &str, sig: String) {
+    if sig.is_empty() {
+        return;
+    }
     if let Ok(mut map) = sig_store().lock() {
-        if map.len() > 2000 {
-            map.clear();
+        if map.len() > 5000 {
+            let keys_to_remove: Vec<String> = map.keys().take(2000).cloned().collect();
+            for k in keys_to_remove {
+                map.remove(&k);
+            }
         }
         map.insert(call_id.to_string(), sig);
     }
 }
 
-fn get_thought_sig(call_id: &str) -> String {
+fn get_thought_sig(call_id: &str) -> Option<String> {
     if let Ok(map) = sig_store().lock() {
         if let Some(sig) = map.get(call_id) {
-            return sig.clone();
+            if !sig.is_empty() {
+                return Some(sig.clone());
+            }
         }
     }
-    "skip_thought_signature_validator".to_string()
+    None
 }
 
 fn clean_schema_for_antigravity(val: &serde_json::Value) -> serde_json::Value {
@@ -137,14 +145,16 @@ pub async fn stream_antigravity(
                     call_id_to_name.insert(tc.id.clone(), tc.function.name.clone());
                     let parsed_args: serde_json::Value =
                         serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::json!({}));
-                    let sig = get_thought_sig(&tc.id);
-                    parts.push(serde_json::json!({
+                    let mut part_val = serde_json::json!({
                         "functionCall": {
                             "name": tc.function.name,
                             "args": parsed_args,
-                        },
-                        "thoughtSignature": sig,
-                    }));
+                        }
+                    });
+                    if let Some(sig) = get_thought_sig(&tc.id) {
+                        part_val["thoughtSignature"] = serde_json::Value::String(sig);
+                    }
+                    parts.push(part_val);
                 }
             }
             if !parts.is_empty() {
@@ -360,10 +370,14 @@ pub async fn stream_antigravity(
             _ => oauth_accounts::fetch_antigravity_project_id(client, &acc.access_token).await,
         };
 
+        let session_id = oauth_accounts::account_machine_session_id(&acc);
+        let mut inner_req_copy = inner_req.clone();
+        inner_req_copy["session_id"] = serde_json::json!(&session_id);
+
         let envelope = serde_json::json!({
             "project": project_id,
             "model": model_clean,
-            "request": inner_req,
+            "request": inner_req_copy,
             "requestType": "agent",
             "userAgent": "antigravity",
             "requestId": format!("agent-{}-{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8]),
@@ -379,7 +393,7 @@ pub async fn stream_antigravity(
             .header("User-Agent", oauth_accounts::antigravity_hub_ua())
             .header("X-Goog-Api-Client", oauth_accounts::antigravity_api_client())
             .header("Client-Metadata", oauth_accounts::antigravity_client_metadata())
-            .header("X-Machine-Session-Id", oauth_accounts::machine_session_id())
+            .header("X-Machine-Session-Id", &session_id)
             .header("X-Goog-Request-Reason", "user_initiated")
             .header("x-cloudaicompanion-trace-id", &trace_id);
         if !project_id.is_empty() {
@@ -412,7 +426,18 @@ pub async fn stream_antigravity(
             if let Ok(refreshed) = oauth_accounts::force_refresh_account(client, &acc.id).await {
                 acc = refreshed;
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let retry_session = oauth_accounts::account_machine_session_id(&acc);
                 let retry_trace = oauth_accounts::antigravity_trace_id();
+                let mut retry_inner = inner_req.clone();
+                retry_inner["session_id"] = serde_json::json!(&retry_session);
+                let retry_envelope = serde_json::json!({
+                    "project": project_id,
+                    "model": model_clean,
+                    "request": retry_inner,
+                    "requestType": "agent",
+                    "userAgent": "antigravity",
+                    "requestId": format!("agent-{}-{}", chrono::Utc::now().timestamp_millis(), &uuid::Uuid::new_v4().to_string()[..8]),
+                });
                 let mut retry_builder = client
                     .post(target_url)
                     .bearer_auth(&acc.access_token)
@@ -421,14 +446,14 @@ pub async fn stream_antigravity(
                     .header("User-Agent", oauth_accounts::antigravity_hub_ua())
                     .header("X-Goog-Api-Client", oauth_accounts::antigravity_api_client())
                     .header("Client-Metadata", oauth_accounts::antigravity_client_metadata())
-                    .header("X-Machine-Session-Id", oauth_accounts::machine_session_id())
+                    .header("X-Machine-Session-Id", &retry_session)
                     .header("X-Goog-Request-Reason", "user_initiated")
                     .header("x-cloudaicompanion-trace-id", &retry_trace);
                 if !project_id.is_empty() {
                     retry_builder = retry_builder.header("X-Goog-User-Project", &project_id);
                 }
                 if let Ok(r2) = retry_builder
-                    .json(&envelope)
+                    .json(&retry_envelope)
                     .send()
                     .await
                 {
@@ -565,6 +590,7 @@ async fn parse_antigravity_sse(
     let mut token_usage: Option<TokenUsage> = None;
     let mut finish_reason: Option<String> = None;
     let mut tool_idx: usize = 0;
+    let mut last_thought_sig: Option<String> = None;
 
     while let Some(chunk_res) = byte_stream.next().await {
         let chunk = match chunk_res {
@@ -630,11 +656,25 @@ async fn parse_antigravity_sse(
 
             if let Some(cands) = v.get("candidates").and_then(|c| c.as_array()) {
                 for cand in cands {
+                    if let Some(sig) = cand
+                        .get("thoughtSignature")
+                        .or_else(|| cand.get("thought_signature"))
+                        .and_then(|s| s.as_str())
+                    {
+                        last_thought_sig = Some(sig.to_string());
+                    }
                     if let Some(fr) = cand.get("finishReason").and_then(|f| f.as_str()) {
                         finish_reason = Some(fr.to_string());
                     }
                     if let Some(parts) = cand.get("content").and_then(|c| c.get("parts")).and_then(|p| p.as_array()) {
                         for part in parts {
+                            if let Some(sig) = part
+                                .get("thoughtSignature")
+                                .or_else(|| part.get("thought_signature"))
+                                .and_then(|s| s.as_str())
+                            {
+                                last_thought_sig = Some(sig.to_string());
+                            }
                             let is_thought = part.get("thought").and_then(|b| b.as_bool()).unwrap_or(false);
                             if let Some(txt) = part.get("text").and_then(|t| t.as_str()) {
                                 if !txt.is_empty() {
@@ -656,12 +696,16 @@ async fn parse_antigravity_sse(
                             if let Some(fc) = part.get("functionCall") {
                                 if let Some(fname) = fc.get("name").and_then(|n| n.as_str()) {
                                     let call_id = format!("ag_call_{}", uuid::Uuid::new_v4().simple());
-                                    if let Some(sig) = part
+                                    let sig_opt = part
                                         .get("thoughtSignature")
                                         .or_else(|| fc.get("thoughtSignature"))
+                                        .or_else(|| part.get("thought_signature"))
+                                        .or_else(|| fc.get("thought_signature"))
                                         .and_then(|s| s.as_str())
-                                    {
-                                        save_thought_sig(&call_id, sig.to_string());
+                                        .map(|s| s.to_string())
+                                        .or_else(|| last_thought_sig.clone());
+                                    if let Some(sig) = sig_opt {
+                                        save_thought_sig(&call_id, sig);
                                     }
                                     let args_str = fc
                                         .get("args")
@@ -732,8 +776,9 @@ pub async fn generate_antigravity_image(
         gen_cfg["imageConfig"] = serde_json::json!({ "aspectRatio": ar });
     }
 
+    let session_id = oauth_accounts::account_machine_session_id(&acc);
     let envelope = serde_json::json!({
-        "project": project_id,
+        "project": &project_id,
         "model": model_id,
         "request": {
             "contents": [{
@@ -741,7 +786,7 @@ pub async fn generate_antigravity_image(
                 "parts": [{ "text": prompt }]
             }],
             "generationConfig": gen_cfg,
-            "session_id": oauth_accounts::machine_session_id()
+            "session_id": &session_id
         },
         "requestType": "agent",
         "userAgent": "antigravity",
@@ -758,11 +803,11 @@ pub async fn generate_antigravity_image(
         .header("User-Agent", oauth_accounts::antigravity_hub_ua())
         .header("X-Goog-Api-Client", oauth_accounts::antigravity_api_client())
         .header("Client-Metadata", oauth_accounts::antigravity_client_metadata())
-        .header("X-Machine-Session-Id", oauth_accounts::machine_session_id())
+        .header("X-Machine-Session-Id", &session_id)
         .header("X-Goog-Request-Reason", "user_initiated")
         .header("x-cloudaicompanion-trace-id", &trace_id);
-    if let Some(ref pid) = acc.project_id.as_deref().filter(|s| !s.is_empty()) {
-        req_builder = req_builder.header("X-Goog-User-Project", *pid);
+    if !project_id.is_empty() {
+        req_builder = req_builder.header("X-Goog-User-Project", &project_id);
     }
     let resp = req_builder
         .json(&envelope)
