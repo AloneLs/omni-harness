@@ -481,7 +481,7 @@ function formatRelativeAge(timestamp: number): string {
         {#if uniqueProjectPaths.length > 0}
           <div class="my-2 border-t border-white/[0.07]"></div>
         {/if}
-        <div data-omni-standalone-header="" class="px-2 py-1 text-[11px] font-sans text-[#66666D]">Без проекта</div>
+        <div data-omni-standalone-header="" class="px-2 py-1 text-[11px] font-sans text-[#66666D]">{themeStore.t('no_project', 'No Project')}</div>
       {/if}
       <div class="space-y-0.5">
         {#each visibleStandaloneChats as chat (chat.id)}
@@ -613,28 +613,28 @@ function formatRelativeAge(timestamp: number): string {
       onclick={() => { if (projCtxMenu) workspaceStore.setWorkspaceDir(projCtxMenu.path); projCtxMenu = null; }}
       class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07]"
     >
-      Выбрать проект
+      Select project
     </button>
     <button
       type="button"
       onclick={() => { if (projCtxMenu) { workspaceStore.setWorkspaceDir(projCtxMenu.path); chatStore.createSession('', projCtxMenu.path); } projCtxMenu = null; }}
       class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07]"
     >
-      Новый чат в проекте
+      New task in project
     </button>
     <button
       type="button"
       onclick={() => { if (projCtxMenu) invoke('open_path_in_explorer', { path: projCtxMenu.path }).catch(() => {}); projCtxMenu = null; }}
       class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07]"
     >
-      Открыть в проводнике
+      Reveal in Explorer
     </button>
     <button
       type="button"
       onclick={() => { if (projCtxMenu) navigator.clipboard.writeText(projCtxMenu.path).catch(() => {}); projCtxMenu = null; }}
       class="w-full px-3 py-1.5 text-left hover:bg-white/[0.07]"
     >
-      Копировать путь
+      Copy path
     </button>
     <div class="my-1 border-t border-white/[0.06]"></div>
     <button
@@ -642,7 +642,7 @@ function formatRelativeAge(timestamp: number): string {
       onclick={() => { if (projCtxMenu) workspaceStore.removeRecentWorkspace(projCtxMenu.path); projCtxMenu = null; }}
       class="w-full px-3 py-1.5 text-left text-[#F87171] hover:bg-[#EF4444]/15"
     >
-      Удалить из списка
+      Remove from list
     </button>
   </div>
 {/if}

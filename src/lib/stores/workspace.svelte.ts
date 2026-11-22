@@ -108,8 +108,10 @@ class WorkspaceStore {
 
   public addRecentWorkspace(path: string): void {
     const norm = path.replace(/[\\/]+$/, '').toLowerCase();
-    const filtered = this.recentWorkspaces.filter((p) => p.replace(/[\\/]+$/, '').toLowerCase() !== norm);
-    const list = [path, ...filtered].slice(0, 15);
+    if (this.recentWorkspaces.some((p) => p.replace(/[\\/]+$/, '').toLowerCase() === norm)) {
+      return;
+    }
+    const list = [...this.recentWorkspaces, path].slice(0, 30);
     this.recentWorkspaces = list;
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem('omni_recent_workspaces', JSON.stringify(list));
