@@ -6,6 +6,7 @@ interface ComputerUsePolicy {
   stealthMode: boolean;
   autoStageOffscreen: boolean;
   drawVirtualCursor: boolean;
+  liveCursorOverlay: boolean;
   defaultWidth: number;
   defaultHeight: number;
 }
@@ -26,6 +27,7 @@ let policy = $state<ComputerUsePolicy>({
   stealthMode: true,
   autoStageOffscreen: true,
   drawVirtualCursor: true,
+  liveCursorOverlay: true,
   defaultWidth: 1280,
   defaultHeight: 820
 });
@@ -225,6 +227,23 @@ onMount(() => {
         class="w-9 h-5 rounded-full p-0.5 shrink-0 transition-colors {policy.drawVirtualCursor ? 'bg-[#8B5CF6]' : 'bg-[#27272A]'}"
       >
         <div class="w-4 h-4 rounded-full transition-transform {policy.drawVirtualCursor ? 'translate-x-4 bg-white' : 'translate-x-0 bg-[#73737A]'}"></div>
+      </button>
+    </div>
+
+    <div class="px-3.5 py-3 flex items-center justify-between gap-4">
+      <div>
+        <div class="text-xs font-medium text-[#EDEDEF]">Live Cursor Overlay</div>
+        <div class="text-[11px] text-[#73737A] mt-0.5">
+          Hardware-accelerated click-through agent cursor visualization with click ripple, key badges, and element hover effects.
+        </div>
+      </div>
+      <button
+        type="button"
+        aria-label="Toggle Live Cursor Overlay"
+        onclick={() => updatePolicy({ liveCursorOverlay: !policy.liveCursorOverlay })}
+        class="w-9 h-5 rounded-full p-0.5 shrink-0 transition-colors {policy.liveCursorOverlay ? 'bg-[#8B5CF6]' : 'bg-[#27272A]'}"
+      >
+        <div class="w-4 h-4 rounded-full transition-transform {policy.liveCursorOverlay ? 'translate-x-4 bg-white' : 'translate-x-0 bg-[#73737A]'}"></div>
       </button>
     </div>
 

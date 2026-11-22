@@ -371,8 +371,12 @@ function formatToolLabel(record: ToolExecutionRecord): { verb: string; target: s
     if (act === 'hotkey') {
       return { verb: 'Hotkey', target: String(record.args?.keys || '') };
     }
+    if (act === 'multi_actions' || record.toolName === 'multi_actions') {
+      const stepsCount = Array.isArray(record.args?.actions) ? record.args.actions.length : (Array.isArray(parsedOut?.steps) ? parsedOut.steps.length : 1);
+      return { verb: 'Multi Actions', target: `${stepsCount} action${stepsCount === 1 ? '' : 's'}` };
+    }
     if (act.includes('click') || act === 'drag' || act === 'scroll') {
-      return { verb: 'Ghost Input', target: `${act} (${record.args?.x ?? 500}, ${record.args?.y ?? 500})` };
+      return { verb: 'Input', target: `${act} (${record.args?.x ?? 500}, ${record.args?.y ?? 500})` };
     }
     if (act === 'restore_window' || act === 'show_window') {
       return { verb: 'Restored', target: String(parsedOut?.title || record.args?.window_title || 'window') };
@@ -421,7 +425,13 @@ interface ParsedComputerUseData {
     enabled?: boolean;
   }>;
   count?: number;
-  isGhostInput?: boolean;
+  isInput?: boolean;
+  isMultiActions?: boolean;
+  multiInfo?: {
+    steps: Array<any>;
+    count: number;
+    delayMs?: number;
+  };
   inputInfo?: {
     action: string;
     coords?: { norm_x?: number; norm_y?: number; win_x?: number; win_y?: number };
@@ -493,6 +503,19 @@ function parseComputerUse(call: ToolExecutionRecord): ParsedComputerUseData | nu
       };
     }
 
+    if (act === 'multi_actions' || call.toolName === 'multi_actions' || Array.isArray(p.steps) || Array.isArray(call.args?.actions)) {
+      const steps = Array.isArray(p.steps) ? p.steps : (Array.isArray(call.args?.actions) ? call.args.actions : []);
+      return {
+        action: 'multi_actions',
+        isMultiActions: true,
+        multiInfo: {
+          steps,
+          count: steps.length,
+          delayMs: p.delayMs ?? call.args?.delay_ms ?? 150
+        }
+      };
+    }
+
     if (
       act.includes('click') ||
       act === 'type' ||
@@ -504,7 +527,7 @@ function parseComputerUse(call: ToolExecutionRecord): ParsedComputerUseData | nu
     ) {
       return {
         action: act,
-        isGhostInput: true,
+        isInput: true,
         inputInfo: {
           action: act,
           coords: p.coords,
@@ -1258,7 +1281,32 @@ function toggleTool(id: string) {
                             <div class="p-3 text-[11px] text-[#71717A] italic">Элементы управления не найдены</div>
                           {/if}
                         </div>
-                      {:else if cu?.isGhostInput}
+                      {:else if cu?.isMultiActions}
+                        <div class="rounded-[6px] border border-white/[0.08] bg-[#0E0E11] p-2.5 flex flex-col gap-2 text-[11.5px]">
+                          <div class="flex items-center justify-between gap-2 border-b border-white/[0.06] pb-1.5">
+                            <span class="text-[#A855F7] font-medium font-sans flex items-center gap-1.5">
+                              <span class="w-1.5 h-1.5 rounded-full bg-[#A855F7]"></span>
+                              Batch: {cu.multiInfo?.count ?? 0} actions
+                            </span>
+                            {#if cu.multiInfo?.delayMs !== undefined}
+                              <span class="text-[#71717A] font-mono text-[10px]">{cu.multiInfo.delayMs}ms delay</span>
+                            {/if}
+                          </div>
+                          <div class="flex flex-wrap gap-1.5 pt-0.5">
+                            {#each (cu.multiInfo?.steps || []) as step, sIdx}
+                              <span class="px-2 py-0.5 rounded-[4px] bg-white/[0.05] border border-white/[0.06] font-mono text-[10.5px] text-[#EDEDEF] flex items-center gap-1">
+                                <span class="text-[#71717A] text-[9.5px]">#{sIdx + 1}</span>
+                                <span class="text-[#C084FC]">{step.action || step.action_name || 'step'}</span>
+                                {#if step.text}
+                                  <span class="text-[#A3A3AA] truncate max-w-[80px]">"{step.text}"</span>
+                                {:else if step.keys}
+                                  <span class="text-[#F59E0B]">[{step.keys}]</span>
+                                {/if}
+                              </span>
+                            {/each}
+                          </div>
+                        </div>
+                      {:else if cu?.isInput}
                         <div class="rounded-[6px] border border-white/[0.08] bg-[#0E0E11] p-2.5 flex items-center justify-between gap-3 text-[11.5px]">
                           <div class="flex items-center gap-2 min-w-0">
                             <span class="px-1.5 py-0.5 rounded-[4px] bg-white/[0.06] text-[#EDEDEF] font-mono text-[10.5px]">

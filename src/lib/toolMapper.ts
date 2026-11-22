@@ -65,6 +65,7 @@ const TOOL_ICONS: Record<string, string> = {
   memory_search: 'M12 2a9 9 0 0 0-9 9c0 3.87 2.45 7.17 5.92 8.41.45.08.62-.2.62-.43v-1.53c-2.42.53-2.93-1.17-2.93-1.17',
   rollback_snapshot: 'M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8 M3 3v5h5',
   computer_use: 'M2 4a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V4z M8 21h8 M12 17v4',
+  multi_actions: 'M4 6h16M4 12h10M4 18h7 M15 13l4 3-4 3',
   default: 'M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z'
 };
 
@@ -89,6 +90,7 @@ const ACTION_NAMES: Record<string, string> = {
   memory_save: 'Save System Memory',
   memory_search: 'Query Vector Memory',
   rollback_snapshot: 'Rollback File Snapshot',
+  multi_actions: 'Multi Actions',
   fs_ops: 'Filesystem Op',
   glob: 'Glob Search',
   grep: 'Grep Search',

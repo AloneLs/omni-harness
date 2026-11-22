@@ -11,6 +11,7 @@ pub struct ComputerUsePolicy {
     pub stealth_mode: bool,
     pub auto_stage_offscreen: bool,
     pub draw_virtual_cursor: bool,
+    pub live_cursor_overlay: bool,
     pub default_width: i32,
     pub default_height: i32,
 }
@@ -21,6 +22,7 @@ impl Default for ComputerUsePolicy {
             stealth_mode: true,
             auto_stage_offscreen: true,
             draw_virtual_cursor: true,
+            live_cursor_overlay: true,
             default_width: 1280,
             default_height: 820,
         }
@@ -110,8 +112,10 @@ fn persist_staged(staged: &HashMap<usize, StagedWindowRecord>) {
 
 fn state() -> &'static Mutex<PhantomState> {
     PHANTOM_STATE.get_or_init(|| {
+        let loaded_policy = load_saved_policy();
+        crate::tools::mouse_overlay::set_overlay_enabled(loaded_policy.live_cursor_overlay);
         let initial = PhantomState {
-            policy: load_saved_policy(),
+            policy: loaded_policy,
             chats: HashMap::new(),
             staged: HashMap::new(),
             isolated_desktop_ready: false,
@@ -158,6 +162,7 @@ pub fn get_policy() -> ComputerUsePolicy {
 pub fn set_policy(mut next: ComputerUsePolicy) -> ComputerUsePolicy {
     next.default_width = next.default_width.clamp(640, 3840);
     next.default_height = next.default_height.clamp(420, 2160);
+    crate::tools::mouse_overlay::set_overlay_enabled(next.live_cursor_overlay);
     if let Ok(mut g) = state().lock() {
         g.policy = next.clone();
     }

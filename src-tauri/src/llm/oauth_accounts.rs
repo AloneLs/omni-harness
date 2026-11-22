@@ -959,16 +959,34 @@ fn is_quota_exhausted_for_now(a: &OAuthAccount, now: i64) -> bool {
     q5_dead || q7_dead
 }
 
+fn strip_model_suffix(s: &str) -> &str {
+    for suf in &[
+        "-high", "-medium", "-med", "-low", "-thinking", "-reasoning", "-off", "-none",
+    ] {
+        if let Some(stripped) = s.strip_suffix(suf) {
+            return stripped;
+        }
+    }
+    s
+}
+
 fn account_supports_model(acc: &OAuthAccount, requested_model: Option<&str>) -> bool {
     let Some(raw_m) = requested_model.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
         return true;
     };
     let clean = raw_m.strip_prefix("models/").unwrap_or(raw_m).to_ascii_lowercase();
+    let clean_base = strip_model_suffix(&clean);
     if let Some(ref allowed) = acc.allowed_models {
         if !allowed.is_empty() {
             let found = allowed.iter().any(|m| {
                 let mc = m.trim().strip_prefix("models/").unwrap_or(m.trim()).to_ascii_lowercase();
-                mc == clean || clean.ends_with(&format!("/{}", mc)) || mc.ends_with(&format!("/{}", clean))
+                let mc_base = strip_model_suffix(&mc);
+                mc == clean
+                    || clean.ends_with(&format!("/{}", mc))
+                    || mc.ends_with(&format!("/{}", clean))
+                    || mc.starts_with(&clean)
+                    || clean.starts_with(&mc)
+                    || mc_base == clean_base
             });
             if !found {
                 return false;

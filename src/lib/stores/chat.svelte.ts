@@ -124,6 +124,7 @@ export interface InlineReviewComment {
 
 class ChatStore {
   sessions = $state<ChatSession[]>([]);
+  draftSession = $state<ChatSession | null>(null);
   activeChatId = $state<string | null>(null);
   messagesByChat = $state<Record<string, ChatMessage[]>>({});
   streamingChats = $state<Record<string, boolean>>({});
@@ -506,6 +507,12 @@ class ChatStore {
 
   public setSessionModel(providerId: string, modelId: string, targetChatId?: string): void {
     const cid = targetChatId || this.activeChatId;
+    if (this.draftSession && (!cid || cid === this.draftSession.id)) {
+      this.draftSession.providerId = providerId;
+      this.draftSession.modelId = modelId;
+    }
+    settingsStore.setProvider(providerId);
+    settingsStore.setModel(modelId);
     if (!cid) return;
     const sess = this.sessions.find((s) => s.id === cid);
     if (sess) {
@@ -1881,13 +1888,19 @@ class ChatStore {
   }
 
   private async runAssistantStream(chatId: string, prompt: string, forceExecute = false): Promise<void> {
+    const sess = this.sessions.find((s) => s.id === chatId) || (this.draftSession?.id === chatId ? this.draftSession : null);
+    const rawProv = sess?.providerId ? settingsStore.data.providers[sess.providerId] : null;
+    const prov = rawProv && rawProv.enabled !== false ? rawProv : settingsStore.currentProvider;
+    const rawTargetModel = sess?.modelId || settingsStore.data.activeModel;
+    const targetModel = resolveValidModelForProvider(prov, rawTargetModel);
+
     const assistantMsgId = `asst-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
     const assistantMessage: ChatMessage = {
       id: assistantMsgId,
       chatId,
       role: 'assistant',
       content: '',
-      modelId: settingsStore.data.activeModel || undefined,
+      modelId: targetModel || settingsStore.data.activeModel || undefined,
       reasoningContent: '',
       toolCalls: [],
       steps: [],
@@ -2251,11 +2264,8 @@ class ChatStore {
     targetMsg.streaming = true;
     targetMsg.statusText = 'Resuming';
     targetMsg.retryReason = undefined;
-    targetMsg.modelId = settingsStore.data.activeModel || targetMsg.modelId;
-    targetMsg.startedAt = Date.now() - prevElapsed;
-    targetMsg.finishedAt = undefined;
-
-    const currentSession = this.sessions.find((s) => s.id === chatId);
+    const currentSession = this.sessions.find((s) => s.id === chatId) || (this.draftSession?.id === chatId ? this.draftSession : null);
+    targetMsg.modelId = targetMsg.modelId || currentSession?.modelId || settingsStore.data.activeModel;
     if (currentSession) {
       currentSession.hasError = false;
       currentSession.isPaused = false;
@@ -2265,7 +2275,7 @@ class ChatStore {
     this.activeStreamMsgIdByChat[chatId] = targetMsg.id;
     this.streamingChats[chatId] = true;
     this.streamTokenCountByChat[chatId] = 0;
-    const startTime = targetMsg.startedAt;
+    const startTime = targetMsg.startedAt ?? Date.now();
     if (this.reasoningTimers[chatId]) {
       clearInterval(this.reasoningTimers[chatId]);
     }
@@ -2758,7 +2768,8 @@ class ChatStore {
       currentAssistantMsg.finishedAt = Date.now();
       currentAssistantMsg.statusText = undefined;
       currentAssistantMsg.retryReason = undefined;
-      currentAssistantMsg.modelId = settingsStore.data.activeModel || currentAssistantMsg.modelId;
+      const sessForDone = this.sessions.find((s) => s.id === cid) || (this.draftSession?.id === cid ? this.draftSession : null);
+      currentAssistantMsg.modelId = currentAssistantMsg.modelId || sessForDone?.modelId || settingsStore.data.activeModel;
       currentAssistantMsg.streaming = false;
       currentAssistantMsg.paused = false;
       this.finalizeRunningTools(currentAssistantMsg, 'success');

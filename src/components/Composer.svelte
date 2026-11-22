@@ -53,12 +53,110 @@ let loadedSkills = $state<{ name: string; command: string; desc: string }[]>([])
 let lastSkillsRefreshAt = 0;
 let oauthAccounts = $state<ComposerOAuthAccount[]>([]);
 
+let modelPopupHighlightIdx = $state<number>(0);
+let modelSearchInputEl = $state<HTMLInputElement | null>(null);
+let modelListContainerEl = $state<HTMLDivElement | null>(null);
+
+let projectPopupHighlightIdx = $state<number>(0);
+let projectListContainerEl = $state<HTMLDivElement | null>(null);
+
+function scrollModelItemIntoView(idx: number) {
+  if (!modelListContainerEl) return;
+  const buttons = modelListContainerEl.querySelectorAll<HTMLButtonElement>('button[data-model-item]');
+  const btn = buttons[idx];
+  if (btn) {
+    btn.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function selectModelItem(item: { providerId: string; model: string; rawIdSet?: Set<string> }) {
+  const prev = displayActiveModel;
+  chatStore.setSessionModel(item.providerId, item.model);
+  settingsStore.setProvider(item.providerId);
+  settingsStore.setModel(item.model);
+  if (prev && prev !== item.model) {
+    chatStore.recordModelChanged(item.model);
+  }
+  closeAllPopups();
+}
+
+function handleModelPopupKeyDown(e: KeyboardEvent) {
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (filteredAvailableModels.length > 0) {
+      modelPopupHighlightIdx = Math.min(modelPopupHighlightIdx + 1, filteredAvailableModels.length - 1);
+      scrollModelItemIntoView(modelPopupHighlightIdx);
+    }
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (filteredAvailableModels.length > 0) {
+      modelPopupHighlightIdx = Math.max(modelPopupHighlightIdx - 1, 0);
+      scrollModelItemIntoView(modelPopupHighlightIdx);
+    }
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    const item = filteredAvailableModels[modelPopupHighlightIdx];
+    if (item) {
+      selectModelItem(item);
+    }
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    closeAllPopups();
+  }
+}
+
+function scrollProjectItemIntoView(idx: number) {
+  if (!projectListContainerEl) return;
+  const buttons = projectListContainerEl.querySelectorAll<HTMLButtonElement>('button[data-project-item]');
+  const btn = buttons[idx];
+  if (btn) {
+    btn.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function handleProjectPopupKeyDown(e: KeyboardEvent) {
+  const total = 1 + workspaceStore.recentWorkspaces.length + 1;
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    projectPopupHighlightIdx = Math.min(projectPopupHighlightIdx + 1, total - 1);
+    scrollProjectItemIntoView(projectPopupHighlightIdx);
+  } else if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    projectPopupHighlightIdx = Math.max(projectPopupHighlightIdx - 1, 0);
+    scrollProjectItemIntoView(projectPopupHighlightIdx);
+  } else if (e.key === 'Enter') {
+    e.preventDefault();
+    if (projectPopupHighlightIdx === 0) {
+      workspaceStore.clearWorkspace();
+      chatStore.setActiveSessionProject('');
+      closeAllPopups();
+    } else if (projectPopupHighlightIdx <= workspaceStore.recentWorkspaces.length) {
+      const p = workspaceStore.recentWorkspaces[projectPopupHighlightIdx - 1];
+      if (p) {
+        workspaceStore.setWorkspaceDir(p);
+        chatStore.setActiveSessionProject(p);
+      }
+      closeAllPopups();
+    } else {
+      closeAllPopups();
+      void workspaceStore.openDirectoryPicker().then((picked) => {
+        if (picked) chatStore.setActiveSessionProject(picked);
+      });
+    }
+  } else if (e.key === 'Escape') {
+    e.preventDefault();
+    closeAllPopups();
+  }
+}
+
 function handleModelPopupSearchInput(e: Event) {
   modelPopupSearch = (e.currentTarget as HTMLInputElement).value;
+  modelPopupHighlightIdx = 0;
   if (modelPopupSearchTimer) clearTimeout(modelPopupSearchTimer);
   modelPopupSearchTimer = setTimeout(() => {
     debouncedModelPopupSearch = modelPopupSearch.trim().toLowerCase();
     visibleModelsLimit = 60;
+    modelPopupHighlightIdx = 0;
   }, 150);
 }
 
@@ -1338,6 +1436,11 @@ async function stopAndSendVoice() {
                   const next = !showProjectPopup;
                   closeAllPopups();
                   showProjectPopup = next;
+                  if (next) {
+                    const curIdx = workspaceStore.recentWorkspaces.indexOf(workspaceStore.currentPath);
+                    projectPopupHighlightIdx = curIdx >= 0 ? curIdx + 1 : 0;
+                    setTimeout(() => scrollProjectItemIntoView(projectPopupHighlightIdx), 20);
+                  }
                 }}
                 title={workspaceStore.currentPath || 'No project (Full PC)'}
                 use:attachPressScale
@@ -1349,12 +1452,16 @@ async function stopAndSendVoice() {
 
               {#if showProjectPopup}
                 <div
-                  class="absolute bottom-full mb-2 right-0 w-64 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-1.5 z-50 text-xs space-y-1 shadow-2xl"
+                  bind:this={projectListContainerEl}
+                  onkeydown={handleProjectPopupKeyDown}
+                  tabindex="-1"
+                  class="absolute bottom-full mb-2 right-0 w-64 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-1.5 z-50 text-xs space-y-1 shadow-2xl outline-none"
                 >
                   <div class="px-2 py-0.5 font-mono text-[10px] text-[#66666D] uppercase tracking-wider">Workspace / Project</div>
                   <button
                     type="button"
-                    class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {!workspaceStore.currentPath ? 'bg-white/[0.08] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.05] hover:text-white'}"
+                    data-project-item=""
+                    class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {projectPopupHighlightIdx === 0 ? 'bg-white/[0.12] text-white ring-1 ring-white/20' : !workspaceStore.currentPath ? 'bg-white/[0.08] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.05] hover:text-white'}"
                     onclick={() => {
                       workspaceStore.clearWorkspace();
                       chatStore.setActiveSessionProject('');
@@ -1369,10 +1476,12 @@ async function stopAndSendVoice() {
 
                   {#if workspaceStore.recentWorkspaces.length > 0}
                     <div class="max-h-40 overflow-y-auto space-y-0.5 border-t border-white/[0.06] pt-1">
-                      {#each workspaceStore.recentWorkspaces as path}
+                      {#each workspaceStore.recentWorkspaces as path, pIdx}
+                        {@const itemIdx = pIdx + 1}
                         <button
                           type="button"
-                          class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between gap-2 transition-colors {workspaceStore.currentPath === path ? 'bg-white/[0.08] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.05] hover:text-white'}"
+                          data-project-item=""
+                          class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between gap-2 transition-colors {projectPopupHighlightIdx === itemIdx ? 'bg-white/[0.12] text-white ring-1 ring-white/20' : workspaceStore.currentPath === path ? 'bg-white/[0.08] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.05] hover:text-white'}"
                           onclick={() => {
                             workspaceStore.setWorkspaceDir(path);
                             chatStore.setActiveSessionProject(path);
@@ -1391,7 +1500,8 @@ async function stopAndSendVoice() {
 
                   <button
                     type="button"
-                    class="w-full px-2.5 py-1.5 border-t border-white/[0.06] pt-1.5 rounded-[4px] text-left text-xs text-[#D4D4D8] hover:bg-white/[0.05] flex items-center justify-between transition-colors"
+                    data-project-item=""
+                    class="w-full px-2.5 py-1.5 border-t border-white/[0.06] pt-1.5 rounded-[4px] text-left text-xs {projectPopupHighlightIdx === 1 + workspaceStore.recentWorkspaces.length ? 'bg-white/[0.12] text-white ring-1 ring-white/20' : 'text-[#D4D4D8] hover:bg-white/[0.05]'} flex items-center justify-between transition-colors"
                     onclick={async () => {
                       closeAllPopups();
                       const picked = await workspaceStore.openDirectoryPicker();
@@ -1438,7 +1548,17 @@ async function stopAndSendVoice() {
                 const next = !showModelPopup;
                 closeAllPopups();
                 showModelPopup = next;
-                if (next) refreshOAuthTiers();
+                if (next) {
+                  refreshOAuthTiers();
+                  const curIdx = filteredAvailableModels.findIndex(
+                    (item) => item.providerId === currentProviderId && (displayActiveModel === item.model || item.rawIdSet.has(currentModelId))
+                  );
+                  modelPopupHighlightIdx = curIdx >= 0 ? curIdx : 0;
+                  setTimeout(() => {
+                    modelSearchInputEl?.focus();
+                    scrollModelItemIntoView(modelPopupHighlightIdx);
+                  }, 20);
+                }
               }}
               data-omni-model-btn=""
               title="Model & Reasoning"
@@ -1455,7 +1575,9 @@ async function stopAndSendVoice() {
               {@const popupProv = settingsStore.data.providers[popupProviderId] || enabledProviders[0]}
               {@const popupTier = providerTierLabel(popupProv)}
               <div
-                class="absolute bottom-full mb-2 right-0 w-72 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-3 z-50 text-xs space-y-3 shadow-2xl"
+                onkeydown={handleModelPopupKeyDown}
+                tabindex="-1"
+                class="absolute bottom-full mb-2 right-0 w-72 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-3 z-50 text-xs space-y-3 shadow-2xl outline-none"
               >
                 <div class="space-y-2">
                   <div class="flex items-center justify-between gap-2 px-1">
@@ -1516,27 +1638,27 @@ async function stopAndSendVoice() {
                   {:else}
                     {#if availableModels.length > 10}
                       <input
+                        bind:this={modelSearchInputEl}
                         value={modelPopupSearch}
                         oninput={handleModelPopupSearchInput}
+                        onkeydown={handleModelPopupKeyDown}
                         type="text"
                         placeholder="Filter models ({availableModels.length})..."
-                        class="w-full px-2 py-1 rounded-[4px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#55555C] outline-none"
+                        class="w-full px-2 py-1 rounded-[4px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-white/30"
                       />
                     {/if}
-                    <div class="max-h-40 overflow-y-auto space-y-0.5">
-                      {#each filteredAvailableModels.slice(0, visibleModelsLimit) as item (item.model)}
+                    <div
+                      bind:this={modelListContainerEl}
+                      class="max-h-40 overflow-y-auto space-y-0.5"
+                    >
+                      {#each filteredAvailableModels.slice(0, visibleModelsLimit) as item, mIdx (item.model)}
                         {@const isSelected = currentProviderId === item.providerId && (displayActiveModel === item.model || item.rawIdSet.has(currentModelId))}
+                        {@const isHighlighted = modelPopupHighlightIdx === mIdx}
                         <button
                           type="button"
-                          class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {isSelected ? 'bg-white/[0.09] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.04] hover:text-white'}"
-                          onclick={() => {
-                            const prev = displayActiveModel;
-                            chatStore.setSessionModel(item.providerId, item.model);
-                            if (prev && prev !== item.model) {
-                              chatStore.recordModelChanged(item.model);
-                            }
-                            closeAllPopups();
-                          }}
+                          data-model-item=""
+                          class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {isHighlighted ? 'bg-white/[0.14] text-white ring-1 ring-white/20' : isSelected ? 'bg-white/[0.09] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.04] hover:text-white'}"
+                          onclick={() => selectModelItem(item)}
                         >
                           <span class="truncate">{item.model}</span>
                         </button>

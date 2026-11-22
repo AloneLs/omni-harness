@@ -498,10 +498,19 @@ fn handle_mouse_on_worker(
 
         match action {
             "move" => {
+                crate::tools::mouse_overlay::notify_move(root, rel_x, rel_y, None);
                 win_msg::PostMessageW(ch, win_msg::WM_MOUSEMOVE, 0, client_lp);
                 phantom_session::update_virtual_cursor(chat_id, root, rel_x, rel_y);
             }
             "click" => {
+                crate::tools::mouse_overlay::notify_click(
+                    root,
+                    rel_x,
+                    rel_y,
+                    crate::tools::mouse_overlay::ClickVisualKind::Left,
+                    "Click",
+                    None,
+                );
                 let _ = win_msg::SendMessageTimeoutW(
                     ch,
                     win_msg::WM_SETCURSOR,
@@ -518,6 +527,14 @@ fn handle_mouse_on_worker(
                 phantom_session::update_virtual_cursor(chat_id, root, rel_x, rel_y);
             }
             "double_click" => {
+                crate::tools::mouse_overlay::notify_click(
+                    root,
+                    rel_x,
+                    rel_y,
+                    crate::tools::mouse_overlay::ClickVisualKind::Double,
+                    "Double Click",
+                    None,
+                );
                 win_msg::PostMessageW(ch, win_msg::WM_MOUSEMOVE, 0, client_lp);
                 win_msg::PostMessageW(ch, win_msg::WM_LBUTTONDOWN, win_msg::MK_LBUTTON, client_lp);
                 win_msg::PostMessageW(ch, win_msg::WM_LBUTTONUP, 0, client_lp);
@@ -528,6 +545,14 @@ fn handle_mouse_on_worker(
                 phantom_session::update_virtual_cursor(chat_id, root, rel_x, rel_y);
             }
             "right_click" => {
+                crate::tools::mouse_overlay::notify_click(
+                    root,
+                    rel_x,
+                    rel_y,
+                    crate::tools::mouse_overlay::ClickVisualKind::Right,
+                    "Context",
+                    None,
+                );
                 win_msg::PostMessageW(ch, win_msg::WM_MOUSEMOVE, 0, client_lp);
                 win_msg::PostMessageW(ch, win_msg::WM_RBUTTONDOWN, win_msg::MK_RBUTTON, client_lp);
                 std::thread::sleep(std::time::Duration::from_millis(18));
@@ -536,6 +561,14 @@ fn handle_mouse_on_worker(
                 phantom_session::update_virtual_cursor(chat_id, root, rel_x, rel_y);
             }
             "middle_click" => {
+                crate::tools::mouse_overlay::notify_click(
+                    root,
+                    rel_x,
+                    rel_y,
+                    crate::tools::mouse_overlay::ClickVisualKind::Middle,
+                    "Middle Click",
+                    None,
+                );
                 win_msg::PostMessageW(ch, win_msg::WM_MOUSEMOVE, 0, client_lp);
                 win_msg::PostMessageW(ch, win_msg::WM_MBUTTONDOWN, win_msg::MK_MBUTTON, client_lp);
                 std::thread::sleep(std::time::Duration::from_millis(18));
@@ -564,6 +597,15 @@ fn handle_mouse_on_worker(
                     to_y.unwrap_or(y),
                     normalized,
                 );
+                crate::tools::mouse_overlay::notify_click(
+                    root,
+                    rel_x,
+                    rel_y,
+                    crate::tools::mouse_overlay::ClickVisualKind::Left,
+                    "Drag",
+                    None,
+                );
+                crate::tools::mouse_overlay::notify_move(root, end_rel_x, end_rel_y, None);
                 let mut end_pt = win_msg::POINT { x: ex, y: ey };
                 win_msg::ScreenToClient(ch, &mut end_pt);
                 win_msg::PostMessageW(ch, win_msg::WM_MOUSEMOVE, 0, client_lp);
@@ -593,7 +635,7 @@ fn handle_mouse_on_worker(
 
         Ok(json!({
             "action": action,
-            "mode": "ghost_message",
+            "mode": "window_message",
             "hwnd": root,
             "targetChildHwnd": child_hwnd,
             "windowTitle": win_info.title,
@@ -664,6 +706,7 @@ fn handle_type_on_worker(
             win_info.bounds.y + vy,
         );
         send_background_activation_hint(root, child_hwnd)?;
+        crate::tools::mouse_overlay::notify_type(root, vx, vy, text, None);
 
         let ch = child_hwnd as win_msg::HWND;
         if clear_first {
@@ -728,7 +771,7 @@ fn handle_type_on_worker(
         }
 
         Ok(json!({
-            "mode": "ghost_wm_char",
+            "mode": "window_wm_char",
             "hwnd": root,
             "targetChildHwnd": child_hwnd,
             "typedChars": text.chars().count(),
@@ -739,7 +782,7 @@ fn handle_type_on_worker(
     #[cfg(not(windows))]
     {
         let _ = (chat_id, root_hwnd, explicit_child, text, clear_first, submit_enter);
-        Err("Ghost text input is only supported on Windows.".to_string())
+        Err("Window-relative text input is only supported on Windows.".to_string())
     }
 }
 
@@ -852,6 +895,7 @@ fn handle_hotkey_on_worker(
             win_info.bounds.y + vy,
         );
         let (target_tid, is_background) = send_background_activation_hint(root, child_hwnd)?;
+        crate::tools::mouse_overlay::notify_hotkey(root, vx, vy, combo, None);
 
         let ch = child_hwnd as win_msg::HWND;
         let worker_tid = win_msg::GetCurrentThreadId();
@@ -960,7 +1004,7 @@ fn handle_hotkey_on_worker(
 
         Ok(json!({
             "hotkey": combo,
-            "mode": "ghost_key_message",
+            "mode": "window_key_message",
             "hwnd": root,
             "targetChildHwnd": child_hwnd,
             "offscreen": win_info.is_offscreen,
@@ -969,6 +1013,6 @@ fn handle_hotkey_on_worker(
     #[cfg(not(windows))]
     {
         let _ = (chat_id, root_hwnd, combo);
-        Err("Ghost hotkey input is only supported on Windows.".to_string())
+        Err("Window-relative hotkey input is only supported on Windows.".to_string())
     }
 }

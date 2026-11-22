@@ -3,6 +3,7 @@ pub mod desktop_uia;
 pub mod edit_cascade;
 pub mod ghost_input;
 pub mod github;
+pub mod mouse_overlay;
 pub mod path_norm;
 pub mod phantom_session;
 pub mod process_pty;
@@ -602,11 +603,13 @@ impl ToolDispatcher {
 
         declarations.push(make_decl(
             "computer_use",
-            "Non-intrusive background Windows Computer Use (zero cursor theft, zero focus theft, off-screen staging). Bind or launch a target window first, then inspect/act via COM UIAutomation (snapshot_ui / uia_action) or window-relative ghost input (screenshot, click, double_click, right_click, drag, scroll, type, hotkey). Normalized 0..1000 coordinates are relative to the bound target window.",
+            "Non-intrusive background Windows Computer Use (zero cursor theft, zero focus theft, off-screen staging). Bind or launch a target window first, then inspect/act via COM UIAutomation (snapshot_ui / uia_action) or window-relative input (screenshot, click, double_click, right_click, drag, scroll, type, hotkey, multi_actions). Normalized 0..1000 coordinates are relative to the bound target window.",
             &[
-                ("action", "string", "list_windows | launch_app | bind_window | restore_window | close_window | screenshot | snapshot_ui | uia_action | click | double_click | right_click | middle_click | move | drag | scroll | hscroll | type | hotkey | wait | web_targets | web_open | web_dom | web_click | web_type | web_scroll | web_wait | web_eval | web_screenshot"),
+                ("action", "string", "list_windows | launch_app | bind_window | restore_window | close_window | screenshot | snapshot_ui | uia_action | click | double_click | right_click | middle_click | move | drag | scroll | hscroll | type | hotkey | wait | multi_actions | web_targets | web_open | web_dom | web_click | web_type | web_scroll | web_wait | web_eval | web_screenshot"),
                 ("app", "string", "Executable name or path for launch_app (e.g. 'notepad', 'calc', 'C:\\\\path\\\\app.exe')"),
                 ("args", "array", "Optional CLI arguments array for launch_app"),
+                ("actions", "array", "Array of up to 10 sequential action objects for multi_actions: [{ action: 'click'|'double_click'|'right_click'|'move'|'drag'|'scroll'|'type'|'hotkey'|'wait', x, y, to_x, to_y, text, keys, delta, wait_ms, clear_first, submit_enter }]"),
+                ("delay_ms", "integer", "Delay in milliseconds between actions for multi_actions (default 150ms)"),
                 ("window_title", "string", "Window title substring filter for bind_window / list_windows / snapshot_ui"),
                 ("process_name", "string", "Process name filter (e.g. 'notepad', 'chrome', 'Code')"),
                 ("hwnd", "integer", "Target window handle"),
@@ -634,6 +637,20 @@ impl ToolDispatcher {
                 ("wait_ms", "integer", "Milliseconds to wait (for action='wait' or settle delay before auto_screenshot)"),
             ],
             &["action"],
+        ));
+
+        declarations.push(make_decl(
+            "multi_actions",
+            "Execute up to 10 sequential desktop/mouse/keyboard actions in a single batch with configurable delay (delay_ms) between actions without waiting for separate model turns.",
+            &[
+                ("actions", "array", "Array of up to 10 action objects: [{ action: 'click'|'double_click'|'right_click'|'middle_click'|'move'|'drag'|'scroll'|'type'|'hotkey'|'wait', x, y, to_x, to_y, text, keys, delta, wait_ms, clear_first, submit_enter }]"),
+                ("delay_ms", "integer", "Delay in milliseconds between actions (default 150ms, 0..5000)"),
+                ("hwnd", "integer", "Target window handle"),
+                ("window_title", "string", "Target window title substring filter"),
+                ("process_name", "string", "Target process name filter"),
+                ("auto_screenshot", "boolean", "Automatically capture updated target window screenshot after completion (default false)"),
+            ],
+            &["actions"],
         ));
 
         declarations.push(make_decl(
@@ -1425,6 +1442,18 @@ impl ToolDispatcher {
                 .await
                 .map_err(|e| e.to_string())?
             }
+            "multi_actions" => {
+                if plan_mode {
+                    return Err("Plan Mode: multi_actions is blocked in read-only Plan mode.".to_string());
+                }
+                let args_cloned = args.clone();
+                let cid_owned = chat_id.map(|s| s.to_string());
+                tokio::task::spawn_blocking(move || {
+                    execute_multi_actions_blocking(&args_cloned, cid_owned.as_deref())
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            }
             "tool_hub" => {
                 let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("list_skills");
                 let loaded = crate::skills::discover_all_skills(&ws_root);
@@ -2107,6 +2136,26 @@ fn execute_computer_use_blocking(
                 value: args.get("text").and_then(|v| v.as_str()).map(|s| s.to_string()),
                 scroll_delta: args.get("delta").and_then(|v| v.as_i64()).map(|v| v as i32),
             };
+            let tstate = phantom_session::get_chat_target(chat_id);
+            if let Some(el) = tstate.last_uia_elements.iter().find(|el| {
+                (req.element_id.is_some() && Some(&el.id) == req.element_id.as_ref())
+                    || (req.automation_id.is_some() && Some(&el.automation_id) == req.automation_id.as_ref())
+                    || (req.name.is_some() && el.name.to_lowercase().contains(&req.name.as_ref().unwrap().to_lowercase()))
+            }) {
+                mouse_overlay::notify_move(
+                    target_hwnd,
+                    el.cx_norm,
+                    el.cy_norm,
+                    Some(mouse_overlay::ElementHoverInfo {
+                        x: el.bounds_screen.x,
+                        y: el.bounds_screen.y,
+                        width: el.bounds_screen.width,
+                        height: el.bounds_screen.height,
+                        label: format!("[{}] {}", el.control_type, el.name),
+                    }),
+                );
+            }
+
             let res = match uia_tree::execute_uia_action(chat_id, target_hwnd, &req)? {
                 uia_tree::UiaActionOutcome::Executed(v) => v,
                 uia_tree::UiaActionOutcome::FallbackClick {
@@ -2271,6 +2320,9 @@ fn execute_computer_use_blocking(
                 settle_ms,
             ))
         }
+        "multi_actions" => {
+            execute_multi_actions_blocking(args, chat_id)
+        }
         "click" | "double_click" | "right_click" | "middle_click" | "move" | "drag" | "scroll"
         | "hscroll" => {
             let target_hwnd =
@@ -2356,4 +2408,100 @@ fn execute_computer_use_blocking(
         }
         other => Err(format!("Unsupported computer_use action '{}'.", other)),
     }
+}
+
+fn execute_multi_actions_blocking(
+    args: &Value,
+    chat_id: Option<&str>,
+) -> Result<Value, String> {
+    let explicit_hwnd = args.get("hwnd").and_then(|v| v.as_i64()).map(|v| v as usize);
+    let title = args.get("window_title").and_then(|v| v.as_str());
+    let proc_name = args.get("process_name").and_then(|v| v.as_str());
+    let target_hwnd = phantom_session::resolve_target_hwnd(chat_id, explicit_hwnd, title, proc_name)?;
+
+    let raw_actions = args
+        .get("actions")
+        .and_then(|v| v.as_array())
+        .ok_or("Missing 'actions' array parameter")?;
+
+    if raw_actions.is_empty() {
+        return Err("Actions array cannot be empty".to_string());
+    }
+
+    let actions: Vec<&Value> = raw_actions.iter().take(10).collect();
+    let delay_ms = args
+        .get("delay_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(150)
+        .clamp(0, 5000) as u64;
+    let auto_shot = args
+        .get("auto_screenshot")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut executed = Vec::new();
+
+    for (i, act_val) in actions.iter().enumerate() {
+        if desktop_uia::is_panic_hotkey_active() {
+            return Err("Execution aborted by panic hotkey".to_string());
+        }
+
+        let act_name = act_val
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("click")
+            .trim()
+            .to_ascii_lowercase();
+
+        let norm = act_val.get("normalized").and_then(|v| v.as_bool()).unwrap_or(true);
+        let x = act_val.get("x").and_then(|v| v.as_i64()).unwrap_or(500) as i32;
+        let y = act_val.get("y").and_then(|v| v.as_i64()).unwrap_or(500) as i32;
+
+        let res = match act_name.as_str() {
+            "click" | "double_click" | "right_click" | "middle_click" | "move" | "drag" | "scroll" | "hscroll" => {
+                let to_x = act_val.get("to_x").and_then(|v| v.as_i64()).map(|v| v as i32);
+                let to_y = act_val.get("to_y").and_then(|v| v.as_i64()).map(|v| v as i32);
+                let delta = act_val.get("delta").and_then(|v| v.as_i64()).map(|v| v as i32);
+                ghost_input::ghost_mouse_action(chat_id, target_hwnd, None, &act_name, x, y, to_x, to_y, delta, norm)
+            }
+            "type" => {
+                let text = act_val.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let clear = act_val.get("clear_first").and_then(|v| v.as_bool()).unwrap_or(false);
+                let enter = act_val.get("submit_enter").and_then(|v| v.as_bool()).unwrap_or(false);
+                ghost_input::ghost_type_text(chat_id, target_hwnd, None, text, clear, enter)
+            }
+            "hotkey" => {
+                let keys = act_val.get("keys").and_then(|v| v.as_str()).unwrap_or("enter");
+                ghost_input::ghost_send_hotkey(chat_id, target_hwnd, keys)
+            }
+            "wait" => {
+                let ms = act_val.get("wait_ms").and_then(|v| v.as_i64()).unwrap_or(300).clamp(10, 10000) as u64;
+                std::thread::sleep(std::time::Duration::from_millis(ms));
+                Ok(json!({ "waitedMs": ms }))
+            }
+            other => Err(format!("Unsupported action '{}' in multi_actions", other)),
+        };
+
+        executed.push(json!({
+            "step": i + 1,
+            "action": act_name,
+            "outcome": match res {
+                Ok(v) => v,
+                Err(e) => json!({ "error": e }),
+            }
+        }));
+
+        if i + 1 < actions.len() && delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+    }
+
+    let summary = json!({
+        "status": "success",
+        "actionsCount": executed.len(),
+        "delayMs": delay_ms,
+        "steps": executed,
+    });
+
+    Ok(attach_auto_screenshot_if_requested(summary, chat_id, target_hwnd, auto_shot, 50))
 }
