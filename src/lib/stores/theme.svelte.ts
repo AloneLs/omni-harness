@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { omniBridge } from '../runtime/omniBridge';
 
 export interface OmniTheme {
   id: string;
@@ -8,6 +9,8 @@ export interface OmniTheme {
   author: string;
   version: string;
   css: string;
+  rawCss?: string;
+  customJs?: string;
   iconOverrides: Record<string, string>;
   textOverrides: Record<string, string>;
   assets: Record<string, string>;
@@ -88,6 +91,8 @@ export function createEmptyTheme(name = 'New Theme'): OmniTheme {
     author: 'User',
     version: '1.0.0',
     css: DEFAULT_OMNI_CSS,
+    rawCss: '',
+    customJs: '',
     iconOverrides: {},
     textOverrides: {},
     assets: {},
@@ -281,7 +286,17 @@ class ThemeStore {
         this.themes = list;
       }
       this.activeThemeId = activeId || null;
+      this.syncCustomRuntime();
     } catch {}
+  }
+
+  public syncCustomRuntime(): void {
+    if (typeof window === 'undefined') return;
+    const current = this.effectiveAppTheme;
+    const rawCss = current?.rawCss !== undefined ? current.rawCss : (localStorage.getItem('omni_raw_css') || '');
+    const customJs = current?.customJs !== undefined ? current.customJs : (localStorage.getItem('omni_custom_js') || '');
+    omniBridge.injectRawCssToDom(rawCss);
+    omniBridge.executeCustomJs(customJs);
   }
 
   public async saveTheme(theme: OmniTheme): Promise<OmniTheme> {
@@ -316,6 +331,7 @@ class ThemeStore {
     this.activeThemeId = id;
     try {
       await invoke('set_active_theme_id', { id });
+      this.syncCustomRuntime();
     } catch {
       this.activeThemeId = prev;
     }

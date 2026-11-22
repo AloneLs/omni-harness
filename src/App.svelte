@@ -25,6 +25,7 @@ import MockHarnessPreview from './components/themes/MockHarnessPreview.svelte';
 import { themeStore, compileThemeCss } from './lib/stores/theme.svelte';
 import { settingsStore } from './lib/stores/settings.svelte';
 import { chatStore } from './lib/stores/chat.svelte';
+import { omniBridge } from './lib/runtime/omniBridge';
 import { SPRING_LAUNCH, SPRING_PANEL, SPRING_POPUP, attachPressScale } from './lib/motion';
 
 interface UpdateInfo {
@@ -164,6 +165,9 @@ const SETTINGS_TABS: { id: typeof activeSettingsTab; label: string; icon: string
 ];
 
 onMount(() => {
+  try {
+    themeStore.syncCustomRuntime();
+  } catch (_) {}
   requestAnimationFrame(() => {
     invoke('window_show').catch(() => {});
     launchSpring.target = { opacity: 1, scale: 1, y: 0 };
@@ -380,6 +384,36 @@ $effect(() => {
   onmouseout={handleGlobalMouseOut}
 />
 
+{#if omniBridge.safeMode}
+  <div
+    id="omni-emergency-banner"
+    data-omni-emergency-shield=""
+    class="fixed top-2 left-1/2 -translate-x-1/2 z-[9999999] px-3.5 py-1.5 rounded-full bg-[#F59E0B] text-black shadow-2xl flex items-center gap-2.5 text-xs font-medium select-none animate-pulse"
+  >
+    <span>⚠️ Safe Mode Active (Custom CSS &amp; Scripts disabled)</span>
+    <span class="font-mono text-[11px] opacity-80">[Ctrl+Alt+Shift+Esc]</span>
+    <button
+      type="button"
+      data-omni-emergency-btn=""
+      onclick={() => omniBridge.toggleSafeMode(false)}
+      class="px-2 py-0.5 rounded bg-black/20 hover:bg-black/30 font-semibold transition-colors"
+    >
+      Restore
+    </button>
+    <button
+      type="button"
+      data-omni-emergency-btn=""
+      onclick={() => {
+        settingsStore.openSettings();
+        activeSettingsTab = 'appearance';
+      }}
+      class="px-2 py-0.5 rounded bg-black/20 hover:bg-black/30 font-semibold transition-colors"
+    >
+      Settings
+    </button>
+  </div>
+{/if}
+
 <div data-omni-theme-root="" class="w-screen h-screen overflow-hidden">
 <div
   data-omni-app=""
@@ -495,6 +529,7 @@ $effect(() => {
     role="presentation"
   >
     <div
+      data-omni-settings-modal=""
       class="bg-[#161618] border border-white/[0.08] flex flex-col overflow-hidden transition-all duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] {themeStore.isStudioOpen ? 'w-full h-full max-w-none rounded-none border-0 border-t border-white/[0.06]' : 'w-full max-w-[920px] h-[630px] rounded-[6px]'}"
       style="transform: translateY({themeStore.isStudioOpen ? 0 : settingsModalSpring.current.y}px) scale({themeStore.isStudioOpen ? 1 : settingsModalSpring.current.scale});"
       onclick={(e) => e.stopPropagation()}
@@ -507,7 +542,7 @@ $effect(() => {
         <ThemeStudio />
       {:else}
       <div class="flex-1 flex overflow-hidden">
-        <aside class="w-52 bg-[#121214] border-r border-white/[0.06] p-2.5 overflow-y-auto shrink-0 text-xs">
+        <aside data-omni-settings-tabs="" class="w-52 bg-[#121214] border-r border-white/[0.06] p-2.5 overflow-y-auto shrink-0 text-xs">
           <div class="relative">
             <div
               class="absolute left-0 right-0 rounded-[6px] bg-[#1C1C1F] border-t border-white/[0.1] pointer-events-none flex items-center"
@@ -531,7 +566,7 @@ $effect(() => {
           </div>
         </aside>
 
-        <section class="flex-1 bg-[#161618] p-6 overflow-y-auto settings-pane">
+        <section data-omni-settings-content="" class="flex-1 bg-[#161618] p-6 overflow-y-auto settings-pane">
           {#key activeSettingsTab}
             <div in:fly={{ y: 6, duration: 150 }}>
               {#if activeSettingsTab === 'providers'}

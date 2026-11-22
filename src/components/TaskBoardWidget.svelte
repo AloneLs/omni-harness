@@ -5,8 +5,25 @@ import { Spring } from 'svelte/motion';
 import Icon from './Icon.svelte';
 import { chatStore } from '../lib/stores/chat.svelte';
 import { SPRING_POPUP } from '../lib/motion';
+import { omniBridge } from '../lib/runtime/omniBridge';
 
 let collapsed = $state<boolean>(false);
+let topSlotEl: HTMLDivElement | undefined = $state();
+let bottomSlotEl: HTMLDivElement | undefined = $state();
+
+$effect(() => {
+  if (topSlotEl) {
+    const unreg = omniBridge.registerSlot('taskboard-top', topSlotEl);
+    return unreg;
+  }
+});
+
+$effect(() => {
+  if (bottomSlotEl) {
+    const unreg = omniBridge.registerSlot('taskboard-bottom', bottomSlotEl);
+    return unreg;
+  }
+});
 
 let todos = $derived(chatStore.activeTodos);
 let hasTodos = $derived(todos.length > 0);
@@ -23,12 +40,15 @@ $effect(() => {
 
 {#if hasTodos || widgetSpring.current.opacity > 0.02}
   <div
+    data-omni-taskboard=""
     class="absolute top-2 right-5 z-30 w-[280px] select-none {hasTodos ? 'pointer-events-auto' : 'pointer-events-none'}"
     style="opacity: {widgetSpring.current.opacity}; transform: translate3d({widgetSpring.current.x}px, {widgetSpring.current.y}px, 0) scale({widgetSpring.current.scale});"
   >
     <div class="rounded-[10px] bg-[#161618]/92 backdrop-blur-[10px] border border-white/[0.08] shadow-xl overflow-hidden">
+      <div bind:this={topSlotEl} data-omni-slot="taskboard-top"></div>
       <button
         type="button"
+        data-omni-taskboard-header=""
         class="w-full px-3.5 py-2.5 flex items-center justify-between text-left hover:bg-white/[0.03] transition-colors"
         onclick={() => (collapsed = !collapsed)}
       >
@@ -64,9 +84,11 @@ $effect(() => {
             <div
               animate:flip={{ duration: 180 }}
               in:fly={{ x: 8, duration: 160 }}
+              data-omni-task-card=""
+              data-task-status={todo.status}
               class="flex items-start gap-2.5 pt-1 text-[12px] leading-snug"
             >
-              <div class="w-4 h-4 mt-0.5 flex items-center justify-center shrink-0">
+              <div data-omni-task-status="" class="w-4 h-4 mt-0.5 flex items-center justify-center shrink-0">
                 {#if todo.status === 'completed'}
                   <span
                     in:scale={{ start: 0.4, duration: 180 }}
@@ -92,6 +114,7 @@ $effect(() => {
               </div>
 
               <span
+                data-omni-task-title=""
                 class="min-w-0 flex-1 break-words {todo.status === 'completed'
                   ? 'text-[#66666D] line-through transition-colors'
                   : todo.status === 'in_progress'
@@ -106,6 +129,7 @@ $effect(() => {
           {/each}
         </div>
       {/if}
+      <div bind:this={bottomSlotEl} data-omni-slot="taskboard-bottom"></div>
     </div>
   </div>
 {/if}

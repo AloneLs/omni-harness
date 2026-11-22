@@ -1454,6 +1454,7 @@ async function stopAndSendVoice() {
                 <div
                   bind:this={projectListContainerEl}
                   onkeydown={handleProjectPopupKeyDown}
+                  role="menu"
                   tabindex="-1"
                   class="absolute bottom-full mb-2 right-0 w-64 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-1.5 z-50 text-xs space-y-1 shadow-2xl outline-none"
                 >
