@@ -227,20 +227,18 @@ impl Database {
 
     pub fn update_chat_title(&self, id: &str, title: &str) -> Result<(), AppError> {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
-        let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE chats SET title = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![title, now, id],
+            "UPDATE chats SET title = ?1 WHERE id = ?2",
+            rusqlite::params![title, id],
         )?;
         Ok(())
     }
 
     pub fn update_chat_pinned(&self, id: &str, is_pinned: bool) -> Result<(), AppError> {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
-        let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE chats SET is_pinned = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![if is_pinned { 1 } else { 0 }, now, id],
+            "UPDATE chats SET is_pinned = ?1 WHERE id = ?2",
+            rusqlite::params![if is_pinned { 1 } else { 0 }, id],
         )?;
         Ok(())
     }
@@ -248,20 +246,18 @@ impl Database {
     pub fn update_chat_project(&self, id: &str, project_id: Option<&str>) -> Result<(), AppError> {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
         Self::ensure_project_row(&conn, project_id);
-        let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE chats SET project_id = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![project_id, now, id],
+            "UPDATE chats SET project_id = ?1 WHERE id = ?2",
+            rusqlite::params![project_id, id],
         )?;
         Ok(())
     }
 
     pub fn update_chat_model(&self, id: &str, model_id: &str) -> Result<(), AppError> {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
-        let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
-            "UPDATE chats SET model_id = ?1, updated_at = ?2 WHERE id = ?3",
-            rusqlite::params![model_id, now, id],
+            "UPDATE chats SET model_id = ?1 WHERE id = ?2",
+            rusqlite::params![model_id, id],
         )?;
         Ok(())
     }

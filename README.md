@@ -1,6 +1,6 @@
 # OmniHarness
 
-[![Version](https://img.shields.io/badge/version-1.0.3-brightgreen.svg)](https://github.com/wasrecordrecorder/omni-harness/releases)
+[![Version](https://img.shields.io/badge/version-1.0.4-brightgreen.svg)](https://github.com/wasrecordrecorder/omni-harness/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2011%20x64-0078D4?logo=windows&logoColor=white)](https://github.com/wasrecordrecorder/omni-harness)
 [![Tauri 2](https://img.shields.io/badge/Tauri-2.2-FFC131?logo=tauri&logoColor=black)](https://tauri.app/)
@@ -232,8 +232,8 @@ The workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) au
 
 1. **Trigger via Git Tag**:
    ```bash
-   git tag v1.0.3
-   git push origin v1.0.3
+   git tag v1.0.4
+   git push origin v1.0.4
    ```
 
 2. **Trigger via Web UI (Manual)**:

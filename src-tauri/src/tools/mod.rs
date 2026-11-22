@@ -82,6 +82,7 @@ pub struct ToolDispatcher {
     pub allowed_roots: Vec<PathBuf>,
     pub read_guard: safety::FileReadGuard,
     pub plan_mode: AtomicBool,
+    pub plan_mode_locked: AtomicBool,
     pub db: std::sync::RwLock<Option<crate::db::Database>>,
     pub theme_studio: Option<(tauri::AppHandle, String)>,
 }
@@ -109,6 +110,7 @@ impl ToolDispatcher {
             allowed_roots,
             read_guard: safety::FileReadGuard::new(),
             plan_mode: AtomicBool::new(false),
+            plan_mode_locked: AtomicBool::new(false),
             db: std::sync::RwLock::new(None),
             theme_studio: None,
         }
@@ -175,6 +177,7 @@ impl ToolDispatcher {
             allowed_roots: roots,
             read_guard: self.read_guard.clone(),
             plan_mode: AtomicBool::new(self.plan_mode.load(Ordering::Relaxed)),
+            plan_mode_locked: AtomicBool::new(self.plan_mode_locked.load(Ordering::Relaxed)),
             db: std::sync::RwLock::new(self.db.read().ok().and_then(|g| g.clone())),
             theme_studio: None,
         })
@@ -198,6 +201,7 @@ impl ToolDispatcher {
             allowed_roots: vec![themes_dir],
             read_guard: self.read_guard.clone(),
             plan_mode: AtomicBool::new(false),
+            plan_mode_locked: AtomicBool::new(false),
             db: std::sync::RwLock::new(None),
             theme_studio: Some((app_handle, theme_id.to_string())),
         })
@@ -215,6 +219,14 @@ impl ToolDispatcher {
 
     pub fn is_plan_mode(&self) -> bool {
         self.plan_mode.load(Ordering::Relaxed)
+    }
+
+    pub fn set_plan_mode_locked(&self, locked: bool) {
+        self.plan_mode_locked.store(locked, Ordering::Relaxed);
+    }
+
+    pub fn is_plan_mode_locked(&self) -> bool {
+        self.plan_mode_locked.load(Ordering::Relaxed)
     }
 
     pub fn get_all_tool_declarations(&self) -> Vec<ToolDeclaration> {
@@ -1370,6 +1382,12 @@ impl ToolDispatcher {
                 }
             }
             "enter_plan_mode" => {
+                if self.is_plan_mode_locked() {
+                    return Err("Plan Mode is locked because the plan was already approved. Execute the plan directly.".to_string());
+                }
+                if self.is_plan_mode() {
+                    return Ok(json!({ "plan_mode": true, "already_in_plan_mode": true, "status": "Already in read-only Plan Mode. Continue exploring and call exit_plan_mode when ready." }));
+                }
                 self.set_plan_mode(true);
                 Ok(json!({ "plan_mode": true, "status": "Entered read-only Plan Mode. Explore files and formulate a plan before calling exit_plan_mode." }))
             }

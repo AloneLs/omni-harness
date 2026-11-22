@@ -983,7 +983,25 @@ async fn sync_chat_context(
     };
 
     let now = chrono::Utc::now().to_rfc3339();
-    if db.get_chat(&chat_id).is_err() {
+    if let Ok(existing) = db.get_chat(&chat_id) {
+        if !title.trim().is_empty() && title != "New task" && existing.title != title {
+            let _ = db.update_chat_title(&chat_id, &title);
+        }
+        let next_proj = project_path.as_deref().map(|x| x.trim()).filter(|x| !x.is_empty());
+        if existing.project_id.as_deref() != next_proj {
+            let _ = db.update_chat_project(&chat_id, next_proj);
+        }
+        if let Some(mid) = model_id.as_deref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
+            if existing.model_id != mid {
+                let _ = db.update_chat_model(&chat_id, mid);
+            }
+        }
+        if let Some(pinned) = is_pinned {
+            if existing.is_pinned != pinned {
+                let _ = db.update_chat_pinned(&chat_id, pinned);
+            }
+        }
+    } else {
         let chat = db::chats::Chat {
             id: chat_id.clone(),
             project_id: project_path.clone().filter(|s| !s.trim().is_empty()),
@@ -995,18 +1013,6 @@ async fn sync_chat_context(
             updated_at: now.clone(),
         };
         let _ = db.create_chat(&chat);
-    } else {
-        if !title.trim().is_empty() && title != "New task" {
-            let _ = db.update_chat_title(&chat_id, &title);
-        }
-        let next_proj = project_path.as_deref().map(|x| x.trim()).filter(|x| !x.is_empty());
-        let _ = db.update_chat_project(&chat_id, next_proj);
-        if let Some(mid) = model_id.as_deref().map(|x| x.trim()).filter(|x| !x.is_empty()) {
-            let _ = db.update_chat_model(&chat_id, mid);
-        }
-        if let Some(pinned) = is_pinned {
-            let _ = db.update_chat_pinned(&chat_id, pinned);
-        }
     }
 
     if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&messages_json) {
@@ -1347,6 +1353,7 @@ async fn start_chat_stream(
     supports_reasoning: Option<bool>,
     workspace_dir: Option<String>,
     plan_mode: Option<bool>,
+    force_execute: Option<bool>,
     resume: Option<bool>,
     history: Option<Vec<HistoryInputItem>>,
     attachments: Option<Vec<AttachmentInput>>,
@@ -1402,8 +1409,10 @@ async fn start_chat_stream(
             .tool_dispatcher
             .for_workspace_with_cwd(sandbox_opt, std::path::Path::new(&workspace_str), &chat_id)
     };
-    let combined_plan = plan_mode.unwrap_or(false) || prompt.split_whitespace().any(|t| t.eq_ignore_ascii_case("/plan"));
+    let force_exec = force_execute.unwrap_or(false);
+    let combined_plan = !force_exec && (plan_mode.unwrap_or(false) || prompt.split_whitespace().any(|t| t.eq_ignore_ascii_case("/plan")));
     tools.set_plan_mode(combined_plan);
+    tools.set_plan_mode_locked(force_exec);
     let key_pool = (*state.key_pool).clone();
     let caps_reg = (*state.caps_registry).clone();
     if context_window.is_some() || max_output_tokens.is_some() || supports_reasoning.is_some() {

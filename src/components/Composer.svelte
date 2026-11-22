@@ -8,7 +8,7 @@ import FileToolIcon from './FileToolIcon.svelte';
 import { themeStore } from '../lib/stores/theme.svelte';
 import { chatStore, type ChatAttachment } from '../lib/stores/chat.svelte';
 import { renderMarkdown } from '../lib/markdown';
-import { settingsStore, groupProviderModels, getSupportedReasoningLevels, getDisplayModelId, REASONING_ORDER, type ReasoningLevel } from '../lib/stores/settings.svelte';
+import { settingsStore, groupProviderModels, findModelGroup, resolveValidModelForProvider, getSupportedReasoningLevels, getDisplayModelId, REASONING_ORDER, type ReasoningLevel } from '../lib/stores/settings.svelte';
 import { workspaceStore } from '../lib/stores/workspace.svelte';
 import { VoiceCapture } from '../lib/voiceCapture';
 import { SPRING_POPUP, SPRING_KEYCAP, SPRING_SLIDER, attachPressScale } from '../lib/motion';
@@ -45,6 +45,7 @@ let paletteFilter = $state<string>('');
 let paletteSelectedIndex = $state<number>(0);
 let planFeedbackOpen = $state<boolean>(false);
 let planFeedbackText = $state<string>('');
+let planFeedbackInputEl = $state<HTMLInputElement | null>(null);
 let planExpanded = $state<boolean>(true);
 let sideQuestionMaxHeight = $state<number>(224);
 let isResizingSideQuestion = $state<boolean>(false);
@@ -156,9 +157,31 @@ const REASONING_LABELS: Record<ReasoningLevel, string> = {
 };
 
 let currentChatSession = $derived(chatStore.activeSession);
-let currentProviderId = $derived(currentChatSession?.providerId || settingsStore.data.activeProvider);
-let currentProvider = $derived(settingsStore.data.providers[currentProviderId] || settingsStore.currentProvider);
-let currentModelId = $derived(currentChatSession?.modelId || settingsStore.data.activeModel);
+let rawSessionProvider = $derived(
+  currentChatSession?.providerId ? settingsStore.data.providers[currentChatSession.providerId] : null
+);
+let currentProvider = $derived(
+  rawSessionProvider && rawSessionProvider.enabled !== false ? rawSessionProvider : settingsStore.currentProvider
+);
+let currentProviderId = $derived(currentProvider?.id || settingsStore.data.activeProvider);
+let currentModelId = $derived(
+  resolveValidModelForProvider(currentProvider, currentChatSession?.modelId || settingsStore.data.activeModel)
+);
+
+$effect(() => {
+  const sess = currentChatSession;
+  const prov = currentProvider;
+  if (!sess || !prov || !sess.modelId) return;
+  const avail = prov.availableModels || [];
+  if (avail.length === 0) return;
+  const exists = avail.includes(sess.modelId) || findModelGroup(prov, sess.modelId) !== null;
+  if (!exists) {
+    const fallback = resolveValidModelForProvider(prov, undefined);
+    if (fallback && fallback !== sess.modelId) {
+      chatStore.setSessionModel(prov.id, fallback, sess.id);
+    }
+  }
+});
 
 let supportedReasoningLevels = $derived(
   getSupportedReasoningLevels(currentProvider, currentModelId)
@@ -901,8 +924,13 @@ async function stopAndSendVoice() {
           </button>
           <button
             type="button"
-            class="h-6 px-2.5 rounded-[5px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.08] text-[11px] text-[#D4D4D8] transition-colors"
-            onclick={() => (planFeedbackOpen = !planFeedbackOpen)}
+            class="h-6 px-2.5 rounded-[5px] {planFeedbackOpen ? 'bg-white/[0.12] border-white/[0.2] text-white' : 'bg-[#1E1E22] hover:bg-[#27272A] border-white/[0.08] text-[#D4D4D8]'} border text-[11px] transition-colors"
+            onclick={() => {
+              planFeedbackOpen = !planFeedbackOpen;
+              if (planFeedbackOpen) {
+                requestAnimationFrame(() => planFeedbackInputEl?.focus());
+              }
+            }}
           >
             Request Changes
           </button>
@@ -920,7 +948,7 @@ async function stopAndSendVoice() {
       </div>
 
       {#if planExpanded && plan.summary}
-        <div class="markdown-prose px-4 py-3 max-h-[42vh] overflow-y-auto text-[13px] text-[#E5E5E8] leading-relaxed select-text">
+        <div class="markdown-prose px-4 py-3 {planFeedbackOpen ? 'max-h-[30vh]' : 'max-h-[42vh]'} overflow-y-auto text-[13px] text-[#E5E5E8] leading-relaxed select-text">
           {@html renderMarkdown(plan.summary)}
         </div>
       {/if}
@@ -928,12 +956,19 @@ async function stopAndSendVoice() {
       {#if planFeedbackOpen}
         <div class="px-3 py-2 border-t border-white/[0.06] flex items-center gap-2 bg-[#141417]">
           <input
+            bind:this={planFeedbackInputEl}
             bind:value={planFeedbackText}
             type="text"
             placeholder="Describe what to change in the plan..."
-            class="flex-1 px-2.5 py-1.5 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] text-xs text-[#EDEDEF] placeholder-[#66666D] outline-none focus:border-white/[0.2]"
+            class="flex-1 px-2.5 py-1.5 rounded-[6px] bg-[#1C1C1F] border border-white/[0.12] text-xs text-[#EDEDEF] placeholder-[#66666D] outline-none focus:border-white/[0.28]"
             onkeydown={(e) => {
+              if (e.key === 'Escape') {
+                e.preventDefault();
+                planFeedbackOpen = false;
+                return;
+              }
               if (e.key === 'Enter' && planFeedbackText.trim()) {
+                e.preventDefault();
                 const fb = planFeedbackText.trim();
                 planFeedbackText = '';
                 planFeedbackOpen = false;
@@ -943,7 +978,8 @@ async function stopAndSendVoice() {
           />
           <button
             type="button"
-            class="h-7 px-3 rounded-[6px] bg-[#EDEDEF] hover:bg-white text-[#111113] text-xs font-medium transition-colors"
+            disabled={!planFeedbackText.trim()}
+            class="h-7 px-3 rounded-[6px] bg-[#EDEDEF] hover:bg-white disabled:opacity-40 disabled:cursor-not-allowed text-[#111113] text-xs font-medium transition-colors"
             onclick={() => {
               if (!planFeedbackText.trim()) return;
               const fb = planFeedbackText.trim();

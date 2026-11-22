@@ -39,10 +39,25 @@ interface UpdateInfo {
   publishedAt: string;
 }
 
-let hoverTip = $state<{ text: string; x: number; y: number } | null>(null);
+let hoverTip = $state<{ text: string; x: number; y: number; above: boolean } | null>(null);
+let hoverTipEl = $state<HTMLDivElement | null>(null);
 let hoverEl: HTMLElement | null = null;
 let hoverTimer: ReturnType<typeof setTimeout> | null = null;
 let hoverRafId: number | null = null;
+
+$effect(() => {
+  if (!hoverTip || !hoverTipEl) return;
+  const rect = hoverTipEl.getBoundingClientRect();
+  const margin = 8;
+  let nx = hoverTip.x;
+  if (rect.right > window.innerWidth - margin) {
+    nx = Math.max(margin, Math.round(window.innerWidth - rect.width - margin));
+  }
+  if (nx < margin) nx = margin;
+  if (nx !== hoverTip.x) {
+    hoverTip = { ...hoverTip, x: nx };
+  }
+});
 
 function handleGlobalMouseOver(e: MouseEvent) {
   const target = e.target as HTMLElement | null;
@@ -69,9 +84,13 @@ function handleGlobalMouseOver(e: MouseEvent) {
       hoverTimer = null;
       if (!hoverEl || !hoverEl.isConnected) return;
       const rect = hoverEl.getBoundingClientRect();
-      const x = Math.min(Math.max(10, rect.left + rect.width / 2), window.innerWidth - 160);
-      const y = rect.top > 44 ? rect.top - 8 : rect.bottom + 8;
-      hoverTip = { text: tipText, x, y };
+      const estW = Math.min(280, Math.max(64, Math.ceil(tipText.length * 6.8) + 22));
+      const margin = 8;
+      const rawLeft = rect.left + rect.width / 2 - estW / 2;
+      const x = Math.round(Math.min(Math.max(margin, rawLeft), Math.max(margin, window.innerWidth - estW - margin)));
+      const above = rect.top > 44;
+      const y = Math.round(above ? rect.top - 8 : rect.bottom + 8);
+      hoverTip = { text: tipText, x, y, above };
     }, 320);
   });
 }
@@ -159,19 +178,29 @@ onMount(() => {
       .catch(() => {});
   }, 3000);
 
-  const blockAltCapture = (e: KeyboardEvent) => {
+  const captureKeydown = (e: KeyboardEvent) => {
+    if (e.key === 'Alt' || e.code === 'AltLeft' || e.code === 'AltRight') {
+      e.preventDefault();
+      return;
+    }
+    if ((e.key === 'Escape' || e.code === 'Escape') && ctxMenu.open) {
+      closeCtxMenu();
+    }
+    handleGlobalKeydown(e);
+  };
+  const blockAltKeyup = (e: KeyboardEvent) => {
     if (e.key === 'Alt' || e.code === 'AltLeft' || e.code === 'AltRight') {
       e.preventDefault();
     }
   };
-  window.addEventListener('keydown', blockAltCapture, { capture: true });
-  window.addEventListener('keyup', blockAltCapture, { capture: true });
+  window.addEventListener('keydown', captureKeydown, { capture: true });
+  window.addEventListener('keyup', blockAltKeyup, { capture: true });
   return () => {
     clearTimeout(updateTimer);
     if (hoverTimer) clearTimeout(hoverTimer);
     if (hoverRafId !== null) cancelAnimationFrame(hoverRafId);
-    window.removeEventListener('keydown', blockAltCapture, { capture: true });
-    window.removeEventListener('keyup', blockAltCapture, { capture: true });
+    window.removeEventListener('keydown', captureKeydown, { capture: true });
+    window.removeEventListener('keyup', blockAltKeyup, { capture: true });
   };
 });
 
@@ -217,31 +246,37 @@ function handleClose() {
 }
 
 function handleGlobalKeydown(e: KeyboardEvent) {
-  if (e.key === 'Alt') {
+  const code = e.code || '';
+  const key = (e.key || '').toLowerCase();
+  if (key === 'alt') {
     e.preventDefault();
     return;
   }
-  if (e.key === 'F11') {
+  if (key === 'f11' || code === 'F11') {
     e.preventDefault();
     invoke('window_toggle_fullscreen').catch(() => {});
     return;
   }
-  if (e.key === 'Escape' && settingsStore.isSettingsOpen) {
+  if ((key === 'escape' || code === 'Escape') && settingsStore.isSettingsOpen) {
     settingsStore.closeSettings();
     return;
   }
-  if (e.ctrlKey || e.metaKey) {
-    if (e.key.toLowerCase() === 'b') {
+  if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+    if (code === 'KeyB' || key === 'b') {
       e.preventDefault();
+      e.stopPropagation();
       toggleSidebar();
-    } else if (e.key.toLowerCase() === 'n') {
+    } else if (code === 'KeyN' || key === 'n') {
       e.preventDefault();
+      e.stopPropagation();
       chatStore.createSession();
-    } else if (e.key === ',') {
+    } else if (code === 'Comma' || key === ',') {
       e.preventDefault();
+      e.stopPropagation();
       settingsStore.openSettings();
-    } else if (e.key.toLowerCase() === 'j') {
+    } else if (code === 'KeyJ' || key === 'j') {
       e.preventDefault();
+      e.stopPropagation();
       toggleContractsPanel();
     }
   }
@@ -338,7 +373,6 @@ $effect(() => {
 </script>
 
 <svelte:window
-  onkeydown={(e) => { if (e.key === 'Escape' && ctxMenu.open) closeCtxMenu(); handleGlobalKeydown(e); }}
   onkeyup={handleGlobalKeyup}
   oncontextmenu={handleGlobalContextMenu}
   onclick={closeCtxMenu}
@@ -719,7 +753,8 @@ $effect(() => {
 
 {#if hoverTip}
   <div
-    class="fixed z-[950] pointer-events-none px-2.5 py-1 rounded-[6px] bg-[#18181B]/96 backdrop-blur-md border border-white/[0.1] shadow-xl font-sans text-[11px] text-[#EDEDEF] max-w-[280px] truncate -translate-x-1/2 -translate-y-full"
+    bind:this={hoverTipEl}
+    class="fixed z-[950] pointer-events-none px-2.5 py-1 rounded-[6px] bg-[#18181B]/96 backdrop-blur-md border border-white/[0.1] shadow-xl font-sans text-[11px] text-[#EDEDEF] max-w-[280px] truncate {hoverTip.above ? '-translate-y-full' : ''}"
     style="left: {hoverTip.x}px; top: {hoverTip.y}px;"
   >
     {hoverTip.text}

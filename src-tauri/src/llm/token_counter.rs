@@ -62,7 +62,6 @@ impl LocalTiktokenCounter {
     ) -> TokenCount {
         let mut text_tokens: u32 = 3;
         let mut image_tokens: u32 = 0;
-        let mut audio_tokens: u32 = 0;
 
         for msg in messages {
             text_tokens += 4;
@@ -80,7 +79,7 @@ impl LocalTiktokenCounter {
                                 image_tokens += 1024;
                             }
                             ContentPart::InputAudio { input_audio } => {
-                                audio_tokens += (input_audio.data.len() as u32 / 4).min(24_000);
+                                image_tokens += (input_audio.data.len() as u32 / 4).min(24_000);
                             }
                         }
                     }

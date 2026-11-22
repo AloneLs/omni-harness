@@ -61,6 +61,22 @@ export function findModelGroup(
   return groups.find((g) => g.displayId === modelId || g.rawIds.includes(modelId)) || null;
 }
 
+export function resolveValidModelForProvider(
+  prov: ProviderConfig | null | undefined,
+  modelId: string | undefined
+): string {
+  if (!prov) return modelId || '';
+  const avail = prov.availableModels || [];
+  if (avail.length === 0) return prov.defaultModel || modelId || '';
+  if (modelId && (avail.includes(modelId) || findModelGroup(prov, modelId) !== null)) {
+    return modelId;
+  }
+  if (prov.defaultModel && (avail.includes(prov.defaultModel) || findModelGroup(prov, prov.defaultModel) !== null)) {
+    return prov.defaultModel;
+  }
+  return avail[0];
+}
+
 export function getDisplayModelId(
   prov: ProviderConfig | null | undefined,
   modelId: string

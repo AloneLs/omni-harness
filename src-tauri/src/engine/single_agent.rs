@@ -792,6 +792,8 @@ impl SingleAgentRunner {
         let mut consecutive_compact_failures: u32 = 0;
         let mut reactive_compact_count: u32 = 0;
         let mut empty_retries: u32 = 0;
+        let mut incomplete_todo_nudges: u32 = 0;
+        let mut plan_mode_entries: u32 = if tools.is_plan_mode() { 1 } else { 0 };
         let mut turn_seq: i64 = 0;
         crate::engine::policy_guard::audit_event(chat_id, "turn_started", "");
         crate::engine::policy_guard::audit_event(chat_id, "user_message_received", "");
@@ -1413,6 +1415,37 @@ impl SingleAgentRunner {
                     let _ = event_sender.send(StreamEvent::Error { error: msg.clone() }).await;
                     return Err(msg);
                 }
+                if !tools.is_plan_mode() && session.is_active() {
+                    let remaining: Vec<String> = contract
+                        .as_ref()
+                        .map(|c| {
+                            c.criteria
+                                .iter()
+                                .filter(|cr| matches!(cr.status, CriterionStatus::Pending | CriterionStatus::InProgress))
+                                .map(|cr| format!("- [{}] ({}) {}", cr.id, match cr.status { CriterionStatus::InProgress => "in_progress", _ => "pending" }, cr.description))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !remaining.is_empty() && incomplete_todo_nudges < 5 {
+                        incomplete_todo_nudges += 1;
+                        history.push(ChatMessage::user(format!(
+                            "You cannot finish yet because the following todo items remain incomplete:
+{}
+
+Complete all remaining items and mark each one as completed via task_board(action=\"update\", id=..., status=\"completed\") before finishing.",
+                            remaining.join("
+")
+                        )));
+                        let _ = event_sender
+                            .send(StreamEvent::RetryNotice {
+                                reason: format!("{} unfinished todo item(s) remaining, continuing...", remaining.len()),
+                                attempt: incomplete_todo_nudges,
+                                model: model_name.to_string(),
+                            })
+                            .await;
+                        continue;
+                    }
+                }
                 let _ = state.transition(TaskStateEnum::Reviewing);
                 break;
             }
@@ -1724,6 +1757,37 @@ impl SingleAgentRunner {
                             })
                             .await;
                     }
+                }
+                if tool_name == "enter_plan_mode" && (tools.is_plan_mode_locked() || tools.is_plan_mode() || plan_mode_entries >= 1) {
+                    let err_msg = if tools.is_plan_mode_locked() {
+                        "Plan Mode entry blocked: plan was already approved for execution. Proceed directly with implementation."
+                    } else if tools.is_plan_mode() {
+                        "Already in Plan Mode. Do not call enter_plan_mode again; continue exploring and call exit_plan_mode when ready."
+                    } else {
+                        "Plan Mode entry blocked: enter_plan_mode was already used in this run. Proceed directly."
+                    };
+                    let out_str = serde_json::json!({ "error": err_msg, "plan_mode": tools.is_plan_mode() }).to_string();
+                    let _ = event_sender
+                        .send(StreamEvent::ToolExecEnd {
+                            id: tc.id.clone(),
+                            success: false,
+                            output: out_str.clone(),
+                            error: Some(err_msg.to_string()),
+                            elapsed_ms: 0,
+                        })
+                        .await;
+                    history.push(ChatMessage {
+                        role: "tool".to_string(),
+                        content: MessageContent::Text(out_str),
+                        name: Some(tool_name.clone()),
+                        tool_calls: None,
+                        tool_call_id: Some(tc.id.clone()),
+                        reasoning_content: None,
+                    });
+                    continue;
+                }
+                if tool_name == "enter_plan_mode" {
+                    plan_mode_entries += 1;
                 }
                 if tool_name == "task_board" {
                     let tool_started = std::time::Instant::now();

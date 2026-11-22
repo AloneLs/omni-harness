@@ -1071,6 +1071,16 @@ pub async fn acquire_valid_account_for_model(
         .map(|(i, _)| i)
         .collect();
 
+    let is_revoked = |a: &OAuthAccount| -> bool {
+        if let Some(ref err) = a.last_error {
+            let low = err.to_ascii_lowercase();
+            (low.contains("invalid_grant") || low.contains("invalid_token") || low.contains("expired or revoked"))
+                && a.cooldown_until_ms.map(|c| c > now).unwrap_or(false)
+        } else {
+            false
+        }
+    };
+
     if candidates.is_empty() {
         candidates = list
             .iter()
@@ -1079,6 +1089,7 @@ pub async fn acquire_valid_account_for_model(
                 a.provider == provider
                     && a.enabled
                     && !excluded_ids.contains(&a.id)
+                    && !is_revoked(a)
                     && !is_quota_exhausted_for_now(a, now)
                     && account_supports_model(a, requested_model)
             })
@@ -1100,23 +1111,37 @@ pub async fn acquire_valid_account_for_model(
     }
 
     candidates.sort_by_key(|&idx| list[idx].last_used_ms);
-    let chosen_idx = candidates[0];
-    let mut chosen = list[chosen_idx].clone();
+    let mut last_refresh_err: Option<String> = None;
 
-    if chosen.access_token.is_empty() || (chosen.expires_at_ms > 0 && chosen.expires_at_ms <= now + 10_000) {
-        if let Err(e) = refresh_account_tokens(client, &mut chosen).await {
-            list[chosen_idx].last_error = Some(e.clone());
-            list[chosen_idx].cooldown_until_ms = Some(now + 120_000);
-            let _ = write_accounts_unlocked(&list);
-            return Err(e);
+    for &chosen_idx in &candidates {
+        let mut chosen = list[chosen_idx].clone();
+        if chosen.access_token.is_empty() || (chosen.expires_at_ms > 0 && chosen.expires_at_ms <= now + 10_000) {
+            let refresh_client = client_for_account(&chosen).unwrap_or_else(|| client.clone());
+            if let Err(e) = refresh_account_tokens(&refresh_client, &mut chosen).await {
+                let low = e.to_ascii_lowercase();
+                let revoked = low.contains("invalid_grant") || low.contains("invalid_token") || low.contains("expired or revoked");
+                let cd_ms = if revoked { 6 * 3_600_000 } else { 120_000 };
+                list[chosen_idx].last_error = Some(e.clone());
+                list[chosen_idx].cooldown_until_ms = Some(now + cd_ms);
+                let _ = write_accounts_unlocked(&list);
+                last_refresh_err = Some(e);
+                continue;
+            }
         }
+        chosen.last_used_ms = now;
+        chosen.cooldown_until_ms = None;
+        chosen.last_error = None;
+        list[chosen_idx] = chosen.clone();
+        write_accounts_unlocked(&list)?;
+        return Ok(chosen);
     }
 
-    chosen.last_used_ms = now;
-    chosen.cooldown_until_ms = None;
-    list[chosen_idx] = chosen.clone();
-    write_accounts_unlocked(&list)?;
-    Ok(chosen)
+    Err(last_refresh_err.unwrap_or_else(|| {
+        format!(
+            "All active OAuth accounts for '{}' failed token refresh.",
+            provider
+        )
+    }))
 }
 
 pub async fn force_refresh_account(client: &reqwest::Client, id: &str) -> Result<OAuthAccount, String> {

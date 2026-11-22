@@ -1,7 +1,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import type { ToolExecutionRecord } from '../toolMapper';
 import { formatToolExecution, isInternalArtifactTool } from '../toolMapper';
-import { settingsStore, resolveModelForReasoning, isImageGenerationModel, type ReasoningLevel } from './settings.svelte';
+import { settingsStore, resolveModelForReasoning, resolveValidModelForProvider, isImageGenerationModel, type ReasoningLevel } from './settings.svelte';
 import { workspaceStore } from './workspace.svelte';
 
 export interface ChatAttachment {
@@ -571,9 +571,27 @@ class ChatStore {
     } catch {}
   }
 
+  private ensurePlanSummaryInHistory(cid: string, summary: string): void {
+    const clean = summary.trim();
+    if (!clean) return;
+    const msgs = this.messagesByChat[cid];
+    if (!msgs || msgs.length === 0) return;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'assistant') {
+        if (!msgs[i].content.trim()) {
+          msgs[i].content = clean;
+          this.saveChatMessagesToStorage(cid, msgs);
+        }
+        break;
+      }
+    }
+  }
+
   public async approvePlan(targetChatId?: string): Promise<void> {
     const cid = targetChatId || this.activeChatId;
     if (!cid) return;
+    const summary = this.pendingPlanByChat[cid]?.summary || '';
+    this.ensurePlanSummaryInHistory(cid, summary);
     this.pendingPlanByChat[cid] = null;
     await this.sendMessage('Plan approved. Execute the plan now.', { targetChatId: cid, forceExecute: true });
   }
@@ -581,6 +599,8 @@ class ChatStore {
   public async requestPlanChanges(feedback: string, targetChatId?: string): Promise<void> {
     const cid = targetChatId || this.activeChatId;
     if (!cid || !feedback.trim()) return;
+    const summary = this.pendingPlanByChat[cid]?.summary || '';
+    this.ensurePlanSummaryInHistory(cid, summary);
     this.pendingPlanByChat[cid] = null;
     await this.sendMessage(`/plan ${feedback.trim()}`, { targetChatId: cid });
   }
@@ -1199,7 +1219,9 @@ class ChatStore {
                 if (lastDb && lastDb.content) {
                   sess.preview = lastDb.content.slice(0, 80);
                 }
-                sess.updatedAt = bcUpdatedMs;
+                if (dbMsgs.length > localMsgs.length) {
+                  sess.updatedAt = bcUpdatedMs;
+                }
                 sessionsChanged = true;
               }
             }
@@ -1452,7 +1474,7 @@ class ChatStore {
         };
         const prev = this.saveChainByChat[cid] || Promise.resolve();
         const next = prev
-          .then(() => invoke('sync_chat_context', payload))
+          .then(async () => { await invoke('sync_chat_context', payload); })
           .catch(() => {});
         this.saveChainByChat[cid] = next;
         await next;
@@ -1726,7 +1748,7 @@ class ChatStore {
     }
     if (session && session.hasUnreadCompletion) {
       session.hasUnreadCompletion = false;
-      void this.saveSessions(id);
+      this.saveLocalOnly(id);
     }
 
     void this.refreshGoalState(id);
@@ -2016,9 +2038,14 @@ class ChatStore {
     forceExecute = false
   ): Promise<void> {
     const sess = this.sessions.find((s) => s.id === chatId);
-    const targetProvId = sess?.providerId || settingsStore.data.activeProvider;
-    const targetModel = sess?.modelId || settingsStore.data.activeModel;
-    const prov = settingsStore.data.providers[targetProvId] || settingsStore.currentProvider;
+    const rawProv = sess?.providerId ? settingsStore.data.providers[sess.providerId] : null;
+    const prov = rawProv && rawProv.enabled !== false ? rawProv : settingsStore.currentProvider;
+    const rawTargetModel = sess?.modelId || settingsStore.data.activeModel;
+    const targetModel = resolveValidModelForProvider(prov, rawTargetModel);
+    if (sess && targetModel && sess.modelId && sess.modelId !== targetModel) {
+      sess.modelId = targetModel;
+      if (prov) sess.providerId = prov.id;
+    }
     const detectedInfo = prov?.modelCapabilities?.[targetModel];
     const resolvedStreamModel = resolveModelForReasoning(prov, targetModel, settingsStore.data.reasoningLevel);
     const resolvedCaps = prov?.modelCapabilities?.[resolvedStreamModel] || detectedInfo;
@@ -2062,7 +2089,7 @@ class ChatStore {
                 .trim();
             }
             if (!text && m.role === 'assistant') {
-              text = '[Canceled by user]';
+              text = m.paused || m.error ? '[Canceled by user]' : (m.toolCalls && m.toolCalls.length > 0 ? '[Completed tool calls]' : '');
             }
             return { role: m.role, content: text };
           })
@@ -2111,6 +2138,7 @@ class ChatStore {
           supportsReasoning: resolvedCaps?.supportsReasoning ?? modelCaps.supportsReasoning,
           workspaceDir: sess?.projectPath || null,
           planMode: !forceExecute && /(?:^|\s)\/plan(?:\s|$)/i.test(prompt.trim()),
+          forceExecute,
           resume,
           history: priorHistory,
           attachments: msgAttachments,
@@ -2496,7 +2524,11 @@ class ChatStore {
     }
 
     if (event.type === 'plan_approval_required') {
-      this.pendingPlanByChat[cid] = { summary: event.planSummary || '' };
+      const summary = event.planSummary || '';
+      this.pendingPlanByChat[cid] = { summary };
+      if (summary.trim() && !currentAssistantMsg.content.trim()) {
+        currentAssistantMsg.content = summary.trim();
+      }
       return;
     }
 

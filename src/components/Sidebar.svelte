@@ -108,10 +108,7 @@ let uniqueProjectPaths = $derived.by(() => {
     const k = normProj(workspaceStore.currentPath);
     if (!map.has(k)) map.set(k, workspaceStore.currentPath);
   }
-  return Array.from(map.values()).filter((p) => {
-    const k = normProj(p);
-    return (projectChatsByNorm.get(k)?.length || 0) > 0 || normProj(workspaceStore.currentPath) === k;
-  });
+  return Array.from(map.values());
 });
 
 let allStandaloneChats = $derived(
@@ -321,52 +318,66 @@ function formatRelativeAge(timestamp: number): string {
 
     <div>
       {#if !chatStore.showArchived && uniqueProjectPaths.length > 0}
-        <div class="px-2 py-1 flex items-center justify-between">
-          <span class="text-[11px] font-sans text-[#66666D]">Projects</span>
-          <button
-            type="button"
-            class="text-[11px] text-[#73737A] hover:text-[#E5E5E8] transition-colors"
-            onclick={() => workspaceStore.openDirectoryPicker()}
-            title="Open another project folder"
-          >
-            + Folder
-          </button>
+        <div class="px-2 pt-1 pb-1.5 flex items-center justify-between">
+          <span class="text-[12px] font-sans font-medium text-[#8E8E96]">Projects</span>
+          <div class="flex items-center gap-1">
+            <button
+              type="button"
+              class="p-1 rounded-[4px] transition-colors {showSearchInput ? 'text-[#E5E5E8] bg-white/[0.08]' : 'text-[#66666D] hover:text-[#D4D4D8] hover:bg-white/[0.05]'}"
+              onclick={() => {
+                showSearchInput = !showSearchInput;
+                if (!showSearchInput) {
+                  localSearch = '';
+                  chatStore.filterSearchQuery = '';
+                }
+              }}
+              title="Filter projects and chats"
+              use:attachPressScale
+            >
+              <Icon name="filter" class="w-3.5 h-3.5" strokeWidth={1.6} />
+            </button>
+            <button
+              type="button"
+              class="p-1 rounded-[4px] text-[#66666D] hover:text-[#D4D4D8] hover:bg-white/[0.05] transition-colors"
+              onclick={() => workspaceStore.openDirectoryPicker()}
+              title="Open project folder"
+              use:attachPressScale
+            >
+              <Icon name="folder-plus" class="w-3.5 h-3.5" strokeWidth={1.6} />
+            </button>
+          </div>
         </div>
         {#each uniqueProjectPaths as projPath (normProj(projPath))}
           {@const projNorm = normProj(projPath)}
           {@const projName = projPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || projPath}
           {@const thisProjChats = projectChatsByNorm.get(projNorm) || []}
-          {@const projLimit = visibleProjectLimits[projNorm] || 20}
-          {@const visibleProjChats = thisProjChats.slice(0, projLimit)}
+          {@const defaultLimit = 8}
+          {@const isExpandedAll = Boolean(visibleProjectLimits[projNorm])}
+          {@const visibleProjChats = isExpandedAll ? thisProjChats : thisProjChats.slice(0, defaultLimit)}
           {@const isProjCollapsed = Boolean(collapsedProjects[projNorm])}
-          <div data-omni-project-group="" class="mb-2">
+          <div data-omni-project-group="" class="mb-2.5">
             <div
               data-omni-project-header=""
-              class="group/proj flex items-center gap-0.5 mb-0.5 rounded-[4px] hover:bg-white/[0.04] transition-colors pr-1"
+              class="group/proj flex items-center gap-1 px-2 py-1.5 rounded-[7px] hover:bg-white/[0.04] transition-colors"
               oncontextmenu={(e) => openProjCtxMenu(e, projPath)}
               role="presentation"
             >
               <button
                 type="button"
-                class="w-5 h-6 rounded-[4px] flex items-center justify-center text-[#73737A] hover:text-[#EDEDEF] shrink-0"
-                onclick={() => toggleProjectCollapsed(projPath)}
-                title={isProjCollapsed ? 'Expand project' : 'Collapse project'}
-              >
-                <Icon name="chevron-right" class="w-3 h-3 transition-transform duration-150 {isProjCollapsed ? '' : 'rotate-90'}" strokeWidth={1.8} />
-              </button>
-              <button
-                type="button"
-                class="flex-1 min-w-0 px-1 py-1.5 flex items-center gap-2 text-left {normProj(workspaceStore.currentPath) === projNorm ? 'text-[#EDEDEF]' : 'text-[#A3A3AA] hover:text-white'} transition-colors"
-                onclick={() => workspaceStore.setWorkspaceDir(projPath)}
+                class="flex-1 min-w-0 flex items-center gap-2 text-left {normProj(workspaceStore.currentPath) === projNorm ? 'text-[#D4D4D8]' : 'text-[#8E8E96] hover:text-[#E5E5E8]'} transition-colors"
+                onclick={() => {
+                  toggleProjectCollapsed(projPath);
+                  workspaceStore.setWorkspaceDir(projPath);
+                }}
                 title={projPath}
               >
-                <Icon name="folder" class="w-3.5 h-3.5 text-[#73737A] shrink-0" strokeWidth={1.6} />
-                <span class="font-mono text-[12px] truncate">{projName}</span>
+                <Icon name="folder" class="w-3.5 h-3.5 text-[#72727A] shrink-0" strokeWidth={1.5} />
+                <span class="font-sans text-[13px] truncate">{projName}</span>
               </button>
               <button
                 type="button"
-                class="w-6 h-6 rounded-[4px] flex items-center justify-center text-[#73737A] hover:text-[#EDEDEF] hover:bg-white/[0.08] transition-colors shrink-0"
-                onclick={() => { workspaceStore.setWorkspaceDir(projPath); chatStore.createSession('', projPath); }}
+                class="w-5 h-5 rounded-[4px] flex items-center justify-center text-[#73737A] hover:text-[#EDEDEF] hover:bg-white/[0.08] opacity-0 group-hover/proj:opacity-100 transition-all shrink-0"
+                onclick={(e) => { e.stopPropagation(); workspaceStore.setWorkspaceDir(projPath); chatStore.createSession('', projPath); }}
                 title="New task in {projName}"
                 use:attachPressScale
               >
@@ -374,87 +385,91 @@ function formatRelativeAge(timestamp: number): string {
               </button>
             </div>
             {#if !isProjCollapsed}
-            <div data-omni-project-chats="" class="pl-2 space-y-0.5">
-              {#each visibleProjChats as chat (chat.id)}
-                <div
-                  data-omni-chat-item=""
-                  class="group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[6px] cursor-pointer transition-colors duration-150 {chatStore.activeChatId === chat.id ? 'bg-white/[0.08] text-[#F5F5F7]' : 'text-[#B3B3BA] hover:bg-white/[0.04] hover:text-[#E5E5E8]'}"
-                  onclick={() => chatStore.selectSession(chat.id)}
-                  role="button"
-                  tabindex="0"
-                  onkeydown={(e) => { if (e.key === 'Enter') chatStore.selectSession(chat.id); }}
-                >
-                  <div class="flex items-center gap-2 min-w-0 flex-1 overflow-hidden">
-                    {#if chatStore.isChatStreaming(chat.id)}
-                      <span class="w-1.5 h-1.5 rounded-full shrink-0 bg-[#EDEDEF] animate-pulse"></span>
-                    {:else if chat.hasError || chat.hasUnreadCompletion}
-                      <span class="w-1.5 h-1.5 rounded-full shrink-0 {chat.hasError ? 'bg-[#EF4444]' : 'bg-[#22C55E]'}"></span>
-                    {/if}
-                    {#if editingChatId === chat.id}
-                      <input
-                        bind:value={editTitleText}
-                        type="text"
-                        class="bg-[#101012] border border-white/[0.2] rounded-[4px] px-1.5 py-0.5 text-[12px] text-[#E5E5E8] w-full outline-none"
-                        onclick={(e) => e.stopPropagation()}
-                        onkeydown={(e) => {
-                          if (e.key === 'Enter') handleSaveRename(chat.id);
-                          if (e.key === 'Escape') handleCancelRename();
-                        }}
-                        onblur={() => handleSaveRename(chat.id)}
-                      />
-                    {:else}
-                      <span class="truncate text-[12.5px] font-sans leading-snug">{chat.title}</span>
-                    {/if}
-                  </div>
-                  <div class="shrink-0 relative flex items-center justify-end min-w-[68px]">
-                    <span class="font-mono text-[11px] text-[#606068] opacity-100 group-hover:opacity-0 transition-opacity duration-150 pointer-events-none">
-                      {formatRelativeAge(chat.updatedAt)}
-                    </span>
-                    <div class="absolute right-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none group-hover:pointer-events-auto">
-                      <button
-                        type="button"
-                        class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#EDEDEF] hover:bg-white/[0.08]"
-                        title="Pin"
-                        onclick={(e) => { e.stopPropagation(); chatStore.togglePinSession(chat.id); }}
-                      >
-                        <Icon name="pin" class="w-3 h-3" strokeWidth={1.6} />
-                      </button>
-                      <button
-                        type="button"
-                        class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#E5E5E8] hover:bg-white/[0.08]"
-                        title="Rename"
-                        onclick={(e) => { e.stopPropagation(); handleStartRename(chat.id, chat.title); }}
-                      >
-                        <Icon name="edit" class="w-3 h-3" strokeWidth={1.6} />
-                      </button>
-                      <button
-                        type="button"
-                        class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#E5E5E8] hover:bg-white/[0.08]"
-                        title="Archive"
-                        onclick={(e) => { e.stopPropagation(); chatStore.toggleArchiveSession(chat.id); }}
-                      >
-                        <Icon name="archive" class="w-3 h-3" strokeWidth={1.6} />
-                      </button>
-                      <button
-                        type="button"
-                        class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#EF4444] hover:bg-white/[0.08]"
-                        title="Delete"
-                        onclick={(e) => { e.stopPropagation(); chatStore.deleteSession(chat.id); }}
-                      >
-                        <Icon name="trash" class="w-3 h-3" strokeWidth={1.6} />
-                      </button>
+            <div data-omni-project-chats="" class="mt-0.5 space-y-0.5">
+              {#if thisProjChats.length === 0}
+                <div class="pl-7 pr-2 py-1.5 text-[12.5px] font-sans text-[#686870]">No conversations yet</div>
+              {:else}
+                {#each visibleProjChats as chat (chat.id)}
+                  <div
+                    data-omni-chat-item=""
+                    class="group flex items-center justify-between gap-2 pl-7 pr-2.5 py-1.5 rounded-[8px] border cursor-pointer transition-colors duration-150 {chatStore.activeChatId === chat.id ? 'bg-white/[0.06] border-white/[0.12] text-[#F5F5F7] font-medium' : 'border-transparent text-[#C8C8CE] hover:bg-white/[0.04] hover:text-[#F5F5F7]'}"
+                    onclick={() => chatStore.selectSession(chat.id)}
+                    role="button"
+                    tabindex="0"
+                    onkeydown={(e) => { if (e.key === 'Enter') chatStore.selectSession(chat.id); }}
+                  >
+                    <div class="flex items-center gap-1.5 min-w-0 flex-1 overflow-hidden">
+                      {#if chatStore.isChatStreaming(chat.id)}
+                        <span class="w-1.5 h-1.5 rounded-full shrink-0 bg-[#EDEDEF] animate-pulse"></span>
+                      {:else if chat.hasError || chat.hasUnreadCompletion}
+                        <span class="w-1.5 h-1.5 rounded-full shrink-0 {chat.hasError ? 'bg-[#EF4444]' : 'bg-[#22C55E]'}"></span>
+                      {/if}
+                      {#if editingChatId === chat.id}
+                        <input
+                          bind:value={editTitleText}
+                          type="text"
+                          class="bg-[#101012] border border-white/[0.2] rounded-[4px] px-1.5 py-0.5 text-[12.5px] text-[#E5E5E8] w-full outline-none"
+                          onclick={(e) => e.stopPropagation()}
+                          onkeydown={(e) => {
+                            if (e.key === 'Enter') handleSaveRename(chat.id);
+                            if (e.key === 'Escape') handleCancelRename();
+                          }}
+                          onblur={() => handleSaveRename(chat.id)}
+                        />
+                      {:else}
+                        <span class="truncate text-[13px] font-sans leading-snug">{chat.title}</span>
+                      {/if}
+                    </div>
+                    <div class="shrink-0 relative flex items-center justify-end min-w-[28px]">
+                      <span class="font-sans text-[12px] text-[#7A7A82] tabular-nums opacity-100 group-hover:opacity-0 transition-opacity duration-150 pointer-events-none">
+                        {formatRelativeAge(chat.updatedAt)}
+                      </span>
+                      <div class="absolute right-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none group-hover:pointer-events-auto bg-[#171719]/90 rounded-[4px] pl-1">
+                        <button
+                          type="button"
+                          class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#EDEDEF] hover:bg-white/[0.08]"
+                          title="Pin"
+                          onclick={(e) => { e.stopPropagation(); chatStore.togglePinSession(chat.id); }}
+                        >
+                          <Icon name="pin" class="w-3 h-3" strokeWidth={1.6} />
+                        </button>
+                        <button
+                          type="button"
+                          class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#E5E5E8] hover:bg-white/[0.08]"
+                          title="Rename"
+                          onclick={(e) => { e.stopPropagation(); handleStartRename(chat.id, chat.title); }}
+                        >
+                          <Icon name="edit" class="w-3 h-3" strokeWidth={1.6} />
+                        </button>
+                        <button
+                          type="button"
+                          class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#E5E5E8] hover:bg-white/[0.08]"
+                          title="Archive"
+                          onclick={(e) => { e.stopPropagation(); chatStore.toggleArchiveSession(chat.id); }}
+                        >
+                          <Icon name="archive" class="w-3 h-3" strokeWidth={1.6} />
+                        </button>
+                        <button
+                          type="button"
+                          class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#EF4444] hover:bg-white/[0.08]"
+                          title="Delete"
+                          onclick={(e) => { e.stopPropagation(); chatStore.deleteSession(chat.id); }}
+                        >
+                          <Icon name="trash" class="w-3 h-3" strokeWidth={1.6} />
+                        </button>
+                      </div>
                     </div>
                   </div>
-                </div>
-              {/each}
-              {#if thisProjChats.length > projLimit}
-                <button
-                  type="button"
-                  class="pl-2.5 py-1 text-[11px] text-[#6B6B72] hover:text-[#D4D4D8] transition-colors"
-                  onclick={() => (visibleProjectLimits = { ...visibleProjectLimits, [projNorm]: projLimit + 30 })}
-                >
-                  Show more ({thisProjChats.length - projLimit})
-                </button>
+                {/each}
+                {#if thisProjChats.length > defaultLimit}
+                  <button
+                    type="button"
+                    class="pl-7 py-1.5 text-[12.5px] font-sans text-[#787880] hover:text-[#D4D4D8] transition-colors"
+                    onclick={() => (visibleProjectLimits = { ...visibleProjectLimits, [projNorm]: isExpandedAll ? 0 : thisProjChats.length })}
+                  >
+                    {isExpandedAll ? 'See less' : 'See more'}
+                  </button>
+                {/if}
               {/if}
             </div>
             {/if}
