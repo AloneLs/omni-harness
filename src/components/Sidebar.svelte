@@ -1,7 +1,4 @@
 <script lang="ts">
-import { slide, crossfade } from 'svelte/transition';
-import { cubicOut } from 'svelte/easing';
-import { flip } from 'svelte/animate';
 import { invoke } from '@tauri-apps/api/core';
 import { Spring } from 'svelte/motion';
 import Icon from './Icon.svelte';
@@ -29,7 +26,10 @@ function openProjCtxMenu(e: MouseEvent, path: string) {
 let editingChatId = $state<string | null>(null);
 let editTitleText = $state('');
 let showSearchInput = $state(false);
-let showAllSessions = $state(false);
+let localSearch = $state(chatStore.filterSearchQuery);
+let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+let visibleStandaloneLimit = $state(24);
+let visibleProjectLimits = $state<Record<string, number>>({});
 
 const searchBoxSpring = new Spring(0, SPRING_POPUP);
 
@@ -37,8 +37,20 @@ $effect(() => {
   searchBoxSpring.target = showSearchInput ? 38 : 0;
 });
 
-const INITIAL_LIMIT = 8;
-const [pinSend, pinReceive] = crossfade({ duration: 220, easing: cubicOut });
+function handleSearchInput(val: string) {
+  localSearch = val;
+  if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+  searchDebounceTimer = setTimeout(() => {
+    searchDebounceTimer = null;
+    chatStore.filterSearchQuery = val;
+  }, 160);
+}
+
+$effect(() => {
+  return () => {
+    if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+  };
+});
 
 let collapsedProjects = $state<Record<string, boolean>>((() => {
   try {
@@ -102,27 +114,20 @@ let uniqueProjectPaths = $derived.by(() => {
   });
 });
 
-let allStandaloneChats = $derived(chatStore.recentSessions.filter((c) => !c.projectPath));
+let allStandaloneChats = $derived(
+  chatStore.showArchived ? chatStore.recentSessions : chatStore.recentSessions.filter((c) => !c.projectPath)
+);
 
-let standaloneChats = $derived.by(() => {
-  if (showAllSessions || chatStore.filterSearchQuery.trim().length > 0 || chatStore.showArchived) {
-    return allStandaloneChats;
+let visibleStandaloneChats = $derived.by(() => {
+  if (chatStore.filterSearchQuery.trim().length > 0) {
+    return allStandaloneChats.slice(0, 60);
   }
-  return allStandaloneChats.slice(0, INITIAL_LIMIT);
+  return allStandaloneChats.slice(0, visibleStandaloneLimit);
 });
 
 let hasMoreSessions = $derived(
-  !showAllSessions &&
-  !chatStore.showArchived &&
-  chatStore.filterSearchQuery.trim().length === 0 &&
-  allStandaloneChats.length > INITIAL_LIMIT
+  chatStore.filterSearchQuery.trim().length === 0 && allStandaloneChats.length > visibleStandaloneLimit
 );
-
-function handleDragMouseDown(e: MouseEvent) {
-  if (e.buttons !== 1) return;
-  if ((e.target as HTMLElement).closest('button')) return;
-  invoke('window_start_dragging').catch(() => {});
-}
 
 function handleNewChat() {
   chatStore.createSession();
@@ -200,7 +205,10 @@ function formatRelativeAge(timestamp: number): string {
         class="p-1 rounded-[4px] transition-colors {showSearchInput ? 'text-[#E5E5E8] bg-white/[0.08]' : 'text-[#66666D] hover:text-[#D4D4D8] hover:bg-white/[0.05]'}"
         onclick={() => {
           showSearchInput = !showSearchInput;
-          if (!showSearchInput) chatStore.filterSearchQuery = '';
+          if (!showSearchInput) {
+            localSearch = '';
+            chatStore.filterSearchQuery = '';
+          }
         }}
         title="Search tasks"
         use:attachPressScale
@@ -222,7 +230,8 @@ function formatRelativeAge(timestamp: number): string {
   {#if searchBoxSpring.current > 0.5}
     <div class="px-4 overflow-hidden shrink-0" style="height: {searchBoxSpring.current}px;">
       <input
-        bind:value={chatStore.filterSearchQuery}
+        value={localSearch}
+        oninput={(e) => handleSearchInput((e.currentTarget as HTMLInputElement).value)}
         type="text"
         placeholder="Filter..."
         class="w-full px-2.5 py-1.5 rounded-[4px] bg-[#101012] border border-white/[0.08] text-[12px] text-[#E5E5E8] placeholder-[#5C5C62] outline-none"
@@ -236,9 +245,6 @@ function formatRelativeAge(timestamp: number): string {
         {#each chatStore.pinnedSessions as chat (chat.id)}
           <div
             data-omni-chat-item=""
-            animate:flip={{ duration: 170 }}
-            in:pinReceive={{ key: chat.id }}
-            out:pinSend={{ key: chat.id }}
             class="group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[6px] cursor-pointer transition-colors duration-150 {chatStore.activeChatId === chat.id ? 'bg-white/[0.08] text-[#F5F5F7]' : 'text-[#B3B3BA] hover:bg-white/[0.04] hover:text-[#E5E5E8]'}"
             onclick={() => chatStore.selectSession(chat.id)}
             role="button"
@@ -265,7 +271,7 @@ function formatRelativeAge(timestamp: number): string {
                   onblur={() => handleSaveRename(chat.id)}
                 />
               {:else}
-                <span class="truncate text-[12.5px] font-sans leading-snug transition-all duration-150">{chat.title}</span>
+                <span class="truncate text-[12.5px] font-sans leading-snug">{chat.title}</span>
               {/if}
             </div>
 
@@ -273,7 +279,7 @@ function formatRelativeAge(timestamp: number): string {
               <span class="font-mono text-[11px] text-[#606068] opacity-100 group-hover:opacity-0 transition-opacity duration-150 pointer-events-none">
                 {formatRelativeAge(chat.updatedAt)}
               </span>
-              <div class="absolute right-0 flex items-center gap-0.5 opacity-0 scale-95 group-hover:opacity-100 group-hover:scale-100 transition-all duration-150 pointer-events-none group-hover:pointer-events-auto">
+              <div class="absolute right-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none group-hover:pointer-events-auto">
                 <button
                   type="button"
                   class="p-0.5 rounded-[3px] text-[#EDEDEF] hover:bg-white/[0.08]"
@@ -314,8 +320,6 @@ function formatRelativeAge(timestamp: number): string {
     {/if}
 
     <div>
-
-
       {#if !chatStore.showArchived && uniqueProjectPaths.length > 0}
         <div class="px-2 py-1 flex items-center justify-between">
           <span class="text-[11px] font-sans text-[#66666D]">Projects</span>
@@ -329,9 +333,12 @@ function formatRelativeAge(timestamp: number): string {
           </button>
         </div>
         {#each uniqueProjectPaths as projPath (normProj(projPath))}
+          {@const projNorm = normProj(projPath)}
           {@const projName = projPath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || projPath}
-          {@const thisProjChats = projectChatsByNorm.get(normProj(projPath)) || []}
-          {@const isProjCollapsed = Boolean(collapsedProjects[normProj(projPath)])}
+          {@const thisProjChats = projectChatsByNorm.get(projNorm) || []}
+          {@const projLimit = visibleProjectLimits[projNorm] || 20}
+          {@const visibleProjChats = thisProjChats.slice(0, projLimit)}
+          {@const isProjCollapsed = Boolean(collapsedProjects[projNorm])}
           <div data-omni-project-group="" class="mb-2">
             <div
               data-omni-project-header=""
@@ -349,7 +356,7 @@ function formatRelativeAge(timestamp: number): string {
               </button>
               <button
                 type="button"
-                class="flex-1 min-w-0 px-1 py-1.5 flex items-center gap-2 text-left {normProj(workspaceStore.currentPath) === normProj(projPath) ? 'text-[#EDEDEF]' : 'text-[#A3A3AA] hover:text-white'} transition-colors"
+                class="flex-1 min-w-0 px-1 py-1.5 flex items-center gap-2 text-left {normProj(workspaceStore.currentPath) === projNorm ? 'text-[#EDEDEF]' : 'text-[#A3A3AA] hover:text-white'} transition-colors"
                 onclick={() => workspaceStore.setWorkspaceDir(projPath)}
                 title={projPath}
               >
@@ -367,13 +374,10 @@ function formatRelativeAge(timestamp: number): string {
               </button>
             </div>
             {#if !isProjCollapsed}
-            <div data-omni-project-chats="" transition:slide={{ duration: 140 }} class="pl-2 space-y-0.5">
-              {#each thisProjChats as chat (chat.id)}
+            <div data-omni-project-chats="" class="pl-2 space-y-0.5">
+              {#each visibleProjChats as chat (chat.id)}
                 <div
                   data-omni-chat-item=""
-                  animate:flip={{ duration: 170 }}
-                  in:pinReceive={{ key: chat.id }}
-                  out:pinSend={{ key: chat.id }}
                   class="group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[6px] cursor-pointer transition-colors duration-150 {chatStore.activeChatId === chat.id ? 'bg-white/[0.08] text-[#F5F5F7]' : 'text-[#B3B3BA] hover:bg-white/[0.04] hover:text-[#E5E5E8]'}"
                   onclick={() => chatStore.selectSession(chat.id)}
                   role="button"
@@ -399,14 +403,14 @@ function formatRelativeAge(timestamp: number): string {
                         onblur={() => handleSaveRename(chat.id)}
                       />
                     {:else}
-                      <span class="truncate text-[12.5px] font-sans leading-snug transition-all duration-150">{chat.title}</span>
+                      <span class="truncate text-[12.5px] font-sans leading-snug">{chat.title}</span>
                     {/if}
                   </div>
                   <div class="shrink-0 relative flex items-center justify-end min-w-[68px]">
                     <span class="font-mono text-[11px] text-[#606068] opacity-100 group-hover:opacity-0 transition-opacity duration-150 pointer-events-none">
                       {formatRelativeAge(chat.updatedAt)}
                     </span>
-                    <div class="absolute right-0 flex items-center gap-0.5 opacity-0 scale-95 group-hover:opacity-100 group-hover:scale-100 transition-all duration-150 pointer-events-none group-hover:pointer-events-auto">
+                    <div class="absolute right-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none group-hover:pointer-events-auto">
                       <button
                         type="button"
                         class="p-0.5 rounded-[3px] text-[#66666D] hover:text-[#EDEDEF] hover:bg-white/[0.08]"
@@ -443,25 +447,31 @@ function formatRelativeAge(timestamp: number): string {
                   </div>
                 </div>
               {/each}
+              {#if thisProjChats.length > projLimit}
+                <button
+                  type="button"
+                  class="pl-2.5 py-1 text-[11px] text-[#6B6B72] hover:text-[#D4D4D8] transition-colors"
+                  onclick={() => (visibleProjectLimits = { ...visibleProjectLimits, [projNorm]: projLimit + 30 })}
+                >
+                  Show more ({thisProjChats.length - projLimit})
+                </button>
+              {/if}
             </div>
             {/if}
           </div>
         {/each}
       {/if}
 
-      {#if standaloneChats.length > 0 && !chatStore.showArchived}
+      {#if visibleStandaloneChats.length > 0 && !chatStore.showArchived}
         {#if uniqueProjectPaths.length > 0}
           <div class="my-2 border-t border-white/[0.07]"></div>
         {/if}
         <div data-omni-standalone-header="" class="px-2 py-1 text-[11px] font-sans text-[#66666D]">Без проекта</div>
       {/if}
       <div class="space-y-0.5">
-        {#each (chatStore.showArchived ? chatStore.recentSessions : standaloneChats) as chat (chat.id)}
+        {#each visibleStandaloneChats as chat (chat.id)}
           <div
             data-omni-chat-item=""
-            animate:flip={{ duration: 170 }}
-            in:pinReceive={{ key: chat.id }}
-            out:pinSend={{ key: chat.id }}
             class="group flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[6px] cursor-pointer transition-colors duration-150 {chatStore.activeChatId === chat.id ? 'bg-white/[0.08] text-[#F5F5F7]' : 'text-[#B3B3BA] hover:bg-white/[0.04] hover:text-[#E5E5E8]'}"
             onclick={() => chatStore.selectSession(chat.id)}
             role="button"
@@ -488,7 +498,7 @@ function formatRelativeAge(timestamp: number): string {
                   onblur={() => handleSaveRename(chat.id)}
                 />
               {:else}
-                <span class="truncate text-[12.5px] font-sans leading-snug transition-all duration-150">{chat.title}</span>
+                <span class="truncate text-[12.5px] font-sans leading-snug">{chat.title}</span>
               {/if}
             </div>
 
@@ -496,7 +506,7 @@ function formatRelativeAge(timestamp: number): string {
               <span class="font-mono text-[11px] text-[#606068] opacity-100 group-hover:opacity-0 transition-opacity duration-150 pointer-events-none">
                 {formatRelativeAge(chat.updatedAt)}
               </span>
-              <div class="absolute right-0 flex items-center gap-0.5 opacity-0 scale-95 group-hover:opacity-100 group-hover:scale-100 transition-all duration-150 pointer-events-none group-hover:pointer-events-auto">
+              <div class="absolute right-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none group-hover:pointer-events-auto">
                 {#if !chat.archived}
                   <button
                     type="button"
@@ -541,15 +551,15 @@ function formatRelativeAge(timestamp: number): string {
         <button
           type="button"
           class="mt-1.5 pl-7 pr-2 py-1 text-[11.5px] font-sans text-[#6B6B72] hover:text-[#D4D4D8] transition-colors"
-          onclick={() => (showAllSessions = true)}
+          onclick={() => (visibleStandaloneLimit += 40)}
         >
-          Show more
+          Show more ({allStandaloneChats.length - visibleStandaloneLimit})
         </button>
-      {:else if showAllSessions && chatStore.recentSessions.length > INITIAL_LIMIT}
+      {:else if visibleStandaloneLimit > 24 && allStandaloneChats.length > 24}
         <button
           type="button"
           class="mt-1.5 pl-7 pr-2 py-1 text-[11.5px] font-sans text-[#6B6B72] hover:text-[#D4D4D8] transition-colors"
-          onclick={() => (showAllSessions = false)}
+          onclick={() => (visibleStandaloneLimit = 24)}
         >
           Show less
         </button>
@@ -570,7 +580,6 @@ function formatRelativeAge(timestamp: number): string {
     </button>
   </div>
 </aside>
-
 
 <svelte:window onclick={() => { if (projCtxMenu?.open) projCtxMenu = null; }} />
 

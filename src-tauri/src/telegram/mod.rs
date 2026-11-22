@@ -639,6 +639,10 @@ impl TelegramBotManager {
         t.clone()
     }
 
+    pub fn is_running_sync(&self) -> bool {
+        self.is_running.load(Ordering::SeqCst)
+    }
+
     pub async fn is_running(&self) -> bool {
         self.is_running.load(Ordering::SeqCst)
     }

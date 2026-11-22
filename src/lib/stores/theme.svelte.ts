@@ -188,6 +188,10 @@ class ThemeStore {
   isStudioOpen = $state<boolean>(false);
   isFullscreenPreview = $state<boolean>(false);
 
+  private unlistenPatch: (() => void) | null = null;
+  private keydownHandler: ((e: KeyboardEvent) => void) | null = null;
+  private disposed = false;
+
   activeTheme = $derived.by(() => {
     if (!this.activeThemeId) return null;
     return this.themes.find((t) => t.id === this.activeThemeId) || null;
@@ -202,6 +206,18 @@ class ThemeStore {
 
   constructor() {
     this.init();
+  }
+
+  public destroy(): void {
+    this.disposed = true;
+    if (this.unlistenPatch) {
+      this.unlistenPatch();
+      this.unlistenPatch = null;
+    }
+    if (this.keydownHandler && typeof window !== 'undefined') {
+      window.removeEventListener('keydown', this.keydownHandler);
+      this.keydownHandler = null;
+    }
   }
 
   public syncDomStylesheet(cssText: string): void {
@@ -223,29 +239,35 @@ class ThemeStore {
 
   private async init(): Promise<void> {
     await this.reload();
+    if (this.disposed) return;
     listen<OmniTheme>('theme-studio-patch', (ev) => {
       const updated = ev.payload;
       if (!updated || !updated.id) return;
       const idx = this.themes.findIndex((t) => t.id === updated.id);
       if (idx >= 0) {
         this.themes[idx] = updated;
-        this.themes = [...this.themes];
       } else {
-        this.themes = [updated, ...this.themes];
+        this.themes.unshift(updated);
       }
       if (this.editingTheme?.id === updated.id) {
         this.editingTheme = updated;
       }
-    }).catch(() => {});
+    })
+      .then((fn) => {
+        if (this.disposed) fn();
+        else this.unlistenPatch = fn;
+      })
+      .catch(() => {});
 
     if (typeof window !== 'undefined') {
-      window.addEventListener('keydown', (e) => {
+      this.keydownHandler = (e: KeyboardEvent) => {
         if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === 'r') {
           e.preventDefault();
           this.isFullscreenPreview = false;
-          this.setActiveTheme(null);
+          void this.setActiveTheme(null);
         }
-      });
+      };
+      window.addEventListener('keydown', this.keydownHandler);
     }
   }
 
@@ -267,9 +289,8 @@ class ThemeStore {
     const idx = this.themes.findIndex((t) => t.id === saved.id);
     if (idx >= 0) {
       this.themes[idx] = saved;
-      this.themes = [...this.themes];
     } else {
-      this.themes = [saved, ...this.themes];
+      this.themes.unshift(saved);
     }
     if (this.editingTheme?.id === saved.id) {
       this.editingTheme = saved;
@@ -279,9 +300,11 @@ class ThemeStore {
 
   public async deleteTheme(id: string): Promise<void> {
     await invoke('delete_theme', { id });
-    this.themes = this.themes.filter((t) => t.id !== id);
+    const idx = this.themes.findIndex((t) => t.id === id);
+    if (idx >= 0) this.themes.splice(idx, 1);
     if (this.activeThemeId === id) {
       this.activeThemeId = null;
+      await invoke('set_active_theme_id', { id: null }).catch(() => {});
     }
     if (this.editingTheme?.id === id) {
       this.editingTheme = this.themes[0] || null;
@@ -289,10 +312,13 @@ class ThemeStore {
   }
 
   public async setActiveTheme(id: string | null): Promise<void> {
+    const prev = this.activeThemeId;
     this.activeThemeId = id;
     try {
       await invoke('set_active_theme_id', { id });
-    } catch {}
+    } catch {
+      this.activeThemeId = prev;
+    }
   }
 
   public openStudio(themeId?: string | null): void {
@@ -310,13 +336,13 @@ class ThemeStore {
   }
 
   public t(key: string, fallback: string, previewOnly = false): string {
-    const src = (previewOnly || this.isFullscreenPreview) ? (this.editingTheme || this.effectiveAppTheme) : this.effectiveAppTheme;
+    const src = previewOnly || this.isFullscreenPreview ? this.editingTheme || this.effectiveAppTheme : this.effectiveAppTheme;
     const val = src?.textOverrides?.[key];
     return val && val.trim() ? val : fallback;
   }
 
   public resolveIconOverride(name: string, previewOnly = false): string | null {
-    const src = (previewOnly || this.isFullscreenPreview) ? (this.editingTheme || this.effectiveAppTheme) : this.effectiveAppTheme;
+    const src = previewOnly || this.isFullscreenPreview ? this.editingTheme || this.effectiveAppTheme : this.effectiveAppTheme;
     const overrides = src?.iconOverrides;
     if (!overrides) return null;
     let direct = overrides[name];

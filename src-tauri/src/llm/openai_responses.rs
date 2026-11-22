@@ -98,6 +98,11 @@ async fn stream_openai_responses_inner(
         } else {
             (key_pool.next_key_async(provider_name, base_url).await?, None)
         };
+        let acc_client_opt = oauth_acc
+            .as_ref()
+            .and_then(|a| crate::llm::oauth_accounts::client_for_account(a));
+        let active_client = acc_client_opt.as_ref().unwrap_or(client);
+
         let caps = caps_registry.get(&request.model);
         normalize_request(&mut request, &caps);
 
@@ -159,10 +164,21 @@ async fn stream_openai_responses_inner(
                                     }));
                                 }
                                 crate::llm::request_compat::ContentPart::ImageUrl { image_url } => {
-                                    content_parts.push(serde_json::json!({
-                                        "type": "input_image",
-                                        "image_url": image_url.url,
-                                    }));
+                                    if image_url.url.starts_with("data:video/") {
+                                        content_parts.push(serde_json::json!({
+                                            "type": "input_text",
+                                            "text": "[video omitted: OpenAI Responses API does not support inline video]",
+                                        }));
+                                    } else {
+                                        let mut img_obj = serde_json::json!({
+                                            "type": "input_image",
+                                            "image_url": image_url.url,
+                                        });
+                                        if let Some(ref d) = image_url.detail {
+                                            img_obj["detail"] = serde_json::json!(d);
+                                        }
+                                        content_parts.push(img_obj);
+                                    }
                                 }
                                 crate::llm::request_compat::ContentPart::InputAudio { input_audio } => {
                                     content_parts.push(serde_json::json!({
@@ -192,9 +208,7 @@ async fn stream_openai_responses_inner(
             "input": input_items,
             "stream": true,
         });
-        let instr_joined = system_instructions.join("
-
-");
+        let instr_joined = system_instructions.join("\n\n");
         if !instr_joined.is_empty() {
             payload["instructions"] = serde_json::json!(instr_joined);
         } else if use_codex_oauth && provider_name == "openai_codex" {
@@ -231,7 +245,7 @@ async fn stream_openai_responses_inner(
         if use_codex_oauth && provider_name == "openai_codex" {
             payload["store"] = serde_json::json!(false);
         }
-        let mut req_builder = client
+        let mut req_builder = active_client
             .post(&target_url)
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json");
@@ -274,7 +288,7 @@ async fn stream_openai_responses_inner(
             let mut token_usage: Option<TokenUsage> = None;
             let mut finish_reason: Option<String> = None;
 
-            while let Some(chunk_res) = byte_stream.next().await {
+            'resp_loop: while let Some(chunk_res) = byte_stream.next().await {
                 let chunk = match chunk_res {
                     Ok(c) => c,
                     Err(e) => return Err(LlmError::Network(e)),
@@ -285,7 +299,7 @@ async fn stream_openai_responses_inner(
 
                 while let Some(pos) = line_buffer.find('\n') {
                     let line = line_buffer[..pos].trim_end_matches('\r').to_string();
-                    line_buffer = line_buffer[pos + 1..].to_string();
+                    line_buffer.drain(..=pos);
 
                     if line.is_empty() || line.starts_with(':') {
                         continue;
@@ -299,7 +313,7 @@ async fn stream_openai_responses_inner(
                     if let Some(stripped) = line.strip_prefix("data: ") {
                         let data_str = stripped.trim();
                         if data_str == "[DONE]" {
-                            break;
+                            break 'resp_loop;
                         }
 
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_str) {
@@ -564,7 +578,7 @@ async fn stream_openai_responses_inner(
             last_oauth_err = Some(LlmError::ProviderError { status: code, message: error_body.clone() });
             if attempt < max_attempts && matches!(code, 401 | 403 | 429 | 500..=504) {
                 if code == 401 {
-                    let _ = crate::llm::oauth_accounts::force_refresh_account(client, &acc.id).await;
+                    let _ = crate::llm::oauth_accounts::force_refresh_account(active_client, &acc.id).await;
                 }
                 let acc_cnt = crate::llm::oauth_accounts::list_accounts(Some("openai_codex")).await.into_iter().filter(|a| a.enabled).count();
                 let reason = if acc_cnt > 1 {

@@ -1,5 +1,5 @@
 <script lang="ts">
-import { flip } from 'svelte/animate';
+import { onMount } from 'svelte';
 import { fade, slide } from 'svelte/transition';
 import { Tween, Spring } from 'svelte/motion';
 import { cubicOut } from 'svelte/easing';
@@ -18,49 +18,14 @@ interface MemoryItem {
 
 const MAX_TOKENS = 32768;
 
-let memories = $state<MemoryItem[]>([
-  {
-    id: 'mem-1',
-    key: 'user.language_and_tone',
-    category: 'preferences',
-    content: 'Concise Russian technical communication, zero redundant commentary.',
-    tokens: 42,
-    priority: 'high',
-    updatedAt: '2026-11-12 18:30'
-  },
-  {
-    id: 'mem-2',
-    key: 'architecture.graphite_theme',
-    category: 'architecture',
-    content: 'Matte graphite surfaces (#121214 / #161618 / #1C1C1F) with 6px corners.',
-    tokens: 68,
-    priority: 'high',
-    updatedAt: '2026-11-12 19:15'
-  },
-  {
-    id: 'mem-3',
-    key: 'architecture.sqlite_wal_pragmas',
-    category: 'architecture',
-    content: 'SQLite enforces PRAGMA journal_mode = WAL, synchronous = NORMAL, foreign_keys = ON.',
-    tokens: 54,
-    priority: 'high',
-    updatedAt: '2026-11-12 19:40'
-  },
-  {
-    id: 'mem-4',
-    key: 'environment.windows_subsystem',
-    category: 'environment',
-    content: 'Pass CREATE_NO_WINDOW (0x08000000) for Command creation on Windows 11.',
-    tokens: 58,
-    priority: 'high',
-    updatedAt: '2026-11-12 20:00'
-  }
-]);
+let memories = $state<MemoryItem[]>([]);
 
 const CATEGORIES = ['all', 'preferences', 'architecture', 'environment', 'skills', 'lessons'] as const;
 
 let selectedCategory = $state<(typeof CATEGORIES)[number]>('all');
 let searchQuery = $state<string>('');
+let debouncedQuery = $state<string>('');
+let searchTimer: ReturnType<typeof setTimeout> | null = null;
 let selectedMemoryId = $state<string | null>(null);
 let isCompacting = $state<boolean>(false);
 let showAddForm = $state<boolean>(false);
@@ -85,13 +50,41 @@ $effect(() => {
   filterPillIndex.target = Math.max(0, CATEGORIES.indexOf(selectedCategory));
 });
 
+function handleSearchInput(e: Event) {
+  searchQuery = (e.currentTarget as HTMLInputElement).value;
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    debouncedQuery = searchQuery.trim().toLowerCase();
+  }, 150);
+}
+
+async function loadMemories() {
+  try {
+    const res = await invoke<MemoryItem[]>('list_memory_entries');
+    if (Array.isArray(res)) {
+      memories = res;
+    }
+  } catch (err: unknown) {
+    notification = {
+      type: 'error',
+      message: err instanceof Error ? err.message : String(err)
+    };
+  }
+}
+
+onMount(() => {
+  loadMemories();
+  return () => {
+    if (searchTimer) clearTimeout(searchTimer);
+  };
+});
+
 let filteredMemories = $derived(
   memories.filter((m) => {
     const matchCat = selectedCategory === 'all' || m.category === selectedCategory;
     if (!matchCat) return false;
-    if (!searchQuery.trim()) return true;
-    const q = searchQuery.toLowerCase();
-    return m.key.toLowerCase().includes(q) || m.content.toLowerCase().includes(q);
+    if (!debouncedQuery) return true;
+    return m.key.toLowerCase().includes(debouncedQuery) || m.content.toLowerCase().includes(debouncedQuery);
   })
 );
 
@@ -102,23 +95,34 @@ async function compactMemory() {
     const res = await invoke<{ prunedCount: number; savedTokens: number }>('compact_memory_entries', {
       maxTokens: MAX_TOKENS
     });
+    await loadMemories();
     notification = {
       type: 'success',
       message: `Compacted: pruned ${res?.prunedCount ?? 0} entries, freed ${res?.savedTokens ?? 0} tokens`
     };
-  } catch {
-    notification = { type: 'success', message: 'Memory index compacted' };
+  } catch (err: unknown) {
+    notification = {
+      type: 'error',
+      message: err instanceof Error ? err.message : String(err)
+    };
   } finally {
     isCompacting = false;
   }
 }
 
 async function deleteMemory(id: string) {
+  const prev = memories;
   memories = memories.filter((m) => m.id !== id);
   if (selectedMemoryId === id) selectedMemoryId = null;
   try {
     await invoke('delete_memory_entry', { id });
-  } catch {}
+  } catch (err: unknown) {
+    memories = prev;
+    notification = {
+      type: 'error',
+      message: err instanceof Error ? err.message : String(err)
+    };
+  }
 }
 
 async function addMemory(e: Event) {
@@ -134,13 +138,20 @@ async function addMemory(e: Event) {
     priority: 'normal',
     updatedAt: new Date().toISOString().slice(0, 16).replace('T', ' ')
   };
+  const prev = memories;
   memories = [entry, ...memories];
   try {
     await invoke('create_memory_entry', { entry });
-  } catch {}
-  newKey = '';
-  newContent = '';
-  showAddForm = false;
+    newKey = '';
+    newContent = '';
+    showAddForm = false;
+  } catch (err: unknown) {
+    memories = prev;
+    notification = {
+      type: 'error',
+      message: err instanceof Error ? err.message : String(err)
+    };
+  }
 }
 </script>
 
@@ -188,7 +199,7 @@ async function addMemory(e: Event) {
   </div>
 
   {#if notification}
-    <div transition:fade={{ duration: 150 }} class="px-3.5 py-2 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] text-xs text-[#A3A3AA]">
+    <div transition:fade={{ duration: 150 }} class="px-3.5 py-2 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] text-xs {notification.type === 'error' ? 'text-[#F87171]' : 'text-[#A3A3AA]'}">
       {notification.message}
     </div>
   {/if}
@@ -236,7 +247,8 @@ async function addMemory(e: Event) {
   <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
     <div class="relative flex-1 max-w-xs">
       <input
-        bind:value={searchQuery}
+        value={searchQuery}
+        oninput={handleSearchInput}
         type="text"
         placeholder="Filter memory..."
         class="w-full px-3 py-1.5 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] text-xs text-[#E5E5E8] placeholder-[#66666D] outline-none focus:border-white/[0.2]"
@@ -270,7 +282,6 @@ async function addMemory(e: Event) {
     <div class="divide-y divide-white/[0.05]">
       {#each filteredMemories as item (item.id)}
         <div
-          animate:flip={{ duration: 180 }}
           out:fade={{ duration: 120 }}
           class="grid grid-cols-[minmax(0,1fr)_72px_56px] gap-3 px-4 py-3 items-start hover:bg-white/[0.02] transition-colors"
         >

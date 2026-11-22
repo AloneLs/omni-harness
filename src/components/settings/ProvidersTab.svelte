@@ -1,20 +1,24 @@
 <script lang="ts">
-import { slide, fade, scale } from 'svelte/transition';
-import { flip } from 'svelte/animate';
+import { slide, fade } from 'svelte/transition';
 import { onMount } from 'svelte';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { settingsStore, groupProviderModels, isNonReasoningModelId, type ApiProtocol, type DetectedModelInfo, type ProviderConfig, type ReasoningLevel } from '../../lib/stores/settings.svelte';
 import Icon from '../Icon.svelte';
 
+interface ApiKeyEntry {
+  id: string;
+  value: string;
+}
+
 let showForm = $state(false);
 let editingId = $state<string | null>(null);
 let name = $state('');
 let baseUrl = $state('');
-let apiKeys = $state<string[]>([]);
+let apiKeys = $state<ApiKeyEntry[]>([]);
 let newKeyInput = $state('');
-let revealedKeys = $state<Record<number, boolean>>({});
-let keyTestStatus = $state<Record<number, { state: 'idle' | 'testing' | 'ok' | 'err'; count?: number; error?: string }>>({});
+let revealedKeys = $state<Record<string, boolean>>({});
+let keyTestStatus = $state<Record<string, { state: 'idle' | 'testing' | 'ok' | 'err'; count?: number; error?: string }>>({});
 let apiProtocol = $state<ApiProtocol>('auto');
 let proxyEnabled = $state(false);
 let proxyUrl = $state('');
@@ -22,6 +26,9 @@ let modelTestStatus = $state<Record<string, { state: 'idle' | 'testing' | 'ok' |
 
 let fetchedModels = $state<DetectedModelInfo[]>([]);
 let modelSearch = $state('');
+let debouncedModelSearch = $state('');
+let modelSearchTimer: ReturnType<typeof setTimeout> | null = null;
+let visibleFetchedLimit = $state(80);
 let customModelId = $state('');
 let isFetchingModels = $state(false);
 let fetchError = $state<string | null>(null);
@@ -29,6 +36,7 @@ let pendingModels = $state<DetectedModelInfo[]>([]);
 let cardModelInputs = $state<Record<string, string>>({});
 
 let fetchTimer: ReturnType<typeof setTimeout> | null = null;
+let discoverReqId = 0;
 
 interface OAuthAccountItem {
   id: string;
@@ -36,6 +44,7 @@ interface OAuthAccountItem {
   email: string;
   projectId?: string | null;
   accountId?: string | null;
+  proxyUrl?: string | null;
   enabled: boolean;
   expiresAtMs: number;
   cooldownUntilMs?: number | null;
@@ -78,18 +87,39 @@ let oauthManualInputs = $state<Record<string, string>>({});
 let oauthPendingMode = $state<Record<string, string>>({});
 let oauthBusy = $state<Record<string, boolean>>({});
 let accCheckStatus = $state<Record<string, { state: 'idle' | 'testing' | 'ok' | 'err'; error?: string }>>({});
+let accProxyEditId = $state<string | null>(null);
+let accProxyDraft = $state<string>('');
 let oauthProxyOpen = $state<boolean>(false);
 let oauthProxyEnabled = $state<boolean>(typeof localStorage !== 'undefined' && localStorage.getItem('omni_oauth_proxy_enabled') === '1');
 let oauthProxyUrl = $state<string>(typeof localStorage !== 'undefined' ? (localStorage.getItem('omni_oauth_proxy_url') || '') : '');
+let oauthProxyPoolText = $state<string>(typeof localStorage !== 'undefined' ? (localStorage.getItem('omni_oauth_proxy_pool') || '') : '');
+let oauthRotationMode = $state<'sticky' | 'round_robin' | 'random' | 'none'>(
+  (typeof localStorage !== 'undefined' ? (localStorage.getItem('omni_oauth_proxy_rotation') as any) : null) || 'sticky'
+);
 let proxySaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+function parseProxyPool(): string[] {
+  return oauthProxyPoolText
+    .split(/[\n,;]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
 
 function saveOAuthProxy(silent = false) {
   const cleanUrl = oauthProxyUrl.trim();
+  const pool = parseProxyPool();
   if (typeof localStorage !== 'undefined') {
     localStorage.setItem('omni_oauth_proxy_enabled', oauthProxyEnabled ? '1' : '0');
     localStorage.setItem('omni_oauth_proxy_url', cleanUrl);
+    localStorage.setItem('omni_oauth_proxy_pool', pool.join('\n'));
+    localStorage.setItem('omni_oauth_proxy_rotation', oauthRotationMode);
   }
-  invoke('oauth_set_proxy', { enabled: oauthProxyEnabled, url: cleanUrl }).catch(() => {});
+  invoke('oauth_set_proxy', {
+    enabled: oauthProxyEnabled,
+    url: cleanUrl,
+    proxyPool: pool,
+    rotationMode: oauthRotationMode
+  }).catch(() => {});
   for (const prov of Object.values(settingsStore.data.providers)) {
     if (OAUTH_PROTOCOLS.includes(prov.apiProtocol as any)) {
       settingsStore.updateProvider(prov.id, {
@@ -99,7 +129,13 @@ function saveOAuthProxy(silent = false) {
     }
   }
   if (!silent) {
-    oauthStatus = oauthProxyEnabled && cleanUrl ? `OAuth proxy saved: ${cleanUrl}` : 'OAuth proxy disabled';
+    oauthStatus = oauthProxyEnabled
+      ? pool.length > 0
+        ? `Global proxy rotation saved (${pool.length} proxies, mode: ${oauthRotationMode})`
+        : cleanUrl
+          ? `Global proxy saved: ${cleanUrl}`
+          : 'Global proxy enabled (enter URL or pool)'
+      : 'Global proxy disabled';
   }
 }
 
@@ -108,6 +144,28 @@ function scheduleAutoSaveProxy() {
   proxySaveTimer = setTimeout(() => {
     saveOAuthProxy(true);
   }, 350);
+}
+
+async function saveAccountProxy(acc: OAuthAccountItem, value: string | null) {
+  const cleaned = value?.trim() || null;
+  try {
+    await invoke('oauth_set_account_proxy', { id: acc.id, proxyUrl: cleaned });
+    accProxyEditId = null;
+    accProxyDraft = '';
+    await loadOAuthAccounts();
+    oauthStatus = cleaned ? `Proxy set for ${acc.email}` : `Proxy cleared for ${acc.email}`;
+  } catch (err: unknown) {
+    oauthStatus = err instanceof Error ? err.message : String(err);
+  }
+}
+
+function handleModelSearchInput(e: Event) {
+  modelSearch = (e.currentTarget as HTMLInputElement).value;
+  if (modelSearchTimer) clearTimeout(modelSearchTimer);
+  modelSearchTimer = setTimeout(() => {
+    debouncedModelSearch = modelSearch.trim().toLowerCase();
+    visibleFetchedLimit = 80;
+  }, 180);
 }
 
 function formatResetDelta(ms?: number | null): string {
@@ -125,6 +183,7 @@ function formatResetDelta(ms?: number | null): string {
 function formatAccQuotaTooltip(acc: OAuthAccountItem): string {
   const parts: string[] = [];
   if (acc.quotaLabel) parts.push(`Plan: ${acc.quotaLabel}`);
+  if (acc.proxyUrl) parts.push(`Proxy: ${acc.proxyUrl}`);
   if (typeof acc.quota5hRemaining === 'number') {
     const d = formatResetDelta(acc.quota5hResetAtMs);
     parts.push(`5h: ${Math.round(acc.quota5hRemaining)}%${d ? ` (resets ${d})` : ''}`);
@@ -185,6 +244,10 @@ function getOAuthProxyParams(oauthProv?: string): { proxyEnabled: boolean; proxy
   if (oauthProxyEnabled && oauthProxyUrl.trim()) {
     return { proxyEnabled: true, proxyUrl: oauthProxyUrl.trim() };
   }
+  const pool = parseProxyPool();
+  if (oauthProxyEnabled && pool.length > 0) {
+    return { proxyEnabled: true, proxyUrl: pool[0] };
+  }
   return { proxyEnabled: false, proxyUrl: null };
 }
 
@@ -198,15 +261,24 @@ async function loadOAuthAccounts() {
 }
 
 onMount(() => {
-  invoke<{ enabled: boolean; url: string }>('oauth_get_proxy')
+  let disposed = false;
+  invoke<{ enabled: boolean; url: string; proxyPool?: string[]; rotationMode?: string }>('oauth_get_proxy')
     .then((px) => {
-      if (px && (px.enabled || px.url)) {
-        oauthProxyEnabled = px.enabled;
+      if (disposed || !px) return;
+      if (px.enabled || px.url || (px.proxyPool && px.proxyPool.length > 0)) {
+        oauthProxyEnabled = Boolean(px.enabled);
         oauthProxyUrl = px.url || '';
+        if (Array.isArray(px.proxyPool)) {
+          oauthProxyPoolText = px.proxyPool.join('\n');
+        }
+        if (px.rotationMode && ['sticky', 'round_robin', 'random', 'none'].includes(px.rotationMode)) {
+          oauthRotationMode = px.rotationMode as any;
+        }
       }
     })
     .catch(() => {});
   loadOAuthAccounts().then(() => {
+    if (disposed) return;
     const missingProviders = Array.from(
       new Set(
         oauthAccounts
@@ -239,7 +311,12 @@ onMount(() => {
     } finally {
       oauthBusy = { ...oauthBusy, zcode_oauth: false };
     }
-  }).then((fn) => (unlistenZcode = fn)).catch(() => {});
+  })
+    .then((fn) => {
+      if (disposed) fn();
+      else unlistenZcode = fn;
+    })
+    .catch(() => {});
 
   let unlisten: (() => void) | null = null;
   listen<{ provider?: string }>('oauth-accounts-updated', async (ev) => {
@@ -247,9 +324,20 @@ onMount(() => {
     if (ev.payload?.provider) {
       await ensureOAuthProviderRegistered(ev.payload.provider);
     }
-  }).then((fn) => (unlisten = fn)).catch(() => {});
+  })
+    .then((fn) => {
+      if (disposed) fn();
+      else unlisten = fn;
+    })
+    .catch(() => {});
+
   return () => {
-    if (unlisten) unlisten(); if (unlistenZcode) unlistenZcode();
+    disposed = true;
+    if (fetchTimer) clearTimeout(fetchTimer);
+    if (proxySaveTimer) clearTimeout(proxySaveTimer);
+    if (modelSearchTimer) clearTimeout(modelSearchTimer);
+    if (unlisten) unlisten();
+    if (unlistenZcode) unlistenZcode();
   };
 });
 
@@ -484,11 +572,24 @@ async function deleteOAuthAcc(acc: OAuthAccountItem) {
 let providersList = $derived(Object.values(settingsStore.data.providers));
 let regularProvidersList = $derived(providersList.filter((p) => !OAUTH_PROTOCOLS.includes((p.apiProtocol || '') as any)));
 
-let filteredFetchedModels = $derived.by(() => {
-  const q = modelSearch.trim().toLowerCase();
-  if (!q) return fetchedModels;
-  return fetchedModels.filter((m) => m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q));
+let groupedModelsByProvider = $derived.by(() => {
+  const map = new Map<string, ReturnType<typeof groupProviderModels>>();
+  for (const p of providersList) {
+    map.set(p.id, groupProviderModels(p.availableModels));
+  }
+  return map;
 });
+
+let filteredFetchedModels = $derived.by(() => {
+  if (!debouncedModelSearch) return fetchedModels;
+  return fetchedModels.filter(
+    (m) => m.id.toLowerCase().includes(debouncedModelSearch) || m.name.toLowerCase().includes(debouncedModelSearch)
+  );
+});
+
+function makeKeyEntry(value: string): ApiKeyEntry {
+  return { id: `key-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, value };
+}
 
 function openCreateForm() {
   editingId = null;
@@ -504,6 +605,8 @@ function openCreateForm() {
   fetchedModels = [];
   pendingModels = [];
   modelSearch = '';
+  debouncedModelSearch = '';
+  visibleFetchedLimit = 80;
   fetchError = null;
   showForm = true;
 }
@@ -515,7 +618,8 @@ function openEditForm(prov: ProviderConfig) {
   apiKeys = (prov.apiKey || '')
     .split(/[\n,;]+/)
     .map((k) => k.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .map(makeKeyEntry);
   newKeyInput = '';
   revealedKeys = {};
   keyTestStatus = {};
@@ -524,6 +628,8 @@ function openEditForm(prov: ProviderConfig) {
   proxyUrl = prov.proxyUrl || '';
   fetchedModels = [];
   modelSearch = '';
+  debouncedModelSearch = '';
+  visibleFetchedLimit = 80;
   fetchError = null;
   pendingModels = prov.availableModels.map((id) => {
     const cap = prov.modelCapabilities?.[id];
@@ -554,8 +660,8 @@ function maskKey(k: string): string {
 function addApiKeyToList() {
   const k = newKeyInput.trim();
   if (!k) return;
-  if (!apiKeys.includes(k)) {
-    apiKeys = [...apiKeys, k];
+  if (!apiKeys.some((item) => item.value === k)) {
+    apiKeys = [...apiKeys, makeKeyEntry(k)];
     if (apiKeys.length === 1 && baseUrl.trim().startsWith('http')) {
       discoverModels();
     }
@@ -563,41 +669,34 @@ function addApiKeyToList() {
   newKeyInput = '';
 }
 
-function removeApiKeyFromList(idx: number) {
-  apiKeys = apiKeys.filter((_, i) => i !== idx);
-  const nextRevealed: Record<number, boolean> = {};
-  const nextTests: typeof keyTestStatus = {};
-  for (const [k, v] of Object.entries(revealedKeys)) {
-    const n = Number(k);
-    if (n < idx) nextRevealed[n] = v;
-    else if (n > idx) nextRevealed[n - 1] = v;
-  }
-  for (const [k, v] of Object.entries(keyTestStatus)) {
-    const n = Number(k);
-    if (n < idx) nextTests[n] = v;
-    else if (n > idx) nextTests[n - 1] = v;
-  }
+function removeApiKeyFromList(keyId: string) {
+  apiKeys = apiKeys.filter((item) => item.id !== keyId);
+  const nextRevealed = { ...revealedKeys };
+  delete nextRevealed[keyId];
   revealedKeys = nextRevealed;
+  const nextTests = { ...keyTestStatus };
+  delete nextTests[keyId];
   keyTestStatus = nextTests;
 }
 
-async function testSingleApiKey(idx: number) {
+async function testSingleApiKey(entry: ApiKeyEntry) {
   const url = baseUrl.trim();
-  const key = apiKeys[idx];
-  if (!url || !key) return;
-  keyTestStatus = { ...keyTestStatus, [idx]: { state: 'testing' } };
+  if (!url || !entry.value) return;
+  keyTestStatus = { ...keyTestStatus, [entry.id]: { state: 'testing' } };
   try {
     const res = await invoke<DetectedModelInfo[]>('fetch_provider_models', {
       baseUrl: url,
-      apiKey: key,
+      apiKey: entry.value,
       proxyEnabled,
       proxyUrl: proxyUrl.trim() || null
     });
-    keyTestStatus = { ...keyTestStatus, [idx]: { state: 'ok', count: Array.isArray(res) ? res.length : 0 } };
+    if (!apiKeys.some((k) => k.id === entry.id)) return;
+    keyTestStatus = { ...keyTestStatus, [entry.id]: { state: 'ok', count: Array.isArray(res) ? res.length : 0 } };
   } catch (err: unknown) {
+    if (!apiKeys.some((k) => k.id === entry.id)) return;
     keyTestStatus = {
       ...keyTestStatus,
-      [idx]: { state: 'err', error: err instanceof Error ? err.message : String(err) }
+      [entry.id]: { state: 'err', error: err instanceof Error ? err.message : String(err) }
     };
   }
 }
@@ -617,6 +716,8 @@ function closeForm() {
   fetchedModels = [];
   pendingModels = [];
   modelSearch = '';
+  debouncedModelSearch = '';
+  visibleFetchedLimit = 80;
   fetchError = null;
 }
 
@@ -631,28 +732,39 @@ function scheduleDiscovery() {
 async function discoverModels() {
   const url = baseUrl.trim();
   if (!url) return;
+  const reqId = ++discoverReqId;
   isFetchingModels = true;
   fetchError = null;
   try {
-    const activeKey = apiKeys[0] || newKeyInput.trim();
+    const activeKey = apiKeys[0]?.value || newKeyInput.trim();
     const res = await invoke<DetectedModelInfo[]>('fetch_provider_models', {
       baseUrl: url,
       apiKey: activeKey,
       proxyEnabled,
       proxyUrl: proxyUrl.trim() || null
     });
-    fetchedModels = Array.isArray(res) ? res : [];
-    if (fetchedModels.length > 0 && pendingModels.length > 0) {
-      pendingModels = pendingModels.map((pm) => {
-        const fresh = fetchedModels.find((f) => f.id === pm.id);
-        return fresh || pm;
-      });
+    if (reqId !== discoverReqId) return;
+    const dedupedMap = new Map<string, DetectedModelInfo>();
+    if (Array.isArray(res)) {
+      for (const item of res) {
+        if (item?.id && !dedupedMap.has(item.id)) {
+          dedupedMap.set(item.id, item);
+        }
+      }
+    }
+    fetchedModels = Array.from(dedupedMap.values());
+    visibleFetchedLimit = 80;
+    if (dedupedMap.size > 0 && pendingModels.length > 0) {
+      pendingModels = pendingModels.map((pm) => dedupedMap.get(pm.id) || pm);
     }
   } catch (err: unknown) {
+    if (reqId !== discoverReqId) return;
     fetchError = err instanceof Error ? err.message : String(err);
     fetchedModels = [];
   } finally {
-    isFetchingModels = false;
+    if (reqId === discoverReqId) {
+      isFetchingModels = false;
+    }
   }
 }
 
@@ -746,7 +858,7 @@ function handleSaveProvider(e: Event) {
   const cleanUrl = baseUrl.trim();
   if (!cleanName || !cleanUrl || pendingModels.length === 0) return;
 
-  const finalKeys = [...apiKeys];
+  const finalKeys = apiKeys.map((k) => k.value);
   const pendingInput = newKeyInput.trim();
   if (pendingInput && !finalKeys.includes(pendingInput)) {
     finalKeys.push(pendingInput);
@@ -804,9 +916,9 @@ function handleSaveProvider(e: Event) {
       <button
         type="button"
         onclick={() => (oauthProxyOpen = !oauthProxyOpen)}
-        class="h-8 px-3 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border text-xs transition-all whitespace-nowrap {oauthProxyEnabled && oauthProxyUrl.trim() ? 'border-[#8B5CF6]/50 text-[#D8B4FE]' : 'border-white/[0.08] text-[#A3A3AA]'}"
+        class="h-8 px-3 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border text-xs transition-all whitespace-nowrap {oauthProxyEnabled && (oauthProxyUrl.trim() || oauthProxyPoolText.trim()) ? 'border-[#8B5CF6]/50 text-[#D8B4FE]' : 'border-white/[0.08] text-[#A3A3AA]'}"
       >
-        {oauthProxyEnabled && oauthProxyUrl.trim() ? 'Proxy: ON' : 'OAuth Proxy'}
+        {oauthProxyEnabled && (oauthProxyUrl.trim() || oauthProxyPoolText.trim()) ? 'Proxy: ON' : 'Global Proxy'}
       </button>
       <button
         type="button"
@@ -837,37 +949,63 @@ function handleSaveProvider(e: Event) {
   </div>
 
   {#if oauthProxyOpen}
-    <div class="p-3 rounded-[6px] bg-[#18181B]/70 border border-white/[0.08] flex items-center gap-3" in:slide={{ duration: 140 }}>
-      <div class="flex items-center gap-2 shrink-0">
+    <div class="p-3.5 rounded-[6px] bg-[#18181B]/70 border border-white/[0.08] space-y-2.5" in:slide={{ duration: 140 }}>
+      <div class="flex items-center gap-3">
+        <div class="flex items-center gap-2 shrink-0">
+          <button
+            type="button"
+            class="w-9 h-5 rounded-full p-0.5 transition-all duration-200 {oauthProxyEnabled ? 'bg-[#8B5CF6]' : 'bg-[#27272A]'}"
+            onclick={() => {
+              oauthProxyEnabled = !oauthProxyEnabled;
+              saveOAuthProxy(false);
+            }}
+            aria-label="Enable Global Proxy"
+          >
+            <div class="w-4 h-4 rounded-full transition-transform duration-200 {oauthProxyEnabled ? 'translate-x-4 bg-white shadow-sm' : 'translate-x-0 bg-[#73737A]'}"></div>
+          </button>
+          <span class="text-xs text-[#D4D4D8]">Global Proxy</span>
+        </div>
+        <input
+          type="text"
+          bind:value={oauthProxyUrl}
+          oninput={scheduleAutoSaveProxy}
+          placeholder="Single proxy for all: http://127.0.0.1:7890 or socks5h://user:pass@host:1080"
+          class="flex-1 h-7 px-2.5 rounded-[5px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#5C5C64] outline-none focus:border-[#8B5CF6]/50"
+        />
+        <select
+          bind:value={oauthRotationMode}
+          onchange={() => saveOAuthProxy(false)}
+          class="h-7 px-2 rounded-[5px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#D4D4D8] outline-none"
+          title="Proxy pool rotation strategy"
+        >
+          <option value="sticky">sticky</option>
+          <option value="round_robin">round_robin</option>
+          <option value="random">random</option>
+          <option value="none">none</option>
+        </select>
         <button
           type="button"
-          class="w-9 h-5 rounded-full p-0.5 transition-all duration-200 {oauthProxyEnabled ? 'bg-[#8B5CF6]' : 'bg-[#27272A]'}"
-          onclick={() => {
-            oauthProxyEnabled = !oauthProxyEnabled;
-            saveOAuthProxy(false);
-          }}
-          aria-label="Enable OAuth Proxy"
+          onclick={() => refreshQuotas()}
+          disabled={oauthBusy.q_all}
+          class="h-7 px-2.5 rounded-[5px] bg-[#27272A] hover:bg-[#323236] border border-white/[0.08] text-[11px] text-[#EDEDEF] shrink-0 disabled:opacity-50"
+          title="Refresh quotas for all OAuth accounts"
         >
-          <div class="w-4 h-4 rounded-full transition-transform duration-200 {oauthProxyEnabled ? 'translate-x-4 bg-white shadow-sm' : 'translate-x-0 bg-[#73737A]'}"></div>
+          {oauthBusy.q_all ? 'Checking...' : 'Refresh Quotas'}
         </button>
-        <span class="text-xs text-[#D4D4D8]">OAuth Proxy</span>
       </div>
-      <input
-        type="text"
-        bind:value={oauthProxyUrl}
-        oninput={scheduleAutoSaveProxy}
-        placeholder="http://127.0.0.1:7890 or socks5://127.0.0.1:1080"
-        class="flex-1 h-7 px-2.5 rounded-[5px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#5C5C64] outline-none focus:border-[#8B5CF6]/50"
-      />
-      <button
-        type="button"
-        onclick={() => refreshQuotas()}
-        disabled={oauthBusy.q_all}
-        class="h-7 px-2.5 rounded-[5px] bg-[#27272A] hover:bg-[#323236] border border-white/[0.08] text-[11px] text-[#EDEDEF] shrink-0 disabled:opacity-50"
-        title="Refresh quotas for all OAuth accounts"
-      >
-        {oauthBusy.q_all ? 'Checking...' : 'Refresh Quotas'}
-      </button>
+      <div class="space-y-1">
+        <div class="flex items-center justify-between text-[10.5px] text-[#73737A]">
+          <span>Proxy Rotation Pool (one proxy URL per line; used across all OAuth & API requests unless overridden per account)</span>
+          <span class="font-mono">{parseProxyPool().length} in pool</span>
+        </div>
+        <textarea
+          bind:value={oauthProxyPoolText}
+          oninput={scheduleAutoSaveProxy}
+          rows="2"
+          placeholder={"http://user:pass@proxy1:8080\nsocks5h://user:pass@proxy2:1080"}
+          class="w-full px-2.5 py-1.5 rounded-[5px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-[#8B5CF6]/50 resize-y"
+        ></textarea>
+      </div>
     </div>
   {/if}
 
@@ -883,6 +1021,7 @@ function handleSaveProvider(e: Event) {
       {@const agg = aggregateLiveQuota(accs)}
       {@const provTiers = summarizeProviderTiers(accs)}
       {@const linkedProv = providersList.find((p) => p.apiProtocol === op.id)}
+      {@const linkedGrouped = linkedProv ? (groupedModelsByProvider.get(linkedProv.id) || []) : []}
       <div class="px-3.5 py-2.5 space-y-2">
         <div class="flex items-center justify-between gap-3">
           <div class="flex items-center gap-2.5 min-w-0">
@@ -979,72 +1118,125 @@ function handleSaveProvider(e: Event) {
           <div class="space-y-1">
             {#each accs as acc (acc.id)}
               {@const chk = accCheckStatus[acc.id]}
-              <div
-                class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[5px] bg-[#121214] border border-white/[0.05] text-[11px]"
-                title={formatAccQuotaTooltip(acc)}
-              >
-                <div class="flex items-center gap-2 min-w-0">
-                  <span class="w-1.5 h-1.5 rounded-full shrink-0 {acc.enabled ? (acc.cooldownUntilMs && acc.cooldownUntilMs > Date.now() ? 'bg-[#F59E0B]' : 'bg-[#22C55E]') : 'bg-[#52525B]'}"></span>
-                  <span class="font-mono text-[#D4D4D8] truncate">{acc.email}</span>
-                  {#if acc.quotaLabel}
-                    <span class="px-1.5 py-0.5 rounded-[4px] border font-mono text-[9.5px] leading-none shrink-0 {tierBadgeClass(acc.quotaLabel)}">{acc.quotaLabel}</span>
-                  {/if}
-                  {#if typeof acc.quota5hRemaining === 'number'}
-                    <span class="inline-flex items-center gap-1 font-mono text-[10px] text-[#C4B5FD] shrink-0">
-                      <svg class="w-3 h-3 -rotate-90" viewBox="0 0 20 20">
-                        <circle cx="10" cy="10" r="7" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="2.5" />
-                        <circle cx="10" cy="10" r="7" fill="none" stroke={acc.quota5hRemaining > 20 ? '#8B5CF6' : '#EF4444'} stroke-width="2.5" stroke-dasharray="43.98" stroke-dashoffset={43.98 * (1 - acc.quota5hRemaining / 100)} stroke-linecap="round" />
-                      </svg>
-                      {Math.round(acc.quota5hRemaining)}%
-                    </span>
-                  {/if}
-                  {#if typeof acc.quotaWeeklyRemaining === 'number'}
-                    <span class="inline-flex items-center gap-1 font-mono text-[10px] text-[#86EFAC] shrink-0">
-                      <svg class="w-3 h-3 -rotate-90" viewBox="0 0 20 20">
-                        <circle cx="10" cy="10" r="7" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="2.5" />
-                        <circle cx="10" cy="10" r="7" fill="none" stroke={acc.quotaWeeklyRemaining > 20 ? '#22C55E' : '#EF4444'} stroke-width="2.5" stroke-dasharray="43.98" stroke-dashoffset={43.98 * (1 - acc.quotaWeeklyRemaining / 100)} stroke-linecap="round" />
-                      </svg>
-                      {Math.round(acc.quotaWeeklyRemaining)}%
-                    </span>
-                  {/if}
-                  {#if acc.projectId}
-                    <span class="font-mono text-[10px] text-[#686870] truncate">{acc.projectId}</span>
-                  {/if}
-                  {#if acc.lastError}
-                    <span class="text-[10px] text-[#F87171] truncate max-w-[160px]" title={acc.lastError}>{acc.lastError}</span>
-                  {/if}
+              <div class="rounded-[5px] bg-[#121214] border border-white/[0.05]">
+                <div
+                  class="flex items-center justify-between gap-2 px-2.5 py-1.5 text-[11px]"
+                  title={formatAccQuotaTooltip(acc)}
+                >
+                  <div class="flex items-center gap-2 min-w-0">
+                    <span class="w-1.5 h-1.5 rounded-full shrink-0 {acc.enabled ? (acc.cooldownUntilMs && acc.cooldownUntilMs > Date.now() ? 'bg-[#F59E0B]' : 'bg-[#22C55E]') : 'bg-[#52525B]'}"></span>
+                    <span class="font-mono text-[#D4D4D8] truncate">{acc.email}</span>
+                    {#if acc.quotaLabel}
+                      <span class="px-1.5 py-0.5 rounded-[4px] border font-mono text-[9.5px] leading-none shrink-0 {tierBadgeClass(acc.quotaLabel)}">{acc.quotaLabel}</span>
+                    {/if}
+                    {#if acc.proxyUrl}
+                      <span class="px-1.5 py-0.5 rounded-[4px] border border-[#8B5CF6]/40 bg-[#8B5CF6]/10 font-mono text-[9.5px] leading-none text-[#DDD6FE] shrink-0" title={acc.proxyUrl}>PX</span>
+                    {/if}
+                    {#if typeof acc.quota5hRemaining === 'number'}
+                      <span class="inline-flex items-center gap-1 font-mono text-[10px] text-[#C4B5FD] shrink-0">
+                        <svg class="w-3 h-3 -rotate-90" viewBox="0 0 20 20">
+                          <circle cx="10" cy="10" r="7" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="2.5" />
+                          <circle cx="10" cy="10" r="7" fill="none" stroke={acc.quota5hRemaining > 20 ? '#8B5CF6' : '#EF4444'} stroke-width="2.5" stroke-dasharray="43.98" stroke-dashoffset={43.98 * (1 - acc.quota5hRemaining / 100)} stroke-linecap="round" />
+                        </svg>
+                        {Math.round(acc.quota5hRemaining)}%
+                      </span>
+                    {/if}
+                    {#if typeof acc.quotaWeeklyRemaining === 'number'}
+                      <span class="inline-flex items-center gap-1 font-mono text-[10px] text-[#86EFAC] shrink-0">
+                        <svg class="w-3 h-3 -rotate-90" viewBox="0 0 20 20">
+                          <circle cx="10" cy="10" r="7" fill="none" stroke="rgba(255,255,255,0.1)" stroke-width="2.5" />
+                          <circle cx="10" cy="10" r="7" fill="none" stroke={acc.quotaWeeklyRemaining > 20 ? '#22C55E' : '#EF4444'} stroke-width="2.5" stroke-dasharray="43.98" stroke-dashoffset={43.98 * (1 - acc.quotaWeeklyRemaining / 100)} stroke-linecap="round" />
+                        </svg>
+                        {Math.round(acc.quotaWeeklyRemaining)}%
+                      </span>
+                    {/if}
+                    {#if acc.projectId}
+                      <span class="font-mono text-[10px] text-[#686870] truncate">{acc.projectId}</span>
+                    {/if}
+                    {#if acc.lastError}
+                      <span class="text-[10px] text-[#F87171] truncate max-w-[160px]" title={acc.lastError}>{acc.lastError}</span>
+                    {/if}
+                  </div>
+                  <div class="flex items-center gap-1 shrink-0">
+                    {#if chk?.state === 'testing'}
+                      <span class="font-mono text-[10px] text-[#A3A3AA] px-1">...</span>
+                    {:else if chk?.state === 'ok'}
+                      <span class="font-mono text-[10px] text-[#4ADE80] px-1">OK</span>
+                    {:else if chk?.state === 'err'}
+                      <span class="font-mono text-[10px] text-[#F87171] px-1" title={chk.error || 'Error'}>ERR</span>
+                    {/if}
+                    <button
+                      type="button"
+                      onclick={() => {
+                        if (accProxyEditId === acc.id) {
+                          accProxyEditId = null;
+                          accProxyDraft = '';
+                        } else {
+                          accProxyEditId = acc.id;
+                          accProxyDraft = acc.proxyUrl || '';
+                        }
+                      }}
+                      class="px-2 py-0.5 rounded text-[10px] transition-colors {acc.proxyUrl ? 'bg-[#8B5CF6]/20 text-[#DDD6FE]' : 'bg-white/[0.04] hover:bg-white/[0.08] text-[#A3A3AA]'}"
+                      title="Set dedicated proxy for this OAuth account"
+                    >
+                      Proxy
+                    </button>
+                    <button
+                      type="button"
+                      onclick={() => checkAccountLiveness(acc)}
+                      class="px-2 py-0.5 rounded bg-white/[0.06] hover:bg-white/[0.12] text-[10px] text-[#D4D4D8] transition-colors"
+                      title="Check if account is alive & refresh quota"
+                    >
+                      Check
+                    </button>
+                    <button
+                      type="button"
+                      onclick={() => toggleOAuthAcc(acc)}
+                      class="px-2 py-0.5 rounded bg-white/[0.04] hover:bg-white/[0.08] text-[10px] text-[#A3A3AA]"
+                    >
+                      {acc.enabled ? 'Disable' : 'Enable'}
+                    </button>
+                    <button
+                      type="button"
+                      onclick={() => deleteOAuthAcc(acc)}
+                      class="px-2 py-0.5 rounded bg-white/[0.04] hover:bg-[#EF4444]/15 text-[10px] text-[#73737A] hover:text-[#FCA5A5]"
+                    >
+                      Remove
+                    </button>
+                  </div>
                 </div>
-                <div class="flex items-center gap-1 shrink-0">
-                  {#if chk?.state === 'testing'}
-                    <span class="font-mono text-[10px] text-[#A3A3AA] px-1">...</span>
-                  {:else if chk?.state === 'ok'}
-                    <span class="font-mono text-[10px] text-[#4ADE80] px-1">OK</span>
-                  {:else if chk?.state === 'err'}
-                    <span class="font-mono text-[10px] text-[#F87171] px-1" title={chk.error || 'Error'}>ERR</span>
-                  {/if}
-                  <button
-                    type="button"
-                    onclick={() => checkAccountLiveness(acc)}
-                    class="px-2 py-0.5 rounded bg-white/[0.06] hover:bg-white/[0.12] text-[10px] text-[#D4D4D8] transition-colors"
-                    title="Check if account is alive & refresh quota"
-                  >
-                    Check
-                  </button>
-                  <button
-                    type="button"
-                    onclick={() => toggleOAuthAcc(acc)}
-                    class="px-2 py-0.5 rounded bg-white/[0.04] hover:bg-white/[0.08] text-[10px] text-[#A3A3AA]"
-                  >
-                    {acc.enabled ? 'Disable' : 'Enable'}
-                  </button>
-                  <button
-                    type="button"
-                    onclick={() => deleteOAuthAcc(acc)}
-                    class="px-2 py-0.5 rounded bg-white/[0.04] hover:bg-[#EF4444]/15 text-[10px] text-[#73737A] hover:text-[#FCA5A5]"
-                  >
-                    Remove
-                  </button>
-                </div>
+                {#if accProxyEditId === acc.id}
+                  <div class="px-2.5 pb-2 pt-1 border-t border-white/[0.05] flex items-center gap-1.5">
+                    <input
+                      type="text"
+                      bind:value={accProxyDraft}
+                      placeholder="Dedicated proxy: socks5h://user:pass@host:port or http://host:port"
+                      class="flex-1 h-7 px-2 rounded-[4px] bg-[#18181B] border border-white/[0.08] font-mono text-[10.5px] text-[#E5E5E8] placeholder-[#5C5C64] outline-none"
+                      onkeydown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          saveAccountProxy(acc, accProxyDraft);
+                        }
+                      }}
+                    />
+                    <button
+                      type="button"
+                      onclick={() => saveAccountProxy(acc, accProxyDraft)}
+                      class="h-7 px-2.5 rounded-[4px] bg-[#EDEDEF] hover:bg-white text-[#111113] text-[10.5px] font-medium"
+                    >
+                      Save
+                    </button>
+                    {#if acc.proxyUrl}
+                      <button
+                        type="button"
+                        onclick={() => saveAccountProxy(acc, null)}
+                        class="h-7 px-2 rounded-[4px] bg-white/[0.05] hover:bg-[#EF4444]/20 text-[10.5px] text-[#A3A3AA] hover:text-[#FCA5A5]"
+                      >
+                        Clear
+                      </button>
+                    {/if}
+                  </div>
+                {/if}
               </div>
             {/each}
           </div>
@@ -1058,7 +1250,7 @@ function handleSaveProvider(e: Event) {
           {:else}
             <div class="pt-2 border-t border-white/[0.06] space-y-1.5">
               <div class="flex items-center justify-between gap-2">
-                <span class="text-[10.5px] text-[#73737A]">Enabled Models ({groupProviderModels(linkedProv.availableModels).length})</span>
+                <span class="text-[10.5px] text-[#73737A]">Enabled Models ({linkedGrouped.length})</span>
                 <div class="flex items-center gap-1">
                   <button
                     type="button"
@@ -1079,7 +1271,7 @@ function handleSaveProvider(e: Event) {
                 </div>
               </div>
               <div class="flex flex-wrap gap-1.5">
-                {#each groupProviderModels(linkedProv.availableModels) as grp (grp.displayId)}
+                {#each linkedGrouped as grp (grp.displayId)}
                   {@const probeId = grp.rawIds[0]}
                   {@const cap = linkedProv.modelCapabilities?.[probeId]}
                   {@const tStatus = modelTestStatus[`${linkedProv.id}:${probeId}`]}
@@ -1159,282 +1351,288 @@ function handleSaveProvider(e: Event) {
     class="p-5 rounded-[6px] bg-[#1C1C1F] border border-white/[0.12] space-y-4"
     in:fade={{ duration: 150 }}
   >
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <label class="block space-y-1.5">
-            <span class="text-xs text-[#A3A3AA]">Provider Name</span>
-            <input
-              bind:value={name}
-              type="text"
-              placeholder="OpenRouter / Local"
-              required
-              class="w-full px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.08] text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-white/[0.2]"
-            />
-          </label>
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+      <label class="block space-y-1.5">
+        <span class="text-xs text-[#A3A3AA]">Provider Name</span>
+        <input
+          bind:value={name}
+          type="text"
+          placeholder="OpenRouter / Local"
+          required
+          class="w-full px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.08] text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-white/[0.2]"
+        />
+      </label>
 
-          <label class="block space-y-1.5">
-            <span class="text-xs text-[#A3A3AA]">Base URL</span>
-            <input
-              bind:value={baseUrl}
-              oninput={scheduleDiscovery}
-              type="url"
-              placeholder="https://api.example.com/v1"
-              required
-              class="w-full px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-white/[0.2]"
-            />
-          </label>
-        </div>
+      <label class="block space-y-1.5">
+        <span class="text-xs text-[#A3A3AA]">Base URL</span>
+        <input
+          bind:value={baseUrl}
+          oninput={scheduleDiscovery}
+          type="url"
+          placeholder="https://api.example.com/v1"
+          required
+          class="w-full px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-white/[0.2]"
+        />
+      </label>
+    </div>
 
-        <div class="space-y-2">
-          <span class="text-xs text-[#A3A3AA] block">API Keys ({apiKeys.length})</span>
-          <div class="flex items-center gap-2">
-            <input
-              bind:value={newKeyInput}
-              type="password"
-              placeholder="Paste API key (sk-...)"
-              onkeydown={(e) => {
-                if (e.key === 'Enter') {
-                  e.preventDefault();
-                  addApiKeyToList();
-                }
-              }}
-              class="flex-1 px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-white/[0.2]"
-            />
-            <button
-              type="button"
-              onclick={addApiKeyToList}
-              class="h-8 px-3 rounded-[6px] bg-[#27272A] hover:bg-[#323236] border border-white/[0.08] text-xs font-medium text-[#EDEDEF] flex items-center gap-1 transition-colors shrink-0"
-              title="Add key to rotation pool"
-            >
-              <Icon name="plus" class="w-3.5 h-3.5" strokeWidth={1.8} />
-              <span>Add</span>
-            </button>
-          </div>
+    <div class="space-y-2">
+      <span class="text-xs text-[#A3A3AA] block">API Keys ({apiKeys.length})</span>
+      <div class="flex items-center gap-2">
+        <input
+          bind:value={newKeyInput}
+          type="password"
+          placeholder="Paste API key (sk-...)"
+          onkeydown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              addApiKeyToList();
+            }
+          }}
+          class="flex-1 px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-white/[0.2]"
+        />
+        <button
+          type="button"
+          onclick={addApiKeyToList}
+          class="h-8 px-3 rounded-[6px] bg-[#27272A] hover:bg-[#323236] border border-white/[0.08] text-xs font-medium text-[#EDEDEF] flex items-center gap-1 transition-colors shrink-0"
+          title="Add key to rotation pool"
+        >
+          <Icon name="plus" class="w-3.5 h-3.5" strokeWidth={1.8} />
+          <span>Add</span>
+        </button>
+      </div>
 
-          {#if apiKeys.length > 0}
-            <div class="space-y-1.5 max-h-40 overflow-y-auto pr-1">
-              {#each apiKeys as key, idx (idx)}
-                {@const tStatus = keyTestStatus[idx]}
-                <div class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[6px] bg-[#121214] border border-white/[0.06]">
-                  <div class="flex items-center gap-2 min-w-0 flex-1">
-                    <span class="font-mono text-[10px] text-[#66666D] shrink-0">#{idx + 1}</span>
-                    <span class="font-mono text-[11px] text-[#E5E5E8] truncate select-all">
-                      {revealedKeys[idx] ? key : maskKey(key)}
-                    </span>
-                  </div>
-                  <div class="flex items-center gap-1 shrink-0">
-                    {#if tStatus?.state === 'testing'}
-                      <span class="font-mono text-[10px] text-[#A3A3AA] px-1">testing...</span>
-                    {:else if tStatus?.state === 'ok'}
-                      <span class="font-mono text-[10px] text-[#4ADE80] px-1" title="Key is valid">OK ({tStatus.count})</span>
-                    {:else if tStatus?.state === 'err'}
-                      <span class="font-mono text-[10px] text-[#F87171] px-1" title={tStatus.error || 'Failed'}>ERR</span>
-                    {/if}
-                    <button
-                      type="button"
-                      onclick={() => testSingleApiKey(idx)}
-                      class="px-2 py-0.5 rounded-[4px] bg-white/[0.05] hover:bg-white/[0.1] text-[10.5px] text-[#D4D4D8] transition-colors"
-                      title="Test this key"
-                    >
-                      Test
-                    </button>
-                    <button
-                      type="button"
-                      onclick={() => (revealedKeys = { ...revealedKeys, [idx]: !revealedKeys[idx] })}
-                      class="px-2 py-0.5 rounded-[4px] bg-white/[0.05] hover:bg-white/[0.1] text-[10.5px] text-[#A3A3AA] hover:text-white transition-colors"
-                      title={revealedKeys[idx] ? 'Hide key' : 'Show key'}
-                    >
-                      {revealedKeys[idx] ? 'Hide' : 'Show'}
-                    </button>
-                    <button
-                      type="button"
-                      onclick={() => removeApiKeyFromList(idx)}
-                      class="p-1 rounded-[4px] text-[#73737A] hover:text-[#F87171] hover:bg-white/[0.05] transition-colors"
-                      title="Remove key"
-                    >
-                      <Icon name="close" class="w-3 h-3" strokeWidth={1.8} />
-                    </button>
-                  </div>
-                </div>
-              {/each}
-            </div>
-          {/if}
-        </div>
-
-        <div class="space-y-1.5">
-          <span class="text-xs text-[#A3A3AA] block">API Protocol</span>
-          {#if OAUTH_PROTOCOLS.includes(apiProtocol as any)}
-            <div class="px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.06] font-mono text-[11px] text-[#C4B5FD]">
-              OAuth: {apiProtocol} (managed in Subscription OAuth Accounts above)
-            </div>
-          {:else}
-            <div class="grid grid-cols-5 gap-1 p-1 rounded-[6px] bg-[#121214] border border-white/[0.06]">
-              {#each [['auto', 'Auto'], ['chat_completions', 'Chat'], ['responses', 'Responses'], ['anthropic_messages', 'Anthropic'], ['google_gemini', 'Google AI']] as [val, label]}
+      {#if apiKeys.length > 0}
+        <div class="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+          {#each apiKeys as entry, idx (entry.id)}
+            {@const tStatus = keyTestStatus[entry.id]}
+            <div class="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[6px] bg-[#121214] border border-white/[0.06]">
+              <div class="flex items-center gap-2 min-w-0 flex-1">
+                <span class="font-mono text-[10px] text-[#66666D] shrink-0">#{idx + 1}</span>
+                <span class="font-mono text-[11px] text-[#E5E5E8] truncate select-all">
+                  {revealedKeys[entry.id] ? entry.value : maskKey(entry.value)}
+                </span>
+              </div>
+              <div class="flex items-center gap-1 shrink-0">
+                {#if tStatus?.state === 'testing'}
+                  <span class="font-mono text-[10px] text-[#A3A3AA] px-1">testing...</span>
+                {:else if tStatus?.state === 'ok'}
+                  <span class="font-mono text-[10px] text-[#4ADE80] px-1" title="Key is valid">OK ({tStatus.count})</span>
+                {:else if tStatus?.state === 'err'}
+                  <span class="font-mono text-[10px] text-[#F87171] px-1" title={tStatus.error || 'Failed'}>ERR</span>
+                {/if}
                 <button
                   type="button"
-                  class="py-1.5 px-2 rounded-[4px] font-mono text-[11px] transition-colors {apiProtocol === val ? 'bg-white/[0.12] text-[#EDEDEF] font-medium' : 'text-[#73737A] hover:text-[#D4D4D8]'}"
-                  onclick={() => (apiProtocol = val as ApiProtocol)}
+                  onclick={() => testSingleApiKey(entry)}
+                  class="px-2 py-0.5 rounded-[4px] bg-white/[0.05] hover:bg-white/[0.1] text-[10.5px] text-[#D4D4D8] transition-colors"
+                  title="Test this key"
                 >
-                  {label}
+                  Test
                 </button>
-              {/each}
-            </div>
-          {/if}
-        </div>
-
-        <div class="space-y-2">
-          <div class="flex items-center justify-between">
-            <span class="text-xs text-[#A3A3AA]">Enable Proxy (HTTP / HTTPS / SOCKS5 / SOCKS5h)</span>
-            <button
-              type="button"
-              class="w-9 h-5 rounded-full p-0.5 transition-all duration-200 {proxyEnabled ? 'bg-[#8B5CF6]' : 'bg-[#27272A]'}"
-              onclick={() => {
-                proxyEnabled = !proxyEnabled;
-                if (editingId) {
-                  settingsStore.updateProvider(editingId, { proxyEnabled, proxyUrl: proxyUrl.trim() });
-                }
-              }}
-              aria-label="Enable Proxy"
-            >
-              <div class="w-4 h-4 rounded-full transition-transform duration-200 {proxyEnabled ? 'translate-x-4 bg-white shadow-sm' : 'translate-x-0 bg-[#73737A]'}"></div>
-            </button>
-          </div>
-          {#if proxyEnabled}
-            <input
-              bind:value={proxyUrl}
-              oninput={() => {
-                if (editingId) {
-                  settingsStore.updateProvider(editingId, { proxyEnabled, proxyUrl: proxyUrl.trim() });
-                }
-              }}
-              type="text"
-              placeholder="socks5h://127.0.0.1:1080 or http://user:pass@host:port"
-              class="w-full px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-white/[0.2]"
-            />
-          {/if}
-        </div>
-
-        <div class="space-y-2.5 pt-1 border-t border-white/[0.06]">
-          <div class="flex items-center justify-between gap-2">
-            <span class="font-mono text-[10.5px] text-[#A3A3AA] uppercase tracking-wider">
-              Endpoint Discovery (/models)
-            </span>
-            <button
-              type="button"
-              class="h-7 px-2.5 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.08] font-mono text-[11px] text-[#D4D4D8] active:scale-[0.97] transition-all"
-              onclick={discoverModels}
-              disabled={isFetchingModels || !baseUrl.trim()}
-            >
-              {isFetchingModels ? 'Fetching...' : 'Fetch /models'}
-            </button>
-          </div>
-
-          {#if fetchError}
-            <div class="text-[11px] font-mono text-[#A3A3AA] bg-[#121214] border border-white/[0.06] rounded-[6px] px-3 py-2">
-              {fetchError} — add custom Model ID below.
-            </div>
-          {/if}
-
-          {#if fetchedModels.length > 0}
-            <div class="space-y-2">
-              <input
-                bind:value={modelSearch}
-                type="text"
-                placeholder="Search discovered models ({fetchedModels.length})..."
-                class="w-full px-3 py-1.5 rounded-[6px] bg-[#121214] border border-white/[0.08] text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none"
-              />
-              <div class="max-h-48 overflow-y-auto rounded-[6px] bg-[#121214] border border-white/[0.06] divide-y divide-white/[0.04]">
-                {#each filteredFetchedModels as m (m.id)}
-                  <div class="px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-white/[0.03]">
-                    <div class="min-w-0 flex items-center gap-2">
-                      <span class="font-mono text-[11.5px] text-[#E5E5E8] truncate">{m.id}</span>
-                      <span class="font-mono text-[10px] text-[#73737A]">{formatCtx(m.contextWindow)}</span>
-                      {#if m.supportsReasoning}
-                        <span class="px-1.5 py-0.5 rounded-[4px] bg-[#1E1E22] font-mono text-[9.5px] text-[#A3A3AA]">Reasoning</span>
-                      {/if}
-                      {#if m.supportsVision}
-                        <span class="px-1.5 py-0.5 rounded-[4px] bg-[#1E1E22] font-mono text-[9.5px] text-[#A3A3AA]">Vision</span>
-                      {/if}
-                    </div>
-                    <button
-                      type="button"
-                      class="w-6 h-6 rounded-[4px] bg-[#1E1E22] hover:bg-[#EDEDEF] hover:text-[#111113] border border-white/[0.08] flex items-center justify-center text-xs shrink-0 active:scale-[0.95] transition-all"
-                      onclick={() => addPendingModel(m)}
-                      title="Add model"
-                    >
-                      +
-                    </button>
-                  </div>
-                {/each}
+                <button
+                  type="button"
+                  onclick={() => (revealedKeys = { ...revealedKeys, [entry.id]: !revealedKeys[entry.id] })}
+                  class="px-2 py-0.5 rounded-[4px] bg-white/[0.05] hover:bg-white/[0.1] text-[10.5px] text-[#A3A3AA] hover:text-white transition-colors"
+                  title={revealedKeys[entry.id] ? 'Hide key' : 'Show key'}
+                >
+                  {revealedKeys[entry.id] ? 'Hide' : 'Show'}
+                </button>
+                <button
+                  type="button"
+                  onclick={() => removeApiKeyFromList(entry.id)}
+                  class="p-1 rounded-[4px] text-[#73737A] hover:text-[#F87171] hover:bg-white/[0.05] transition-colors"
+                  title="Remove key"
+                >
+                  <Icon name="close" class="w-3 h-3" strokeWidth={1.8} />
+                </button>
               </div>
             </div>
-          {/if}
+          {/each}
+        </div>
+      {/if}
+    </div>
 
-          <div class="flex items-center gap-2">
-            <input
-              bind:value={customModelId}
-              type="text"
-              placeholder="Custom Model ID (if /models is restricted)"
-              class="flex-1 px-3 py-1.5 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none"
-              onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustomModel(); } }}
-            />
+    <div class="space-y-1.5">
+      <span class="text-xs text-[#A3A3AA] block">API Protocol</span>
+      {#if OAUTH_PROTOCOLS.includes(apiProtocol as any)}
+        <div class="px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.06] font-mono text-[11px] text-[#C4B5FD]">
+          OAuth: {apiProtocol} (managed in Subscription OAuth Accounts above)
+        </div>
+      {:else}
+        <div class="grid grid-cols-5 gap-1 p-1 rounded-[6px] bg-[#121214] border border-white/[0.06]">
+          {#each [['auto', 'Auto'], ['chat_completions', 'Chat'], ['responses', 'Responses'], ['anthropic_messages', 'Anthropic'], ['google_gemini', 'Google AI']] as [val, label]}
             <button
               type="button"
-              class="h-8 px-3 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.08] text-xs text-[#E5E5E8] active:scale-[0.97] transition-all"
-              onclick={addCustomModel}
+              class="py-1.5 px-2 rounded-[4px] font-mono text-[11px] transition-colors {apiProtocol === val ? 'bg-white/[0.12] text-[#EDEDEF] font-medium' : 'text-[#73737A] hover:text-[#D4D4D8]'}"
+              onclick={() => (apiProtocol = val as ApiProtocol)}
             >
-              + Add
+              {label}
             </button>
-          </div>
+          {/each}
         </div>
+      {/if}
+    </div>
 
-        {#if pendingModels.length > 0}
-          <div class="space-y-1.5 pt-1">
-            <div class="font-mono text-[10px] text-[#73737A] uppercase tracking-wider">Selected Models ({pendingModels.length})</div>
-            <div class="flex flex-wrap gap-1.5">
-              {#each pendingModels as pm (pm.id)}
-                <div
-                  animate:flip={{ duration: 160 }}
-                  in:scale={{ start: 0.9, duration: 150 }}
-                  class="px-2.5 py-1 rounded-[6px] bg-[#121214] border border-white/[0.08] flex items-center gap-2 text-[11px]"
-                >
-                  <span class="font-mono text-[#EDEDEF]">{pm.id}</span>
-                  <span class="font-mono text-[10px] text-[#73737A]">{formatCtx(pm.contextWindow)}</span>
-                  {#if pm.supportsReasoning}
-                    <span class="font-mono text-[10px] text-[#A3A3AA]">Reasoning</span>
+    <div class="space-y-2">
+      <div class="flex items-center justify-between">
+        <span class="text-xs text-[#A3A3AA]">Enable Proxy (HTTP / HTTPS / SOCKS5 / SOCKS5h)</span>
+        <button
+          type="button"
+          class="w-9 h-5 rounded-full p-0.5 transition-all duration-200 {proxyEnabled ? 'bg-[#8B5CF6]' : 'bg-[#27272A]'}"
+          onclick={() => {
+            proxyEnabled = !proxyEnabled;
+            if (editingId) {
+              settingsStore.updateProvider(editingId, { proxyEnabled, proxyUrl: proxyUrl.trim() });
+            }
+          }}
+          aria-label="Enable Proxy"
+        >
+          <div class="w-4 h-4 rounded-full transition-transform duration-200 {proxyEnabled ? 'translate-x-4 bg-white shadow-sm' : 'translate-x-0 bg-[#73737A]'}"></div>
+        </button>
+      </div>
+      {#if proxyEnabled}
+        <input
+          bind:value={proxyUrl}
+          oninput={() => {
+            if (editingId) {
+              settingsStore.updateProvider(editingId, { proxyEnabled, proxyUrl: proxyUrl.trim() });
+            }
+          }}
+          type="text"
+          placeholder="socks5h://127.0.0.1:1080 or http://user:pass@host:port"
+          class="w-full px-3 py-2 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none focus:border-white/[0.2]"
+        />
+      {/if}
+    </div>
+
+    <div class="space-y-2.5 pt-1 border-t border-white/[0.06]">
+      <div class="flex items-center justify-between gap-2">
+        <span class="font-mono text-[10.5px] text-[#A3A3AA] uppercase tracking-wider">
+          Endpoint Discovery (/models)
+        </span>
+        <button
+          type="button"
+          class="h-7 px-2.5 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.08] font-mono text-[11px] text-[#D4D4D8] active:scale-[0.97] transition-all"
+          onclick={discoverModels}
+          disabled={isFetchingModels || !baseUrl.trim()}
+        >
+          {isFetchingModels ? 'Fetching...' : 'Fetch /models'}
+        </button>
+      </div>
+
+      {#if fetchError}
+        <div class="text-[11px] font-mono text-[#A3A3AA] bg-[#121214] border border-white/[0.06] rounded-[6px] px-3 py-2">
+          {fetchError} — add custom Model ID below.
+        </div>
+      {/if}
+
+      {#if fetchedModels.length > 0}
+        <div class="space-y-2">
+          <input
+            value={modelSearch}
+            oninput={handleModelSearchInput}
+            type="text"
+            placeholder="Search discovered models ({fetchedModels.length})..."
+            class="w-full px-3 py-1.5 rounded-[6px] bg-[#121214] border border-white/[0.08] text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none"
+          />
+          <div class="max-h-48 overflow-y-auto rounded-[6px] bg-[#121214] border border-white/[0.06] divide-y divide-white/[0.04]">
+            {#each filteredFetchedModels.slice(0, visibleFetchedLimit) as m (m.id)}
+              <div class="px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-white/[0.03]">
+                <div class="min-w-0 flex items-center gap-2">
+                  <span class="font-mono text-[11.5px] text-[#E5E5E8] truncate">{m.id}</span>
+                  <span class="font-mono text-[10px] text-[#73737A]">{formatCtx(m.contextWindow)}</span>
+                  {#if m.supportsReasoning}
+                    <span class="px-1.5 py-0.5 rounded-[4px] bg-[#1E1E22] font-mono text-[9.5px] text-[#A3A3AA]">Reasoning</span>
                   {/if}
-                  {#if pm.supportsVision}
-                    <span class="font-mono text-[10px] text-[#A3A3AA]">Vision</span>
+                  {#if m.supportsVision}
+                    <span class="px-1.5 py-0.5 rounded-[4px] bg-[#1E1E22] font-mono text-[9.5px] text-[#A3A3AA]">Vision</span>
                   {/if}
-                  <button
-                    type="button"
-                    class="text-[#73737A] hover:text-[#EF4444] ml-0.5"
-                    onclick={() => removePendingModel(pm.id)}
-                  >
-                    ×
-                  </button>
                 </div>
-              {/each}
-            </div>
+                <button
+                  type="button"
+                  class="w-6 h-6 rounded-[4px] bg-[#1E1E22] hover:bg-[#EDEDEF] hover:text-[#111113] border border-white/[0.08] flex items-center justify-center text-xs shrink-0 active:scale-[0.95] transition-all"
+                  onclick={() => addPendingModel(m)}
+                  title="Add model"
+                >
+                  +
+                </button>
+              </div>
+            {/each}
+            {#if filteredFetchedModels.length > visibleFetchedLimit}
+              <button
+                type="button"
+                onclick={() => (visibleFetchedLimit += 80)}
+                class="w-full py-2 text-center font-mono text-[11px] text-[#8E8E95] hover:text-[#EDEDEF] hover:bg-white/[0.03]"
+              >
+                Show more ({filteredFetchedModels.length - visibleFetchedLimit} remaining)
+              </button>
+            {/if}
           </div>
-        {/if}
-
-        <div class="flex justify-end gap-2 pt-1">
-          <button
-            type="button"
-            onclick={closeForm}
-            class="h-8 px-3 rounded-[6px] bg-[#121214] hover:bg-[#242428] border border-white/[0.08] text-xs text-[#A3A3AA] hover:text-white active:scale-[0.97] transition-all"
-          >
-            Cancel
-          </button>
-          <button
-            type="submit"
-            disabled={pendingModels.length === 0}
-            class="h-8 px-4 rounded-[6px] bg-[#EDEDEF] hover:bg-white text-[#111113] text-xs font-medium disabled:opacity-40 active:scale-[0.97] transition-all"
-          >
-            {editingId ? 'Save Changes' : 'Save Provider'}
-          </button>
         </div>
-      </form>
+      {/if}
+
+      <div class="flex items-center gap-2">
+        <input
+          bind:value={customModelId}
+          type="text"
+          placeholder="Custom Model ID (if /models is restricted)"
+          class="flex-1 px-3 py-1.5 rounded-[6px] bg-[#121214] border border-white/[0.08] font-mono text-xs text-[#E5E5E8] placeholder-[#55555C] outline-none"
+          onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); addCustomModel(); } }}
+        />
+        <button
+          type="button"
+          class="h-8 px-3 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.08] text-xs text-[#E5E5E8] active:scale-[0.97] transition-all"
+          onclick={addCustomModel}
+        >
+          + Add
+        </button>
+      </div>
+    </div>
+
+    {#if pendingModels.length > 0}
+      <div class="space-y-1.5 pt-1">
+        <div class="font-mono text-[10px] text-[#73737A] uppercase tracking-wider">Selected Models ({pendingModels.length})</div>
+        <div class="flex flex-wrap gap-1.5">
+          {#each pendingModels as pm (pm.id)}
+            <div class="px-2.5 py-1 rounded-[6px] bg-[#121214] border border-white/[0.08] flex items-center gap-2 text-[11px]">
+              <span class="font-mono text-[#EDEDEF]">{pm.id}</span>
+              <span class="font-mono text-[10px] text-[#73737A]">{formatCtx(pm.contextWindow)}</span>
+              {#if pm.supportsReasoning}
+                <span class="font-mono text-[10px] text-[#A3A3AA]">Reasoning</span>
+              {/if}
+              {#if pm.supportsVision}
+                <span class="font-mono text-[10px] text-[#A3A3AA]">Vision</span>
+              {/if}
+              <button
+                type="button"
+                class="text-[#73737A] hover:text-[#EF4444] ml-0.5"
+                onclick={() => removePendingModel(pm.id)}
+              >
+                ×
+              </button>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    <div class="flex justify-end gap-2 pt-1">
+      <button
+        type="button"
+        onclick={closeForm}
+        class="h-8 px-3 rounded-[6px] bg-[#121214] hover:bg-[#242428] border border-white/[0.08] text-xs text-[#A3A3AA] hover:text-white active:scale-[0.97] transition-all"
+      >
+        Cancel
+      </button>
+      <button
+        type="submit"
+        disabled={pendingModels.length === 0}
+        class="h-8 px-4 rounded-[6px] bg-[#EDEDEF] hover:bg-white text-[#111113] text-xs font-medium disabled:opacity-40 active:scale-[0.97] transition-all"
+      >
+        {editingId ? 'Save Changes' : 'Save Provider'}
+      </button>
+    </div>
+  </form>
 {/snippet}
 
   {#if showForm && !editingId}
@@ -1463,12 +1661,13 @@ function handleSaveProvider(e: Event) {
   {#if regularProvidersList.length > 0}
     <div class="space-y-3">
       {#each regularProvidersList as prov (prov.id)}
+        {@const provGrouped = groupedModelsByProvider.get(prov.id) || []}
         {#if showForm && editingId === prov.id}
           <div transition:slide={{ duration: 180 }}>
             {@render providerForm()}
           </div>
         {:else}
-        <div transition:slide={{ duration: 160 }} class="p-4 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] space-y-3">
+        <div class="p-4 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] space-y-3">
           <div class="flex items-center justify-between gap-3">
             <div class="flex items-center gap-3 min-w-0">
               <span class="font-medium text-[#EDEDEF] truncate">{prov.name}</span>
@@ -1513,16 +1712,12 @@ function handleSaveProvider(e: Event) {
             <div class="space-y-1.5">
               <span class="text-[11px] text-[#73737A] block">Enabled Models</span>
               <div class="flex flex-wrap gap-1.5">
-                {#each groupProviderModels(prov.availableModels) as grp (grp.displayId)}
+                {#each provGrouped as grp (grp.displayId)}
                   {@const probeId = grp.rawIds[0]}
                   {@const cap = prov.modelCapabilities?.[probeId]}
                   {@const tStatus = modelTestStatus[`${prov.id}:${probeId}`]}
                   {@const variantLevels = (['OFF', 'LOW', 'MEDIUM', 'HIGH', 'MAX'] as ReasoningLevel[]).filter((l) => Boolean(grp.reasoningVariants[l]))}
-                  <div
-                    animate:flip={{ duration: 160 }}
-                    in:scale={{ start: 0.9, duration: 150 }}
-                    class="flex items-center rounded-[6px] border bg-[#121214] text-[#D4D4D8] border-white/[0.08]"
-                  >
+                  <div class="flex items-center rounded-[6px] border bg-[#121214] text-[#D4D4D8] border-white/[0.08]">
                     <button
                       type="button"
                       class="pl-2 pr-0.5 py-1 flex items-center justify-center transition-colors"

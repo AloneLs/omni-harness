@@ -20,11 +20,15 @@ export interface SearchResult {
 class WorkspaceStore {
   currentPath = $state<string>('');
   recentWorkspaces = $state<string[]>([]);
-  files = $state<WorkspaceFile[]>([]);
+  files = $state.raw<WorkspaceFile[]>([]);
   activeFilePath = $state<string | null>(null);
   searchQuery = $state<string>('');
-  searchResults = $state<SearchResult[]>([]);
+  searchResults = $state.raw<SearchResult[]>([]);
   isLoading = $state<boolean>(false);
+
+  private refreshReqId = 0;
+  private searchReqId = 0;
+  private searchTimer: ReturnType<typeof setTimeout> | null = null;
 
   workspaceName = $derived.by(() => {
     if (!this.currentPath) {
@@ -65,6 +69,7 @@ class WorkspaceStore {
     const active = localStorage.getItem('omni_active_workspace');
     if (active) {
       this.currentPath = active;
+      void this.refreshFiles();
     }
     this.syncWorkspacesToBackend();
   }
@@ -91,7 +96,9 @@ class WorkspaceStore {
     if (path) {
       await this.refreshFiles();
     } else {
+      this.refreshReqId++;
       this.files = [];
+      this.isLoading = false;
     }
   }
 
@@ -101,10 +108,8 @@ class WorkspaceStore {
 
   public addRecentWorkspace(path: string): void {
     const norm = path.replace(/[\\/]+$/, '').toLowerCase();
-    const exists = this.recentWorkspaces.some((p) => p.replace(/[\\/]+$/, '').toLowerCase() === norm);
-    if (exists) return;
-    const list = [path, ...this.recentWorkspaces];
-    if (list.length > 15) list.pop();
+    const filtered = this.recentWorkspaces.filter((p) => p.replace(/[\\/]+$/, '').toLowerCase() !== norm);
+    const list = [path, ...filtered].slice(0, 15);
     this.recentWorkspaces = list;
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem('omni_recent_workspaces', JSON.stringify(list));
@@ -157,42 +162,78 @@ class WorkspaceStore {
   }
 
   public async refreshFiles(): Promise<void> {
-    if (!this.currentPath) {
+    const targetPath = this.currentPath;
+    if (!targetPath) {
+      this.refreshReqId++;
       this.files = [];
+      this.isLoading = false;
       return;
     }
+    const reqId = ++this.refreshReqId;
     this.isLoading = true;
     try {
-      const result = await invoke<WorkspaceFile[]>('list_workspace_files', { path: this.currentPath });
+      const result = await invoke<WorkspaceFile[]>('list_workspace_files', { path: targetPath });
+      if (reqId !== this.refreshReqId || this.currentPath !== targetPath) return;
       if (Array.isArray(result)) {
         this.files = result;
       }
     } catch {
+      if (reqId !== this.refreshReqId || this.currentPath !== targetPath) return;
       this.files = [];
     } finally {
-      this.isLoading = false;
+      if (reqId === this.refreshReqId) {
+        this.isLoading = false;
+      }
     }
+  }
+
+  public searchFilesDebounced(query: string, delayMs = 180): void {
+    this.searchQuery = query;
+    if (this.searchTimer) {
+      clearTimeout(this.searchTimer);
+      this.searchTimer = null;
+    }
+    const trimmed = query.trim();
+    if (!trimmed || !this.currentPath) {
+      this.searchReqId++;
+      this.searchResults = [];
+      return;
+    }
+    this.searchTimer = setTimeout(() => {
+      this.searchTimer = null;
+      void this.searchFiles(query);
+    }, delayMs);
   }
 
   public async searchFiles(query: string): Promise<SearchResult[]> {
     this.searchQuery = query;
-    if (!query.trim() || !this.currentPath) {
+    const trimmed = query.trim();
+    const targetPath = this.currentPath;
+    const reqId = ++this.searchReqId;
+    if (!trimmed || !targetPath) {
       this.searchResults = [];
       return [];
     }
 
     try {
       const results = await invoke<SearchResult[]>('search_workspace_files', {
-        path: this.currentPath,
-        query: query.trim()
+        path: targetPath,
+        query: trimmed
       });
+      if (reqId !== this.searchReqId || this.currentPath !== targetPath) {
+        return this.searchResults;
+      }
       if (Array.isArray(results)) {
         this.searchResults = results;
         return results;
       }
     } catch {}
 
-    const q = query.toLowerCase();
+    if (reqId !== this.searchReqId || this.currentPath !== targetPath) {
+      return this.searchResults;
+    }
+
+    const q = trimmed.toLowerCase();
     const matches: SearchResult[] = [];
     const searchRec = (list: WorkspaceFile[]) => {
       for (const f of list) {

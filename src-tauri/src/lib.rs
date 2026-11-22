@@ -4,6 +4,7 @@ pub mod error;
 pub mod llm;
 pub mod logger;
 pub mod mcp;
+pub mod scheduler;
 pub mod skills;
 pub mod speech;
 pub mod state;
@@ -38,13 +39,7 @@ pub struct AppManagedState {
 
 impl AppManagedState {
     pub fn has_active_tasks(&self) -> bool {
-        let has_streams = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.stream_mgr.has_running_sessions())
-        });
-        let has_bot = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(self.telegram_mgr.is_running())
-        });
-        has_streams || has_bot
+        self.stream_mgr.has_running_sessions_sync() || self.telegram_mgr.is_running_sync()
     }
 }
 
@@ -162,7 +157,12 @@ pub fn build_http_client(
     let explicit_proxy = if proxy_enabled.unwrap_or(false) {
         proxy_url.map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string())
     } else {
-        None
+        let (global_en, global_url) = llm::oauth_accounts::resolve_global_proxy_for_api();
+        if global_en == Some(true) {
+            global_url
+        } else {
+            None
+        }
     };
 
     if let Some(ref purl) = explicit_proxy {
@@ -1015,7 +1015,18 @@ async fn sync_chat_context(
             .filter_map(|item| {
                 let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user").trim().to_string();
                 let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                if content.trim().is_empty() {
+                let has_work = item
+                    .get("steps")
+                    .and_then(|v| v.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false)
+                    || item
+                        .get("toolCalls")
+                        .and_then(|v| v.as_array())
+                        .map(|a| !a.is_empty())
+                        .unwrap_or(false)
+                    || item.get("paused").and_then(|v| v.as_bool()).unwrap_or(false);
+                if content.trim().is_empty() && !has_work {
                     None
                 } else {
                     Some((role, content))
@@ -1062,6 +1073,17 @@ async fn sync_workspaces_to_backend(
     workspaces: Vec<telegram::SyncedProject>,
 ) -> Result<(), String> {
     state.telegram_mgr.sync_projects(workspaces).await
+}
+
+#[tauri::command]
+async fn get_cached_chat_messages(
+    state: State<'_, AppManagedState>,
+    chat_id: String,
+) -> Result<Option<(String, String)>, String> {
+    let db = state.app_state.db.clone();
+    tokio::task::spawn_blocking(move || db.get_cached_chat_messages(&chat_id).map_err(|e| e.to_string()))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1249,8 +1271,9 @@ async fn build_user_msg_with_attachments(
             };
             if let Some(u) = url_opt {
                 has_media = true;
+                let resized = llm::request_compat::resize_image_data_url_if_needed(&u, 1568);
                 parts.push(llm::request_compat::ContentPart::ImageUrl {
-                    image_url: llm::request_compat::ImageUrlDetail { url: u, detail: None },
+                    image_url: llm::request_compat::ImageUrlDetail { url: resized, detail: Some("auto".to_string()) },
                 });
             }
         } else if is_audio {
@@ -2710,8 +2733,29 @@ async fn oauth_get_proxy() -> Result<llm::oauth_accounts::OAuthProxyConfig, Stri
 }
 
 #[tauri::command]
-async fn oauth_set_proxy(enabled: bool, url: String) -> Result<(), String> {
-    llm::oauth_accounts::save_oauth_proxy(llm::oauth_accounts::OAuthProxyConfig { enabled, url })
+async fn oauth_set_proxy(
+    enabled: bool,
+    url: String,
+    proxy_pool: Option<Vec<String>>,
+    rotation_mode: Option<String>,
+) -> Result<(), String> {
+    let prev = llm::oauth_accounts::load_oauth_proxy();
+    let pool = proxy_pool.unwrap_or(prev.proxy_pool);
+    let mode = rotation_mode
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(prev.rotation_mode);
+    llm::oauth_accounts::save_oauth_proxy(llm::oauth_accounts::OAuthProxyConfig {
+        enabled,
+        url,
+        proxy_pool: pool,
+        rotation_mode: mode,
+    })
+}
+
+#[tauri::command]
+async fn oauth_set_account_proxy(id: String, proxy_url: Option<String>) -> Result<(), String> {
+    llm::oauth_accounts::set_account_proxy(&id, proxy_url).await
 }
 
 #[tauri::command]
@@ -3496,6 +3540,7 @@ pub fn run() {
             search_memory_entries,
             get_total_memory_tokens,
             sync_chat_context,
+            get_cached_chat_messages,
             get_bootstrap_config,
             complete_first_run,
             get_workspace_dir,
@@ -3527,6 +3572,7 @@ pub fn run() {
             oauth_fetch_codex_models,
             oauth_get_proxy,
             oauth_set_proxy,
+            oauth_set_account_proxy,
             oauth_add_manual_token,
             oauth_check_account,
             oauth_refresh_quotas,
@@ -3816,28 +3862,29 @@ async fn cu_close_window(hwnd: usize) -> Result<serde_json::Value, String> {
 
 #[tauri::command]
 async fn get_settings() -> Result<Option<serde_json::Value>, String> {
-    let path = state::AppState::resolve_data_dir().join("settings.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-    Ok(Some(parsed))
+    tokio::task::spawn_blocking(|| {
+        let path = state::AppState::resolve_data_dir().join("settings.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        Ok(Some(parsed))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
 async fn save_settings(settings: serde_json::Value) -> Result<(), String> {
-    let dir = state::AppState::resolve_data_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("settings.json");
-    let tmp = dir.join("settings.json.tmp");
-    let json_str = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(&tmp, json_str).map_err(|e| e.to_string())?;
-    if path.exists() {
-        let _ = std::fs::remove_file(&path);
-    }
-    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    Ok(())
+    tokio::task::spawn_blocking(move || {
+        let path = state::AppState::resolve_data_dir().join("settings.json");
+        let json_str = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+        db::atomic_write(&path, json_str.as_bytes()).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]

@@ -191,7 +191,19 @@ export interface DetectedModelInfo {
   supportsFiles: boolean;
 }
 
-export type ApiProtocol = 'auto' | 'chat_completions' | 'responses' | 'anthropic_messages' | 'google_gemini' | 'antigravity' | 'openai_codex' | 'claude_oauth' | 'kimi_oauth' | 'xai_oauth' | 'zcode_oauth' | 'perplexity_oauth';
+export type ApiProtocol =
+  | 'auto'
+  | 'chat_completions'
+  | 'responses'
+  | 'anthropic_messages'
+  | 'google_gemini'
+  | 'antigravity'
+  | 'openai_codex'
+  | 'claude_oauth'
+  | 'kimi_oauth'
+  | 'xai_oauth'
+  | 'zcode_oauth'
+  | 'perplexity_oauth';
 
 export interface ProviderConfig {
   id: string;
@@ -273,6 +285,11 @@ class SettingsStore {
   isSettingsOpen = $state<boolean>(false);
   isFirstRunOpen = $state<boolean>(false);
   private diskLoaded = false;
+  private mutationVersion = 0;
+  private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private saveChain: Promise<void> = Promise.resolve();
+  private unlisteners: Array<() => void> = [];
+  private disposed = false;
 
   currentProvider = $derived.by(() => {
     return this.data.providers[this.data.activeProvider] || null;
@@ -286,7 +303,13 @@ class SettingsStore {
       this.currentProvider?.modelCapabilities?.[rawModel];
     if (detected) {
       const mLow = model.toLowerCase();
-      const isFaulty200k = detected.contextWindow === 200000 && (mLow.includes('gemini') || mLow.includes('sonnet-4') || mLow.includes('sonnet-5') || mLow.includes('sol') || mLow.includes('astra'));
+      const isFaulty200k =
+        detected.contextWindow === 200000 &&
+        (mLow.includes('gemini') ||
+          mLow.includes('sonnet-4') ||
+          mLow.includes('sonnet-5') ||
+          mLow.includes('sol') ||
+          mLow.includes('astra'));
       const resolvedCtx = isFaulty200k ? (mLow.includes('gemini') ? 1048576 : 1000000) : detected.contextWindow;
       return {
         modelId: model,
@@ -318,6 +341,20 @@ class SettingsStore {
     this.init();
   }
 
+  public destroy(): void {
+    this.disposed = true;
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    for (const fn of this.unlisteners) {
+      try {
+        fn();
+      } catch {}
+    }
+    this.unlisteners = [];
+  }
+
   private hydrateFromLocalStorageSync(): void {
     if (typeof localStorage === 'undefined') return;
     const saved = localStorage.getItem('omni_settings');
@@ -337,9 +374,11 @@ class SettingsStore {
 
   private async init(): Promise<void> {
     await this.loadSettings();
+    if (this.disposed) return;
     import('@tauri-apps/api/event')
-      .then(({ listen }) => {
-        listen<{ providerId?: string | null; modelId?: string | null; reasoningEffort?: string | null }>(
+      .then(async ({ listen }) => {
+        if (this.disposed) return;
+        const u1 = await listen<{ providerId?: string | null; modelId?: string | null; reasoningEffort?: string | null }>(
           'telegram-settings-updated',
           (ev) => {
             const p = ev.payload;
@@ -361,36 +400,37 @@ class SettingsStore {
               }
             }
             if (changed) {
-              this.data = { ...this.data };
-              if (typeof localStorage !== 'undefined') {
-                localStorage.setItem('omni_settings', JSON.stringify(this.data));
-              }
-              invoke('save_settings', { settings: this.data }).catch(() => {});
+              this.mutationVersion++;
+              this.saveSettings();
             }
           }
         );
-        listen<any>('telegram-providers-updated', (ev) => {
+        if (this.disposed) {
+          u1();
+          return;
+        }
+        this.unlisteners.push(u1);
+
+        const u2 = await listen<any>('telegram-providers-updated', (ev) => {
           const p = ev.payload;
           if (!p) return;
           if (p.action === 'add_provider' && p.provider) {
             const np = p.provider;
-            this.data.providers = {
-              ...this.data.providers,
-              [np.id]: {
-                id: np.id,
-                name: np.name,
-                baseUrl: np.baseUrl || np.base_url || '',
-                apiKey: np.apiKey || np.api_key || '',
-                apiProtocol: np.apiProtocol || np.api_protocol || 'auto',
-                proxyEnabled: Boolean(np.proxyEnabled),
-                proxyUrl: np.proxyUrl || '',
-                defaultModel: np.defaultModel || '',
-                availableModels: np.availableModels || [],
-                supportsReasoning: true,
-                enabled: true
-              }
+            this.data.providers[np.id] = {
+              id: np.id,
+              name: np.name,
+              baseUrl: np.baseUrl || np.base_url || '',
+              apiKey: np.apiKey || np.api_key || '',
+              apiProtocol: np.apiProtocol || np.api_protocol || 'auto',
+              proxyEnabled: Boolean(np.proxyEnabled),
+              proxyUrl: np.proxyUrl || '',
+              defaultModel: np.defaultModel || '',
+              availableModels: np.availableModels || [],
+              supportsReasoning: true,
+              enabled: true
             };
             this.data.activeProvider = np.id;
+            this.mutationVersion++;
             this.saveSettings();
           } else if (p.action === 'edit_provider' && p.provider) {
             const up = p.provider;
@@ -415,12 +455,18 @@ class SettingsStore {
             }
           }
         });
+        if (this.disposed) {
+          u2();
+          return;
+        }
+        this.unlisteners.push(u2);
       })
       .catch(() => {});
+
     this.refreshAllModelCapabilities();
     try {
       const cfg = await invoke<{ firstRunCompleted?: boolean; workspaceDir?: string | null }>('get_bootstrap_config');
-      if (cfg && cfg.firstRunCompleted === false) {
+      if (!this.disposed && cfg && cfg.firstRunCompleted === false) {
         this.data.firstRunCompleted = false;
         this.isFirstRunOpen = true;
       }
@@ -428,10 +474,17 @@ class SettingsStore {
   }
 
   public async loadSettings(): Promise<void> {
+    const startVer = this.mutationVersion;
     this.isLoading = true;
-    const localProviders = { ...(this.data.providers || {}) };
+    const localProviders = { ...$state.snapshot(this.data.providers || {}) };
     try {
       const res = await invoke<AppSettings | null>('get_settings');
+      if (this.mutationVersion !== startVer) {
+        this.diskLoaded = true;
+        this.isLoading = false;
+        this.syncProvidersToBackend();
+        return;
+      }
       if (res && typeof res === 'object') {
         const diskProviders = { ...(res.providers || {}) };
         const mergedProviders =
@@ -452,137 +505,203 @@ class SettingsStore {
             if (cap.contextWindow === 200000) {
               if (mLow.includes('gemini')) {
                 cap.contextWindow = 1048576;
-              } else if (mLow.includes('sonnet-4') || mLow.includes('sonnet-5') || mLow.includes('sol') || mLow.includes('astra')) {
+              } else if (
+                mLow.includes('sonnet-4') ||
+                mLow.includes('sonnet-5') ||
+                mLow.includes('sol') ||
+                mLow.includes('astra')
+              ) {
                 cap.contextWindow = 1000000;
               }
             }
           }
         }
-        const rawActiveModel = res.activeModel || this.data.activeModel || activeProvObj?.defaultModel || activeProvObj?.availableModels?.[0] || '';
-        this.data = {
+        const rawActiveModel =
+          res.activeModel ||
+          this.data.activeModel ||
+          activeProvObj?.defaultModel ||
+          activeProvObj?.availableModels?.[0] ||
+          '';
+        const nextData: AppSettings = {
           ...DEFAULT_SETTINGS,
-          ...this.data,
+          ...$state.snapshot(this.data),
           ...res,
           activeProvider,
           activeModel: getDisplayModelId(activeProvObj, rawActiveModel),
           providers: mergedProviders,
           enabledTools: { ...DEFAULT_SETTINGS.enabledTools, ...(res.enabledTools || {}) }
         };
+        this.data = nextData;
         if (typeof localStorage !== 'undefined') {
-          localStorage.setItem('omni_settings', JSON.stringify(this.data));
+          try {
+            localStorage.setItem('omni_settings', JSON.stringify(nextData));
+          } catch {}
         }
         this.diskLoaded = true;
         this.isLoading = false;
         this.syncProvidersToBackend();
         if (Object.keys(diskProviders).length === 0 && Object.keys(mergedProviders).length > 0) {
-          invoke('save_settings', { settings: this.data }).catch(() => {});
+          this.enqueueDiskSave();
         }
         return;
       }
-    } catch {}
+    } catch (err) {
+      console.error('Failed to load settings from disk:', err);
+    }
 
     this.diskLoaded = true;
     this.isLoading = false;
     this.syncProvidersToBackend();
     if (Object.keys(this.data.providers || {}).length > 0) {
-      invoke('save_settings', { settings: this.data }).catch(() => {});
+      this.enqueueDiskSave();
     }
   }
 
   public async refreshAllModelCapabilities(): Promise<void> {
-    const oauthProtos = new Set(['antigravity', 'openai_codex', 'claude_oauth', 'kimi_oauth', 'xai_oauth', 'zcode_oauth', 'perplexity_oauth']);
-    const provs = Object.values(this.data.providers || {});
-    let changed = false;
-    for (const prov of provs) {
+    const startVer = this.mutationVersion;
+    const provsSnapshot = Object.values($state.snapshot(this.data.providers || {}));
+    const updates: Array<{ providerId: string; modelId: string; info: DetectedModelInfo }> = [];
+    for (const prov of provsSnapshot) {
       const models = prov.availableModels || [];
       if (models.length === 0) continue;
-      const isOAuth = oauthProtos.has(prov.apiProtocol || '');
-      const nextCaps: Record<string, DetectedModelInfo> = { ...(prov.modelCapabilities || {}) };
+      const caps = prov.modelCapabilities || {};
       for (const mid of models) {
-        const prev = nextCaps[mid];
+        const prev = caps[mid];
         const mLow = mid.toLowerCase();
-        const isCorrupted200k = prev && prev.contextWindow === 200000 && (mLow.includes('gemini') || mLow.includes('sonnet-4') || mLow.includes('sonnet-5') || mLow.includes('sol') || mLow.includes('astra'));
+        const isCorrupted200k =
+          prev &&
+          prev.contextWindow === 200000 &&
+          (mLow.includes('gemini') ||
+            mLow.includes('sonnet-4') ||
+            mLow.includes('sonnet-5') ||
+            mLow.includes('sol') ||
+            mLow.includes('astra'));
         if (prev && prev.contextWindow > 0 && !isCorrupted200k) continue;
         try {
           const detected = await invoke<DetectedModelInfo>('detect_model_capabilities', { modelId: mid });
-          nextCaps[mid] = detected;
-          changed = true;
+          updates.push({ providerId: prov.id, modelId: mid, info: detected });
         } catch {}
       }
-      prov.modelCapabilities = nextCaps;
     }
-    if (changed) {
-      this.data.providers = { ...this.data.providers };
+    if (this.disposed || updates.length === 0) return;
+    let applied = false;
+    for (const u of updates) {
+      const liveProv = this.data.providers[u.providerId];
+      if (!liveProv) continue;
+      if (!liveProv.modelCapabilities) {
+        liveProv.modelCapabilities = {};
+      }
+      if (!liveProv.modelCapabilities[u.modelId] || this.mutationVersion === startVer) {
+        liveProv.modelCapabilities[u.modelId] = u.info;
+        applied = true;
+      }
+    }
+    if (applied) {
       await this.saveSettings();
     }
   }
 
   public syncProvidersToBackend(): void {
+    const snap = $state.snapshot(this.data);
     invoke('sync_providers_to_backend', {
-      providers: Object.values(this.data.providers || {}),
-      activeProvider: this.data.activeProvider || '',
-      activeModel: this.data.activeModel || ''
+      providers: Object.values(snap.providers || {}),
+      activeProvider: snap.activeProvider || '',
+      activeModel: snap.activeModel || ''
     }).catch(() => {});
   }
 
-  public async saveSettings(): Promise<void> {
-    if (!this.diskLoaded) return;
+  private enqueueDiskSave(): Promise<void> {
+    const snapshot = $state.snapshot(this.data);
     if (typeof localStorage !== 'undefined') {
-      localStorage.setItem('omni_settings', JSON.stringify(this.data));
+      try {
+        localStorage.setItem('omni_settings', JSON.stringify(snapshot));
+      } catch {}
     }
     this.syncProvidersToBackend();
-    try {
-      await invoke('save_settings', { settings: this.data });
-    } catch {}
+    this.saveChain = this.saveChain
+      .then(async () => {
+        const latest = $state.snapshot(this.data);
+        await invoke('save_settings', { settings: latest });
+      })
+      .catch((err) => {
+        console.error('Failed to save settings:', err);
+      });
+    return this.saveChain;
+  }
+
+  public async saveSettings(immediate = false): Promise<void> {
+    if (!this.diskLoaded) return;
+    this.mutationVersion++;
+    if (typeof localStorage !== 'undefined') {
+      try {
+        localStorage.setItem('omni_settings', JSON.stringify($state.snapshot(this.data)));
+      } catch {}
+    }
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    if (immediate) {
+      await this.enqueueDiskSave();
+      return;
+    }
+    await new Promise<void>((resolve) => {
+      this.saveTimer = setTimeout(() => {
+        this.saveTimer = null;
+        this.enqueueDiskSave().finally(resolve);
+      }, 220);
+    });
+  }
+
+  public flushPendingSaves(): void {
+    if (!this.diskLoaded) return;
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+      void this.enqueueDiskSave();
+    }
   }
 
   public addProvider(provider: ProviderConfig): void {
-    this.data.providers = {
-      ...this.data.providers,
-      [provider.id]: provider
-    };
+    this.data.providers[provider.id] = provider;
     if (!this.data.activeProvider) {
       this.data.activeProvider = provider.id;
-      this.data.activeModel = provider.defaultModel || provider.availableModels[0] || '';
+      this.data.activeModel = getDisplayModelId(provider, provider.defaultModel || provider.availableModels[0] || '');
     }
-    this.saveSettings();
+    void this.saveSettings();
   }
 
   public updateProvider(providerId: string, patch: Partial<ProviderConfig>): void {
     const existing = this.data.providers[providerId];
     if (!existing) return;
-    const updated: ProviderConfig = {
-      ...existing,
-      ...patch
-    };
-    this.data.providers = {
-      ...this.data.providers,
-      [providerId]: updated
-    };
-    if (this.data.activeProvider === providerId && updated.availableModels.length > 0 && !findModelGroup(updated, this.data.activeModel)) {
-      this.data.activeModel = getDisplayModelId(updated, updated.defaultModel || updated.availableModels[0]);
+    Object.assign(existing, patch);
+    if (
+      this.data.activeProvider === providerId &&
+      existing.availableModels.length > 0 &&
+      !findModelGroup(existing, this.data.activeModel)
+    ) {
+      this.data.activeModel = getDisplayModelId(existing, existing.defaultModel || existing.availableModels[0]);
     }
-    this.saveSettings();
+    void this.saveSettings();
   }
 
   public addModelToProvider(providerId: string, model: DetectedModelInfo): void {
     const prov = this.data.providers[providerId];
     if (!prov) return;
     if (!prov.availableModels.includes(model.id)) {
-      prov.availableModels = [...prov.availableModels, model.id];
+      prov.availableModels.push(model.id);
     }
-    prov.modelCapabilities = {
-      ...(prov.modelCapabilities || {}),
-      [model.id]: model
-    };
+    if (!prov.modelCapabilities) {
+      prov.modelCapabilities = {};
+    }
+    prov.modelCapabilities[model.id] = model;
     if (!prov.defaultModel) prov.defaultModel = model.id;
     if (model.supportsReasoning) prov.supportsReasoning = true;
     if (!this.data.activeModel) {
       this.data.activeProvider = providerId;
-      this.data.activeModel = model.id;
+      this.data.activeModel = getDisplayModelId(prov, model.id);
     }
-    this.data.providers = { ...this.data.providers };
-    this.saveSettings();
+    void this.saveSettings();
   }
 
   public removeModelFromProvider(providerId: string, modelId: string): void {
@@ -590,34 +709,29 @@ class SettingsStore {
     if (!prov) return;
     prov.availableModels = prov.availableModels.filter((m) => m !== modelId);
     if (prov.modelCapabilities) {
-      const nextCaps = { ...prov.modelCapabilities };
-      delete nextCaps[modelId];
-      prov.modelCapabilities = nextCaps;
+      delete prov.modelCapabilities[modelId];
     }
-    if (this.data.activeProvider === providerId && this.data.activeModel === modelId) {
-      this.data.activeModel = prov.availableModels[0] || '';
+    if (this.data.activeProvider === providerId && !findModelGroup(prov, this.data.activeModel)) {
+      this.data.activeModel = getDisplayModelId(prov, prov.availableModels[0] || '');
     }
-    this.data.providers = { ...this.data.providers };
-    this.saveSettings();
+    void this.saveSettings();
   }
 
   public removeProvider(providerId: string): void {
-    const next = { ...this.data.providers };
-    delete next[providerId];
-    this.data.providers = next;
+    delete this.data.providers[providerId];
     if (this.data.activeProvider === providerId) {
-      const first = Object.values(next).find((p) => p.enabled);
+      const first = Object.values(this.data.providers).find((p) => p.enabled);
       this.data.activeProvider = first ? first.id : '';
-      this.data.activeModel = first ? (first.defaultModel || first.availableModels[0] || '') : '';
+      this.data.activeModel = first ? getDisplayModelId(first, first.defaultModel || first.availableModels[0] || '') : '';
     }
-    this.saveSettings();
+    void this.saveSettings();
   }
 
   public setActiveModel(providerId: string, modelId: string): void {
     const prov = this.data.providers[providerId];
     this.data.activeProvider = providerId;
     this.data.activeModel = getDisplayModelId(prov, modelId);
-    this.saveSettings();
+    void this.saveSettings();
   }
 
   public setReasoningLevel(level: ReasoningLevel): void {
@@ -639,7 +753,7 @@ class SettingsStore {
         this.data.reasoningBudgetTokens = 64000;
         break;
     }
-    this.saveSettings();
+    void this.saveSettings();
   }
 
   public setProvider(providerId: string): void {
@@ -650,19 +764,20 @@ class SettingsStore {
       if (prov.availableModels.length > 0 && !grp) {
         this.data.activeModel = getDisplayModelId(prov, prov.defaultModel || prov.availableModels[0]);
       }
-      this.saveSettings();
+      void this.saveSettings();
     }
   }
 
   public setModel(modelId: string): void {
-    this.data.activeModel = modelId;
-    this.saveSettings();
+    const prov = this.data.providers[this.data.activeProvider];
+    this.data.activeModel = getDisplayModelId(prov, modelId);
+    void this.saveSettings();
   }
 
   public setApiKey(providerId: string, apiKey: string): void {
     if (this.data.providers[providerId]) {
       this.data.providers[providerId].apiKey = apiKey;
-      this.saveSettings();
+      void this.saveSettings();
     }
   }
 

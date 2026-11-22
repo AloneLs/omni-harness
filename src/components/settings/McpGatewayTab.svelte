@@ -1,6 +1,6 @@
 <script lang="ts">
 import { onMount } from 'svelte';
-import { fly, slide } from 'svelte/transition';
+import { slide } from 'svelte/transition';
 import { invoke } from '@tauri-apps/api/core';
 import Icon from '../Icon.svelte';
 
@@ -44,6 +44,7 @@ interface McpServerUi {
 let servers = $state<McpServerUi[]>([]);
 let selectedServerId = $state<string>('');
 let activeServer = $derived(servers.find((s) => s.id === selectedServerId) ?? servers[0] ?? null);
+let visibleToolsLimit = $state<number>(60);
 
 let showForm = $state<boolean>(false);
 let editingId = $state<string | null>(null);
@@ -58,6 +59,11 @@ let formArgsText = $state<string>('');
 let formEnvText = $state<string>('{}');
 let formUrl = $state<string>('');
 let formEnabled = $state<boolean>(true);
+
+$effect(() => {
+  const _id = activeServer?.id;
+  visibleToolsLimit = 60;
+});
 
 function parseArgsString(raw?: string | null): string[] {
   if (!raw || !raw.trim()) return [];
@@ -554,21 +560,25 @@ async function toggleConnection(server: McpServerUi) {
               Discovered Tools ({activeServer.tools.length})
             </div>
 
-            {#key activeServer.id}
-              <div class="space-y-1.5">
-                {#each activeServer.tools as tool, idx (tool.name)}
-                  <div
-                    in:fly={{ y: 6, duration: 150, delay: idx * 25 }}
-                    class="p-2.5 rounded-[6px] bg-[#121214] border border-white/[0.06]"
-                  >
-                    <div class="font-mono text-xs text-[#EDEDEF]">{tool.name}</div>
-                    {#if tool.description}
-                      <div class="text-[11px] text-[#73737A] mt-0.5">{tool.description}</div>
-                    {/if}
-                  </div>
-                {/each}
-              </div>
-            {/key}
+            <div class="space-y-1.5">
+              {#each activeServer.tools.slice(0, visibleToolsLimit) as tool, idx (`${idx}-${tool.name}`)}
+                <div class="p-2.5 rounded-[6px] bg-[#121214] border border-white/[0.06]">
+                  <div class="font-mono text-xs text-[#EDEDEF]">{tool.name}</div>
+                  {#if tool.description}
+                    <div class="text-[11px] text-[#73737A] mt-0.5">{tool.description}</div>
+                  {/if}
+                </div>
+              {/each}
+              {#if activeServer.tools.length > visibleToolsLimit}
+                <button
+                  type="button"
+                  onclick={() => (visibleToolsLimit += 80)}
+                  class="w-full py-2 rounded-[6px] bg-[#141416] hover:bg-[#1C1C1F] border border-white/[0.08] text-xs text-[#A3A3AA] hover:text-[#EDEDEF] transition-colors"
+                >
+                  Show more ({activeServer.tools.length - visibleToolsLimit} remaining)
+                </button>
+              {/if}
+            </div>
           </div>
         </div>
       {/if}

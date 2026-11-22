@@ -5,6 +5,7 @@ pub use protocol::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -96,6 +97,56 @@ pub struct McpServerInstance {
     req_counter: AtomicU64,
 }
 
+async fn parse_http_or_sse_response(resp: reqwest::Response) -> Result<Value, String> {
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("MCP server returned HTTP {}: {}", status.as_u16(), body));
+    }
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read MCP HTTP response: {}", e))?;
+
+    if status.as_u16() == 202 && text.trim().is_empty() {
+        return Ok(Value::Null);
+    }
+
+    let rpc_resp: JsonRpcResponse = if content_type.contains("text/event-stream") {
+        let mut found: Option<JsonRpcResponse> = None;
+        for line in text.lines() {
+            if let Some(data) = line.strip_prefix("data:") {
+                let trimmed = data.trim();
+                if trimmed.is_empty() || trimmed == "[DONE]" {
+                    continue;
+                }
+                if let Ok(parsed) = serde_json::from_str::<JsonRpcResponse>(trimmed) {
+                    found = Some(parsed);
+                    break;
+                }
+            }
+        }
+        found.ok_or_else(|| "No JSON-RPC payload found in SSE response".to_string())?
+    } else {
+        serde_json::from_str(&text)
+            .map_err(|e| format!("Failed to parse JSON-RPC response: {}", e))?
+    };
+
+    if let Some(err) = rpc_resp.error {
+        Err(format!("MCP Error {}: {}", err.code, err.message))
+    } else {
+        Ok(rpc_resp.result.unwrap_or(Value::Null))
+    }
+}
+
 impl McpServerInstance {
     pub async fn send_request(
         &self,
@@ -113,20 +164,28 @@ impl McpServerInstance {
                     resp_map.insert(req_id, reply_tx);
                 }
 
-                let mut line = serde_json::to_string(&rpc_req)
-                    .map_err(|e| format!("Serialization error: {}", e))?;
+                let mut line = match serde_json::to_string(&rpc_req) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        conn.responses.lock().await.remove(&req_id);
+                        return Err(format!("Serialization error: {}", e));
+                    }
+                };
                 line.push('\n');
 
-                {
+                let write_res = {
                     let mut stdin = conn.writer.lock().await;
-                    stdin
-                        .write_all(line.as_bytes())
-                        .await
-                        .map_err(|e| format!("Stdin write error: {}", e))?;
-                    stdin
-                        .flush()
-                        .await
-                        .map_err(|e| format!("Stdin flush error: {}", e))?;
+                    if let Err(e) = stdin.write_all(line.as_bytes()).await {
+                        Err(format!("Stdin write error: {}", e))
+                    } else if let Err(e) = stdin.flush().await {
+                        Err(format!("Stdin flush error: {}", e))
+                    } else {
+                        Ok(())
+                    }
+                };
+                if let Err(err) = write_res {
+                    conn.responses.lock().await.remove(&req_id);
+                    return Err(err);
                 }
 
                 match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
@@ -137,8 +196,14 @@ impl McpServerInstance {
                             Ok(resp.result.unwrap_or(Value::Null))
                         }
                     }
-                    Ok(Err(_)) => Err("Response channel dropped".to_string()),
-                    Err(_) => Err("MCP request timed out after 30s".to_string()),
+                    Ok(Err(_)) => {
+                        conn.responses.lock().await.remove(&req_id);
+                        Err("Response channel dropped".to_string())
+                    }
+                    Err(_) => {
+                        conn.responses.lock().await.remove(&req_id);
+                        Err("MCP request timed out after 30s".to_string())
+                    }
                 }
             }
             McpTransportConnection::Sse {
@@ -149,45 +214,22 @@ impl McpServerInstance {
                 let url = post_endpoint.read().await.clone();
                 let resp = client
                     .post(&url)
+                    .header("Accept", "application/json, text/event-stream")
                     .json(&rpc_req)
                     .send()
                     .await
                     .map_err(|e| format!("SSE POST request failed: {}", e))?;
-
-                let status = resp.status();
-                if !status.is_success() {
-                    return Err(format!("SSE server returned HTTP {}", status));
-                }
-
-                let rpc_resp: JsonRpcResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| format!("Failed to parse SSE JSON-RPC response: {}", e))?;
-
-                if let Some(err) = rpc_resp.error {
-                    Err(format!("MCP Error {}: {}", err.code, err.message))
-                } else {
-                    Ok(rpc_resp.result.unwrap_or(Value::Null))
-                }
+                parse_http_or_sse_response(resp).await
             }
             McpTransportConnection::HttpStream { endpoint, client } => {
                 let resp = client
                     .post(endpoint)
+                    .header("Accept", "application/json, text/event-stream")
                     .json(&rpc_req)
                     .send()
                     .await
                     .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-                let rpc_resp: JsonRpcResponse = resp
-                    .json()
-                    .await
-                    .map_err(|e| format!("Failed to parse HTTP JSON-RPC response: {}", e))?;
-
-                if let Some(err) = rpc_resp.error {
-                    Err(format!("MCP Error {}: {}", err.code, err.message))
-                } else {
-                    Ok(rpc_resp.result.unwrap_or(Value::Null))
-                }
+                parse_http_or_sse_response(resp).await
             }
         }
     }
@@ -306,7 +348,10 @@ impl McpServerCatalog {
                 .ok_or_else(|| "Missing command for stdio MCP server".to_string())?;
 
             let mut std_cmd = std::process::Command::new(cmd_path);
-            std_cmd.creation_flags(0x08000000);
+            #[cfg(windows)]
+            {
+                std_cmd.creation_flags(0x08000000);
+            }
             for arg in &config.args {
                 std_cmd.arg(arg);
             }

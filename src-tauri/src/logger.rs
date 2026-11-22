@@ -2,20 +2,49 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Mutex, OnceLock};
 
+enum LogCmd {
+    SetPaths(Vec<PathBuf>),
+    Line(String),
+}
+
 struct LoggerState {
-    paths: Vec<PathBuf>,
+    primary_path: String,
     trace_ring: VecDeque<String>,
+    tx: SyncSender<LogCmd>,
 }
 
 static LOGGER: OnceLock<Mutex<LoggerState>> = OnceLock::new();
 
 fn state() -> &'static Mutex<LoggerState> {
     LOGGER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<LogCmd>(1024);
+        std::thread::spawn(move || {
+            let mut files: Vec<File> = Vec::new();
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    LogCmd::SetPaths(paths) => {
+                        files.clear();
+                        for p in paths {
+                            if let Ok(f) = OpenOptions::new().create(true).append(true).open(&p) {
+                                files.push(f);
+                            }
+                        }
+                    }
+                    LogCmd::Line(text) => {
+                        for f in &mut files {
+                            let _ = f.write_all(text.as_bytes());
+                        }
+                    }
+                }
+            }
+        });
         Mutex::new(LoggerState {
-            paths: Vec::new(),
+            primary_path: String::new(),
             trace_ring: VecDeque::with_capacity(120),
+            tx,
         })
     })
 }
@@ -42,10 +71,7 @@ pub fn init(primary_dir: PathBuf) {
     }
 
     let mut active_paths = Vec::new();
-    let header = format!(
-        "=== OmniHarness Run Log started at {} ===\n",
-        ts()
-    );
+    let header = format!("=== OmniHarness Run Log started at {} ===\n", ts());
     for path in candidates {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
@@ -57,16 +83,18 @@ pub fn init(primary_dir: PathBuf) {
     }
 
     if let Ok(mut st) = state().lock() {
-        st.paths = active_paths;
+        st.primary_path = active_paths
+            .first()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
         st.trace_ring.clear();
+        let _ = st.tx.try_send(LogCmd::SetPaths(active_paths));
     }
 }
 
 pub fn get_log_path() -> String {
     if let Ok(st) = state().lock() {
-        if let Some(p) = st.paths.first() {
-            return p.to_string_lossy().to_string();
-        }
+        return st.primary_path.clone();
     }
     String::new()
 }
@@ -77,12 +105,10 @@ fn append_raw(line: &str) {
             st.trace_ring.pop_front();
         }
         st.trace_ring.push_back(line.to_string());
-        for p in &st.paths {
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
-                let _ = f.write_all(line.as_bytes());
-                let _ = f.write_all(b"\n");
-            }
-        }
+        let mut payload = String::with_capacity(line.len() + 1);
+        payload.push_str(line);
+        payload.push('\n');
+        let _ = st.tx.try_send(LogCmd::Line(payload));
     }
 }
 
@@ -119,11 +145,7 @@ pub fn error_with_trace(tag: &str, msg: &str) {
             dump.push('\n');
         }
         dump.push_str("--- END TRACE DUMP ---\n");
-        for p in &st.paths {
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(p) {
-                let _ = f.write_all(dump.as_bytes());
-            }
-        }
+        let _ = st.tx.try_send(LogCmd::Line(dump));
         if st.trace_ring.len() >= 100 {
             st.trace_ring.pop_front();
         }

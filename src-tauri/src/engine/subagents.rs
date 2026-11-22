@@ -653,7 +653,7 @@ impl SubagentRunner {
             loop {
                 let evt = tokio::select! {
                     biased;
-                    _ = session.cancel_notify.notified() => {
+                    _ = session.cancelled() => {
                         join.abort();
                         return Err("User canceled execution".to_string());
                     }
@@ -751,12 +751,12 @@ impl SubagentRunner {
                                 },
                                 ContentPart::ImageUrl {
                                     image_url: ImageUrlDetail {
-                                        url: du,
-                                        detail: Some("high".to_string()),
+                                        url: crate::llm::request_compat::resize_image_data_url_if_needed(&du, 1568),
+                                        detail: Some("auto".to_string()),
                                     },
                                 },
                             ]),
-                            name: None,
+                            name: Some("ephemeral_vision".to_string()),
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: None,

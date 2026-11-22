@@ -52,10 +52,11 @@ impl SingleAgentRunner {
                 } else {
                     content
                 };
-                if total_chars + capped.len() > max_total_chars {
+                let capped_chars = capped.chars().count();
+                if total_chars + capped_chars > max_total_chars {
                     break;
                 }
-                total_chars += capped.len();
+                total_chars += capped_chars;
                 out.push((raw_p, capped));
             }
         }
@@ -152,7 +153,7 @@ impl SingleAgentRunner {
 
         let outcome = match tools
             .pty_manager
-            .wait_or_background(&task_id, wait_ms, Some(&session.cancel_notify))
+            .wait_or_background(&task_id, wait_ms, Some(session.cancel_receiver()))
             .await
         {
             Ok(o) => o,
@@ -392,6 +393,7 @@ impl SingleAgentRunner {
         custom_instruction: Option<&str>,
     ) -> Result<String, String> {
         let mut fork_msgs = projection.to_vec();
+        ContextBuilder::strip_all_media_for_compaction(&mut fork_msgs);
         fork_msgs.push(ChatMessage {
             role: "user".to_string(),
             content: MessageContent::Text(ContextBuilder::build_compaction_prompt(custom_instruction)),
@@ -1026,7 +1028,7 @@ impl SingleAgentRunner {
                 loop {
                     let evt = tokio::select! {
                         biased;
-                        _ = session.cancel_notify.notified() => {
+                        _ = session.cancelled() => {
                             stream_join.abort();
                             let _ = tools.pty_manager.kill_all_for_chat(chat_id);
                             Self::save_checkpoint(db, chat_id, history);
@@ -1173,16 +1175,17 @@ impl SingleAgentRunner {
                             let raw_txt = last_user.content.as_text_lossy();
                             if !raw_txt.trim_start().starts_with("artifact://sha256:") && !raw_txt.trim().is_empty() {
                                 if let Ok(art) = crate::engine::policy_guard::ArtifactStore::save_text_artifact(&raw_txt) {
+                                    let short_hash: String = art.hash.chars().take(16).collect();
                                     crate::engine::policy_guard::audit_event(
                                         chat_id,
                                         "artifact_created",
-                                        &format!("sha256:{}", &art.hash[..16]),
+                                        &format!("sha256:{}", short_hash),
                                     );
                                     let ref_prompt = crate::engine::policy_guard::ArtifactStore::format_prompt_ref(&art);
                                     crate::engine::policy_guard::audit_event(
                                         chat_id,
                                         "prompt_assembled",
-                                        &format!("artifact://sha256:{}", &art.hash[..16]),
+                                        &format!("artifact://sha256:{}", short_hash),
                                     );
                                     last_user.content = MessageContent::Text(ref_prompt);
                                     let (rebuilt_proj, _) = ContextBuilder::build_projection(
@@ -1526,10 +1529,16 @@ impl SingleAgentRunner {
                 continue;
             }
 
+            if event_sender.is_closed() {
+                let _ = tools.pty_manager.kill_all_for_chat(chat_id);
+                Self::save_checkpoint(db, chat_id, history);
+                return Err("Client disconnected".to_string());
+            }
+
             let all_concurrent_safe = active_tool_calls.len() > 1
                 && active_tool_calls
                     .iter()
-                    .all(|tc| Self::is_concurrency_safe_tool(&tc.function.name) || tc.function.name == "terminal_exec");
+                    .all(|tc| Self::is_concurrency_safe_tool(&tc.function.name));
 
             if all_concurrent_safe {
                 let mut join_set = tokio::task::JoinSet::new();
@@ -1622,7 +1631,9 @@ impl SingleAgentRunner {
 
                 if tool_name == "terminal_exec" {
                     let exec_cp_id = uuid::Uuid::new_v4().to_string();
-                    let pre_exec_manifest = crate::tools::blob_store::capture_workspace_manifest(workspace_root, &exec_cp_id, "pre_exec", false).ok();
+                    let ws_for_pre = workspace_root.to_string();
+                    let cp_for_pre = exec_cp_id.clone();
+                    let pre_exec_manifest = tokio::task::spawn_blocking(move || crate::tools::blob_store::capture_workspace_manifest(&ws_for_pre, &cp_for_pre, "pre_exec", false).ok()).await.ok().flatten();
                     let tool_started = std::time::Instant::now();
                     let (ok, out_str, err_opt) = Self::run_live_terminal_exec(
                         &parsed_args,
@@ -1650,7 +1661,9 @@ impl SingleAgentRunner {
                 }
 
                 if let Some(pre_m) = pre_exec_manifest {
-                    if let Ok(post_m) = crate::tools::blob_store::capture_workspace_manifest(workspace_root, &pre_m.checkpoint_id, "post_exec", false) {
+                    let ws_for_post = workspace_root.to_string();
+                    let cp_for_post = pre_m.checkpoint_id.clone();
+                    if let Ok(Ok(post_m)) = tokio::task::spawn_blocking(move || crate::tools::blob_store::capture_workspace_manifest(&ws_for_post, &cp_for_post, "post_exec", false)).await {
                         let pre_map: std::collections::HashMap<String, String> = pre_m.entries.into_iter().map(|e| (e.path, e.blob_hash)).collect();
                         if let Some(d) = db {
                             for post_e in post_m.entries {
@@ -1858,7 +1871,9 @@ impl SingleAgentRunner {
                 if matches!(tool_name.as_str(), "write_file" | "edit_file" | "patch_file" | "fs_ops") && !turn_checkpoint_created {
                     turn_checkpoint_created = true;
                     let cp_id = uuid::Uuid::new_v4().to_string();
-                    if let Ok(manifest) = crate::tools::blob_store::capture_workspace_manifest(workspace_root, &cp_id, "pre_write", true) {
+                    let ws_for_pw = workspace_root.to_string();
+                    let cp_for_pw = cp_id.clone();
+                    if let Ok(Ok(manifest)) = tokio::task::spawn_blocking(move || crate::tools::blob_store::capture_workspace_manifest(&ws_for_pw, &cp_for_pw, "pre_write", true)).await {
                         if let Some(d) = db {
                             if let Ok(m_json) = serde_json::to_string(&manifest) {
                                 let msg_seq = d.max_message_seq(chat_id);
@@ -1892,7 +1907,7 @@ impl SingleAgentRunner {
                 let tool_started = std::time::Instant::now();
                 let exec_result = tokio::select! {
                     biased;
-                    _ = session.cancel_notify.notified() => {
+                    _ = session.cancelled() => {
                         let _ = tools.pty_manager.kill_all_for_chat(chat_id);
                         Self::save_checkpoint(db, chat_id, history);
                         let _ = event_sender
@@ -1944,6 +1959,9 @@ impl SingleAgentRunner {
                 }
 
                 let mut vision_data_url: Option<String> = None;
+                let mut audio_data_part: Option<(String, String)> = None;
+                let mut video_data_part: Option<(String, String)> = None;
+                let mut media_file_path: Option<String> = None;
                 let mut ui_output_override: Option<String> = None;
                 let raw_output = if exec_result.success {
                     if tool_name == "computer_use" {
@@ -1954,6 +1972,58 @@ impl SingleAgentRunner {
                                 let mut compact = obj.clone();
                                 compact.remove("dataUrl");
                                 serde_json::to_string(&Value::Object(compact)).unwrap_or_else(|_| "{}".to_string())
+                            } else {
+                                serde_json::to_string(&exec_result.output).unwrap_or_else(|_| "{}".to_string())
+                            }
+                        } else {
+                            serde_json::to_string(&exec_result.output).unwrap_or_else(|_| "{}".to_string())
+                        }
+                    } else if tool_name == "read_file" {
+                        if let Some(obj) = exec_result.output.as_object() {
+                            let kind = obj.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                            let p = obj.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                            if kind == "image" {
+                                if let Some(du) = obj.get("dataUrl").and_then(|v| v.as_str()) {
+                                    vision_data_url = Some(du.to_string());
+                                    media_file_path = Some(p.to_string());
+                                    ui_output_override = serde_json::to_string(&exec_result.output).ok();
+                                    let mut compact = obj.clone();
+                                    compact.remove("dataUrl");
+                                    serde_json::to_string(&Value::Object(compact)).unwrap_or_else(|_| "{}".to_string())
+                                } else {
+                                    serde_json::to_string(&exec_result.output).unwrap_or_else(|_| "{}".to_string())
+                                }
+                            } else if kind == "audio" {
+                                if let Some(du) = obj.get("dataUrl").and_then(|v| v.as_str()) {
+                                    let fmt_hint = obj
+                                        .get("format")
+                                        .and_then(|v| v.as_str())
+                                        .or_else(|| obj.get("mime").and_then(|v| v.as_str()))
+                                        .unwrap_or("wav");
+                                    if let Some(idx) = du.find(";base64,") {
+                                        let b64 = &du[idx + 8..];
+                                        audio_data_part = Some((b64.to_string(), fmt_hint.to_string()));
+                                    }
+                                    media_file_path = Some(p.to_string());
+                                    ui_output_override = serde_json::to_string(&exec_result.output).ok();
+                                    let mut compact = obj.clone();
+                                    compact.remove("dataUrl");
+                                    serde_json::to_string(&Value::Object(compact)).unwrap_or_else(|_| "{}".to_string())
+                                } else {
+                                    serde_json::to_string(&exec_result.output).unwrap_or_else(|_| "{}".to_string())
+                                }
+                            } else if kind == "video" {
+                                if let Some(du) = obj.get("dataUrl").and_then(|v| v.as_str()) {
+                                    let mime = obj.get("mime").and_then(|v| v.as_str()).unwrap_or("video/mp4");
+                                    video_data_part = Some((du.to_string(), mime.to_string()));
+                                    media_file_path = Some(p.to_string());
+                                    ui_output_override = serde_json::to_string(&exec_result.output).ok();
+                                    let mut compact = obj.clone();
+                                    compact.remove("dataUrl");
+                                    serde_json::to_string(&Value::Object(compact)).unwrap_or_else(|_| "{}".to_string())
+                                } else {
+                                    serde_json::to_string(&exec_result.output).unwrap_or_else(|_| "{}".to_string())
+                                }
                             } else {
                                 serde_json::to_string(&exec_result.output).unwrap_or_else(|_| "{}".to_string())
                             }
@@ -2067,34 +2137,112 @@ impl SingleAgentRunner {
                 }
                 if let Some(du) = vision_data_url {
                     if caps.supports_vision {
-                        let win_title = exec_result
-                            .output
-                            .get("title")
-                            .and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or("desktop");
-                        let offscreen_flag = exec_result
-                            .output
-                            .get("offscreen")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
+                        if tool_name == "computer_use" {
+                            let win_title = exec_result
+                                .output
+                                .get("title")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or("desktop");
+                            let offscreen_flag = exec_result
+                                .output
+                                .get("offscreen")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            history.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: MessageContent::Parts(vec![
+                                    ContentPart::Text {
+                                        text: format!(
+                                            "Captured target '{}' (offscreen={}) via computer_use. Coordinates 0..1000 map directly to this image's width and height.",
+                                            win_title, offscreen_flag
+                                        ),
+                                    },
+                                    ContentPart::ImageUrl {
+                                        image_url: ImageUrlDetail {
+                                            url: crate::llm::request_compat::resize_image_data_url_if_needed(&du, 1568),
+                                            detail: Some("auto".to_string()),
+                                        },
+                                    },
+                                ]),
+                                name: Some("ephemeral_vision".to_string()),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                reasoning_content: None,
+                            });
+                        } else {
+                            let fp = media_file_path.as_deref().unwrap_or("image");
+                            history.push(ChatMessage {
+                                role: "user".to_string(),
+                                content: MessageContent::Parts(vec![
+                                    ContentPart::Text {
+                                        text: format!("Loaded image '{}' for visual inspection.", fp),
+                                    },
+                                    ContentPart::ImageUrl {
+                                        image_url: ImageUrlDetail {
+                                            url: du,
+                                            detail: Some("auto".to_string()),
+                                        },
+                                    },
+                                ]),
+                                name: Some("ephemeral_vision".to_string()),
+                                tool_calls: None,
+                                tool_call_id: None,
+                                reasoning_content: None,
+                            });
+                        }
+                    }
+                } else if let Some((b64, mime_or_fmt)) = audio_data_part {
+                    let fp = media_file_path.as_deref().unwrap_or("audio");
+                    let low = mime_or_fmt.to_ascii_lowercase();
+                    let fmt = if low.contains("mp3") || low.contains("mpeg") {
+                        "mp3"
+                    } else if low.contains("ogg") || low.contains("opus") {
+                        "ogg"
+                    } else if low.contains("flac") {
+                        "flac"
+                    } else if low.contains("m4a") || low.contains("aac") || low.contains("mp4") {
+                        "aac"
+                    } else if low.contains("webm") {
+                        "webm"
+                    } else {
+                        "wav"
+                    };
+                    history.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: MessageContent::Parts(vec![
+                            ContentPart::Text {
+                                text: format!("Loaded audio '{}' for audio inspection.", fp),
+                            },
+                            ContentPart::InputAudio {
+                                input_audio: crate::llm::request_compat::InputAudioDetail {
+                                    data: b64,
+                                    format: fmt.to_string(),
+                                },
+                            },
+                        ]),
+                        name: Some("ephemeral_vision".to_string()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        reasoning_content: None,
+                    });
+                } else if let Some((du, _mime)) = video_data_part {
+                    let fp = media_file_path.as_deref().unwrap_or("video");
+                    if caps.supports_vision {
                         history.push(ChatMessage {
                             role: "user".to_string(),
                             content: MessageContent::Parts(vec![
                                 ContentPart::Text {
-                                    text: format!(
-                                        "Captured target '{}' (offscreen={}) via computer_use. Coordinates 0..1000 map directly to this image's width and height.",
-                                        win_title, offscreen_flag
-                                    ),
+                                    text: format!("Loaded video '{}' for visual inspection.", fp),
                                 },
                                 ContentPart::ImageUrl {
                                     image_url: ImageUrlDetail {
                                         url: du,
-                                        detail: Some("high".to_string()),
+                                        detail: Some("auto".to_string()),
                                     },
                                 },
                             ]),
-                            name: None,
+                            name: Some("ephemeral_vision".to_string()),
                             tool_calls: None,
                             tool_call_id: None,
                             reasoning_content: None,

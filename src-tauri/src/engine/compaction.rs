@@ -1,3 +1,4 @@
+use crate::engine::context_engine::ContextBuilder;
 use crate::llm::request_compat::{ChatMessage, MessageContent};
 
 pub struct ContextCompactor;
@@ -33,6 +34,7 @@ impl ContextCompactor {
 
         let mut system_message: Option<ChatMessage> = None;
         let mut work_messages = messages;
+        ContextBuilder::strip_all_media_for_compaction(&mut work_messages);
 
         if let Some(first) = work_messages.first() {
             if first.role == "system" {

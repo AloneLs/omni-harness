@@ -1,9 +1,16 @@
+use futures_util::StreamExt;
 use serde::Serialize;
-use std::io::Read;
+use std::io::Write;
 use std::path::PathBuf;
 use tauri::Emitter;
 
 const GITHUB_REPO: &str = "wasrecordrecorder/omni-harness";
+const ALLOWED_UPDATE_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+];
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,6 +24,21 @@ pub struct UpdateInfo {
     pub asset_name: Option<String>,
     pub asset_url: Option<String>,
     pub published_at: String,
+}
+
+fn validate_update_url(raw_url: &str) -> Result<url::Url, String> {
+    let parsed = url::Url::parse(raw_url).map_err(|e| format!("Invalid update URL: {}", e))?;
+    if parsed.scheme() != "https" {
+        return Err("Update URL must use HTTPS".to_string());
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "Update URL missing host".to_string())?
+        .to_ascii_lowercase();
+    if !ALLOWED_UPDATE_HOSTS.contains(&host.as_str()) {
+        return Err(format!("Untrusted update host: {}", host));
+    }
+    Ok(parsed)
 }
 
 fn parse_semver(v: &str) -> (u64, u64, u64) {
@@ -68,7 +90,7 @@ pub async fn check_github_update(client: &reqwest::Client) -> Result<UpdateInfo,
             let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let dl = a.get("browser_download_url").and_then(|v| v.as_str()).unwrap_or("");
             let low = name.to_ascii_lowercase();
-            if !dl.is_empty() && (low.ends_with(".zip") || low.ends_with(".exe")) {
+            if !dl.is_empty() && (low.ends_with(".zip") || low.ends_with(".exe")) && validate_update_url(dl).is_ok() {
                 chosen_name = Some(name.to_string());
                 chosen_url = Some(dl.to_string());
                 if low.contains("win64") || low.contains("x64") {
@@ -101,6 +123,8 @@ pub async fn install_github_update(
     asset_url: &str,
     asset_name: &str,
 ) -> Result<(), String> {
+    validate_update_url(asset_url)?;
+
     let _ = app.emit(
         "update-download-progress",
         serde_json::json!({ "status": "downloading", "percent": 0 }),
@@ -116,49 +140,81 @@ pub async fn install_github_update(
     if !resp.status().is_success() {
         return Err(format!("Download failed with HTTP {}", resp.status().as_u16()));
     }
+    validate_update_url(resp.url().as_str())?;
 
-    let bytes = resp.bytes().await.map_err(|e| e.to_string())?.to_vec();
+    let stage_dir = std::env::temp_dir().join(format!("omni_update_{}", chrono::Utc::now().timestamp_millis()));
+    std::fs::create_dir_all(&stage_dir).map_err(|e| e.to_string())?;
+
+    let total_len = resp.content_length().unwrap_or(0);
+    let download_path = stage_dir.join("download.tmp");
+    let mut out_file = std::fs::File::create(&download_path).map_err(|e| e.to_string())?;
+    let mut downloaded: u64 = 0;
+    let mut last_pct: u64 = 0;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = chunk_res.map_err(|e| format!("Download stream error: {}", e))?;
+        out_file.write_all(&chunk).map_err(|e| e.to_string())?;
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        if total_len > 0 {
+            let pct = ((downloaded * 70) / total_len).min(70);
+            if pct >= last_pct + 5 {
+                last_pct = pct;
+                let _ = app.emit(
+                    "update-download-progress",
+                    serde_json::json!({ "status": "downloading", "percent": pct }),
+                );
+            }
+        }
+    }
+    drop(out_file);
+
     let _ = app.emit(
         "update-download-progress",
         serde_json::json!({ "status": "extracting", "percent": 75 }),
     );
 
-    let stage_dir = std::env::temp_dir().join(format!("omni_update_{}", chrono::Utc::now().timestamp_millis()));
-    std::fs::create_dir_all(&stage_dir).map_err(|e| e.to_string())?;
-
     let low = asset_name.to_ascii_lowercase();
-    let mut new_exe: Option<PathBuf> = None;
-
-    if low.ends_with(".zip") {
-        let reader = std::io::Cursor::new(&bytes);
-        let mut archive = zip::ZipArchive::new(reader).map_err(|e| format!("Invalid zip archive: {}", e))?;
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
-            if file.is_dir() {
-                continue;
+    let stage_clone = stage_dir.clone();
+    let dl_clone = download_path.clone();
+    let staged_exe = tokio::task::spawn_blocking(move || -> Result<PathBuf, String> {
+        let mut new_exe: Option<PathBuf> = None;
+        if low.ends_with(".zip") {
+            let f = std::fs::File::open(&dl_clone).map_err(|e| e.to_string())?;
+            let mut archive = zip::ZipArchive::new(f).map_err(|e| format!("Invalid zip archive: {}", e))?;
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+                if file.is_dir() {
+                    continue;
+                }
+                let enclosed = match file.enclosed_name() {
+                    Some(p) => p.to_path_buf(),
+                    None => continue,
+                };
+                let fname = enclosed
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if fname.is_empty() {
+                    continue;
+                }
+                let out_p = stage_clone.join(&fname);
+                let mut dest = std::fs::File::create(&out_p).map_err(|e| e.to_string())?;
+                std::io::copy(&mut file, &mut dest).map_err(|e| e.to_string())?;
+                if fname.eq_ignore_ascii_case("omni-harness.exe") {
+                    new_exe = Some(out_p);
+                }
             }
-            let fname = PathBuf::from(file.name())
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if fname.is_empty() {
-                continue;
-            }
-            let out_p = stage_dir.join(&fname);
-            let mut buf = Vec::new();
-            file.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-            std::fs::write(&out_p, &buf).map_err(|e| e.to_string())?;
-            if fname.eq_ignore_ascii_case("omni-harness.exe") {
-                new_exe = Some(out_p);
-            }
+            let _ = std::fs::remove_file(&dl_clone);
+        } else if low.ends_with(".exe") {
+            let out_p = stage_clone.join("omni-harness.exe");
+            std::fs::rename(&dl_clone, &out_p).map_err(|e| e.to_string())?;
+            new_exe = Some(out_p);
         }
-    } else if low.ends_with(".exe") {
-        let out_p = stage_dir.join("omni-harness.exe");
-        std::fs::write(&out_p, &bytes).map_err(|e| e.to_string())?;
-        new_exe = Some(out_p);
-    }
+        new_exe.ok_or_else(|| "Update archive does not contain omni-harness.exe".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
-    let staged_exe = new_exe.ok_or("Update archive does not contain omni-harness.exe")?;
     let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let target_dir = current_exe.parent().ok_or("Cannot resolve executable directory")?;
     let pid = std::process::id();

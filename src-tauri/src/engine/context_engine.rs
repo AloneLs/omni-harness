@@ -1,7 +1,7 @@
 use crate::db::Database;
 use crate::engine::task_contract::TaskContract;
 use crate::llm::capabilities::ModelFamily;
-use crate::llm::request_compat::{ChatMessage, MessageContent, ToolDefinition};
+use crate::llm::request_compat::{ChatMessage, ContentPart, MessageContent, ToolDefinition};
 use crate::llm::token_counter::TokenCountRouter;
 use std::collections::HashMap;
 use std::path::Path;
@@ -189,29 +189,20 @@ pub fn read_project_memory_prefix(workspace_root: &str) -> String {
     if let Ok(raw) = std::fs::read_to_string(&summary_path) {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            out.push_str("
-<project_summary>
-");
+            out.push_str("\n<project_summary>\n");
             out.push_str(safe_slice_head(trimmed, 12_000));
-            out.push_str("
-</project_summary>
-");
+            out.push_str("\n</project_summary>\n");
         }
     }
     let mem_index = resolve_auto_memory_dir(workspace_root).join("MEMORY.md");
     if let Ok(raw) = std::fs::read_to_string(&mem_index) {
         let lines: Vec<&str> = raw.lines().take(200).collect();
-        let joined = lines.join("
-");
+        let joined = lines.join("\n");
         let trimmed = joined.trim();
         if !trimmed.is_empty() {
-            out.push_str("
-<auto_memory_index>
-");
+            out.push_str("\n<auto_memory_index>\n");
             out.push_str(safe_slice_head(trimmed, 25_000));
-            out.push_str("
-</auto_memory_index>
-");
+            out.push_str("\n</auto_memory_index>\n");
         }
     }
     out
@@ -255,6 +246,31 @@ pub fn snap_to_turn_boundary(messages: &[ChatMessage], start_idx: usize) -> usiz
     idx
 }
 
+fn extract_media_path_hint(sibling_text: &str) -> Option<String> {
+    for prefix in [
+        "Loaded image '",
+        "Loaded audio '",
+        "Loaded video '",
+        "Captured target '",
+        "path: ",
+        "Attached file: ",
+    ] {
+        if let Some(pos) = sibling_text.find(prefix) {
+            let rest = &sibling_text[pos + prefix.len()..];
+            let end = rest
+                .find('\'')
+                .or_else(|| rest.find('\n'))
+                .or_else(|| rest.find(']'))
+                .unwrap_or(rest.len());
+            let candidate = rest[..end].trim();
+            if !candidate.is_empty() {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct CompactionCursor {
     pub last_pruned_upto: usize,
@@ -276,6 +292,7 @@ impl ContextBuilder {
     ) -> (Vec<ChatMessage>, bool) {
         let _ = (preserve_past_reasoning, cursor);
         let mut proj: Vec<ChatMessage> = transcript.to_vec();
+        Self::prune_ephemeral_media_projection(&mut proj, 3, 2);
         let now_ts = chrono::Utc::now().timestamp();
         let cache_cold = last_request_ts.map(|ts| now_ts - ts > 300).unwrap_or(false);
         let used = estimate_messages_tokens(&proj);
@@ -313,6 +330,139 @@ impl ContextBuilder {
         }
 
         (proj, pruned)
+    }
+
+    pub fn prune_ephemeral_media_projection(
+        messages: &mut [ChatMessage],
+        keep_recent: usize,
+        min_removal: usize,
+    ) -> usize {
+        struct MediaLoc {
+            msg_idx: usize,
+            part_idx: usize,
+            replacement: String,
+        }
+
+        let mut ephemeral_media: Vec<MediaLoc> = Vec::new();
+
+        for (m_idx, msg) in messages.iter().enumerate() {
+            let sibling_txt = msg.content.as_text_lossy();
+            let is_ephemeral = if msg.role == "tool" {
+                true
+            } else if msg.role == "user" {
+                sibling_txt.starts_with("Captured target ")
+                    || sibling_txt.starts_with("Loaded image ")
+                    || sibling_txt.starts_with("Loaded audio ")
+                    || sibling_txt.starts_with("Loaded video ")
+                    || msg.name.as_deref() == Some("ephemeral_vision")
+            } else {
+                false
+            };
+
+            if !is_ephemeral {
+                continue;
+            }
+
+            let path_hint = extract_media_path_hint(&sibling_txt);
+
+            if let MessageContent::Parts(parts) = &msg.content {
+                for (p_idx, part) in parts.iter().enumerate() {
+                    match part {
+                        ContentPart::ImageUrl { image_url } => {
+                            let kind = if image_url.url.starts_with("data:video/") {
+                                "video"
+                            } else {
+                                "image"
+                            };
+                            let label = if let Some(ref p) = path_hint {
+                                format!("[{} omitted; path: {}]", kind, p)
+                            } else if !image_url.url.starts_with("data:") {
+                                format!("[{} omitted; path: {}]", kind, image_url.url)
+                            } else {
+                                format!("[{} omitted; inline ({} chars)]", kind, image_url.url.len())
+                            };
+                            ephemeral_media.push(MediaLoc {
+                                msg_idx: m_idx,
+                                part_idx: p_idx,
+                                replacement: label,
+                            });
+                        }
+                        ContentPart::InputAudio { input_audio } => {
+                            let label = if let Some(ref p) = path_hint {
+                                format!("[audio omitted; path: {}; format: {}]", p, input_audio.format)
+                            } else {
+                                format!("[audio omitted; format: {}]", input_audio.format)
+                            };
+                            ephemeral_media.push(MediaLoc {
+                                msg_idx: m_idx,
+                                part_idx: p_idx,
+                                replacement: label,
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let total = ephemeral_media.len();
+        if total <= keep_recent {
+            return 0;
+        }
+
+        let surplus = total - keep_recent;
+        if surplus < min_removal {
+            return 0;
+        }
+
+        for loc in &ephemeral_media[..surplus] {
+            if let MessageContent::Parts(ref mut parts) = messages[loc.msg_idx].content {
+                if loc.part_idx < parts.len() {
+                    parts[loc.part_idx] = ContentPart::Text {
+                        text: loc.replacement.clone(),
+                    };
+                }
+            }
+        }
+
+        surplus
+    }
+
+    pub fn strip_all_media_for_compaction(messages: &mut [ChatMessage]) {
+        for msg in messages.iter_mut() {
+            let sibling_txt = msg.content.as_text_lossy();
+            let path_hint = extract_media_path_hint(&sibling_txt);
+            if let MessageContent::Parts(ref mut parts) = msg.content {
+                for part in parts.iter_mut() {
+                    match part {
+                        ContentPart::ImageUrl { image_url } => {
+                            let kind = if image_url.url.starts_with("data:video/") {
+                                "video"
+                            } else {
+                                "image"
+                            };
+                            let text = if let Some(ref p) = path_hint {
+                                format!("[{} omitted for compaction; path: {}]", kind, p)
+                            } else if !image_url.url.starts_with("data:") {
+                                format!("[{} omitted for compaction; path: {}]", kind, image_url.url)
+                            } else {
+                                format!("[{} omitted for compaction; inline ({} chars)]", kind, image_url.url.len())
+                            };
+                            *part = ContentPart::Text { text };
+                        }
+                        ContentPart::InputAudio { input_audio } => {
+                            let text = if let Some(ref p) = path_hint {
+                                format!("[audio omitted for compaction; path: {}; format: {}]", p, input_audio.format)
+                            } else {
+                                format!("[audio omitted for compaction; format: {}]", input_audio.format)
+                            };
+                            *part = ContentPart::Text { text };
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
 
     fn apply_prune_range(messages: &mut [ChatMessage], from: usize, to: usize) -> bool {
@@ -458,23 +608,11 @@ impl ContextBuilder {
     pub fn build_session_memory_prompt(existing_memory: Option<&str>) -> String {
         let prev = existing_memory
             .filter(|s| !s.trim().is_empty())
-            .map(|s| format!("
-Existing session memory to update incrementally:
-{}
-", s))
+            .map(|s| format!("\nExisting session memory to update incrementally:\n{}\n", s))
             .unwrap_or_default();
 
         format!(
-            "Update the structured Anchored Session Memory in Markdown (max ~12,000 tokens). Preserve exact file paths, symbol names, commands, and requirements. Use these exact headings:
-# Session Title
-## Current State
-## Task Specification
-## Important Files
-## Commands & Tools
-## Errors & Fixes
-## Learnings
-## Key Results
-## Worklog{}",
+            "Update the structured Anchored Session Memory in Markdown (max ~12,000 tokens). Preserve exact file paths, symbol names, commands, and requirements. Use these exact headings:\n# Session Title\n## Current State\n## Task Specification\n## Important Files\n## Commands & Tools\n## Errors & Fixes\n## Learnings\n## Key Results\n## Worklog{}",
             prev
         )
     }
@@ -669,6 +807,8 @@ Existing session memory to update incrementally:
                 out.push(cloned);
             }
         }
+
+        Self::strip_all_media_for_compaction(&mut out);
 
         let mut rehydration_blocks = Vec::new();
         if let Some(tail) = Self::build_dynamic_tail(workspace_root, contract) {

@@ -119,6 +119,9 @@ async fn stream_anthropic_inner(
     let mut unavailable_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut excluded_oauth: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_oauth_err: Option<LlmError> = None;
+    let is_native_anthropic = !(use_claude_oauth && (provider_name == "kimi_oauth" || provider_name == "zcode_oauth"))
+        && (use_claude_oauth || target_url.contains("anthropic.com"));
+
     for attempt in 1..=max_attempts {
         let (api_key, oauth_acc) = if use_claude_oauth {
             let acc = match crate::llm::oauth_accounts::acquire_valid_account_for_model(client, provider_name, &excluded_oauth, Some(&request.model)).await {
@@ -129,11 +132,17 @@ async fn stream_anthropic_inner(
         } else {
             (key_pool.next_key_async(provider_name, base_url).await?, None)
         };
+        let acc_client_opt = oauth_acc
+            .as_ref()
+            .and_then(|a| crate::llm::oauth_accounts::client_for_account(a));
+        let active_client = acc_client_opt.as_ref().unwrap_or(client);
+
         let caps = caps_registry.get(&request.model);
         normalize_request(&mut request, &caps);
 
         let mut system_text = String::new();
         let mut messages_payload: Vec<serde_json::Value> = Vec::new();
+        let mut has_tool_results = false;
 
         for msg in &request.messages {
             if msg.name.as_deref() == Some("ephemeral_runtime_state") {
@@ -175,6 +184,7 @@ async fn stream_anthropic_inner(
                 }
                 system_text.push_str(&msg.content.as_text_lossy());
             } else if msg.role == "tool" {
+                has_tool_results = true;
                 let call_id = msg.tool_call_id.clone().unwrap_or_default();
                 let tool_content = msg.content.as_text_lossy();
                 messages_payload.push(serde_json::json!({
@@ -235,7 +245,12 @@ async fn stream_anthropic_inner(
                                     }));
                                 }
                                 ContentPart::ImageUrl { image_url } => {
-                                    if let Some(stripped_b64) =
+                                    if image_url.url.starts_with("data:video/") {
+                                        arr.push(serde_json::json!({
+                                            "type": "text",
+                                            "text": "[video omitted: Anthropic API does not support inline video]",
+                                        }));
+                                    } else if let Some(stripped_b64) =
                                         image_url.url.strip_prefix("data:")
                                     {
                                         if let Some(semi_pos) = stripped_b64.find(';') {
@@ -344,6 +359,18 @@ async fn stream_anthropic_inner(
             payload["tools"] = serde_json::json!(mapped_tools);
         }
 
+        let use_context_editing = is_native_anthropic && has_tool_results;
+        if use_context_editing {
+            payload["context_management"] = serde_json::json!({
+                "edits": [{
+                    "type": "clear_tool_uses_20250919",
+                    "trigger": { "type": "input_tokens", "value": 80000 },
+                    "keep": { "type": "tool_uses", "value": 4 },
+                    "clear_at_least": { "type": "input_tokens", "value": 15000 }
+                }]
+            });
+        }
+
         let req_builder = if use_claude_oauth && provider_name == "kimi_oauth" {
             let k_url = if let Some(ref acc) = oauth_acc {
                 if acc.account_id.as_deref() == Some("kimi.ai") {
@@ -354,7 +381,7 @@ async fn stream_anthropic_inner(
             } else {
                 target_url.as_str()
             };
-            client
+            active_client
                 .post(k_url)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .header("anthropic-version", "2023-06-01")
@@ -363,7 +390,7 @@ async fn stream_anthropic_inner(
                 .header("Content-Type", "application/json")
                 .json(&payload)
         } else if use_claude_oauth && provider_name == "zcode_oauth" {
-            client
+            active_client
                 .post(&target_url)
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
@@ -373,21 +400,31 @@ async fn stream_anthropic_inner(
                 .header("Content-Type", "application/json")
                 .json(&payload)
         } else if use_claude_oauth {
-            client
+            let beta = if use_context_editing {
+                "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14,context-management-2025-06-27"
+            } else {
+                "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+            };
+            active_client
                 .post(&target_url)
                 .header("Authorization", format!("Bearer {}", api_key))
                 .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14")
+                .header("anthropic-beta", beta)
                 .header("user-agent", "claude-cli/1.0.0 (external, cli)")
                 .header("x-app", "cli")
                 .header("Content-Type", "application/json")
                 .json(&payload)
         } else {
-            client
+            let beta = if use_context_editing {
+                "prompt-caching-2024-07-31,context-management-2025-06-27"
+            } else {
+                "prompt-caching-2024-07-31"
+            };
+            active_client
                 .post(&target_url)
                 .header("x-api-key", &api_key)
                 .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", "prompt-caching-2024-07-31")
+                .header("anthropic-beta", beta)
                 .header("Content-Type", "application/json")
                 .json(&payload)
         };
@@ -453,7 +490,7 @@ async fn stream_anthropic_inner(
 
                 while let Some(pos) = line_buffer.find('\n') {
                     let line = line_buffer[..pos].trim_end_matches('\r').to_string();
-                    line_buffer = line_buffer[pos + 1..].to_string();
+                    line_buffer.drain(..=pos);
 
                     if line.is_empty() || line.starts_with(':') {
                         continue;
@@ -719,7 +756,7 @@ async fn stream_anthropic_inner(
             last_oauth_err = Some(LlmError::ProviderError { status: code, message: error_body.clone() });
             if attempt < max_attempts && matches!(code, 401 | 403 | 429 | 500..=504) {
                 if code == 401 {
-                    let _ = crate::llm::oauth_accounts::force_refresh_account(client, &acc.id).await;
+                    let _ = crate::llm::oauth_accounts::force_refresh_account(active_client, &acc.id).await;
                 }
                 let acc_cnt = crate::llm::oauth_accounts::list_accounts(Some("claude_oauth")).await.into_iter().filter(|a| a.enabled).count();
                 let reason = if acc_cnt > 1 {

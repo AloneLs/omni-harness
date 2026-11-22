@@ -373,6 +373,7 @@ pub async fn stream_antigravity(
                 return Err(last_err.unwrap_or(LlmError::ProviderError { status: 401, message: e }));
             }
         };
+        let effective_client = oauth_accounts::client_for_account(&acc).unwrap_or_else(|| client.clone());
 
         let project_id = match acc.project_id.clone() {
             Some(p) if !p.trim().is_empty() => p,
@@ -404,7 +405,7 @@ pub async fn stream_antigravity(
 
         crate::logger::info("Antigravity", &format!("POST {} model={} account={} project={}", target_url, model_clean, acc.email, project_id));
         let trace_id = oauth_accounts::antigravity_trace_id();
-        let mut req_builder = client
+        let mut req_builder = effective_client
             .post(target_url)
             .bearer_auth(&acc.access_token)
             .header("Content-Type", "application/json")
@@ -439,7 +440,7 @@ pub async fn stream_antigravity(
 
         let status = response.status();
         if status.as_u16() == 401 {
-            if let Ok(refreshed) = oauth_accounts::force_refresh_account(client, &acc.id).await {
+            if let Ok(refreshed) = oauth_accounts::force_refresh_account(&effective_client, &acc.id).await {
                 acc = refreshed;
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 let retry_trace = oauth_accounts::antigravity_trace_id();
@@ -454,7 +455,7 @@ pub async fn stream_antigravity(
                     "userAgent": "antigravity",
                     "requestId": uuid::Uuid::new_v4().to_string(),
                 });
-                let mut retry_builder = client
+                let mut retry_builder = effective_client
                     .post(target_url)
                     .bearer_auth(&acc.access_token)
                     .header("Content-Type", "application/json")
@@ -819,9 +820,10 @@ pub async fn generate_antigravity_image(
     let model_id = chosen_model.unwrap_or_else(|| "gemini-3-pro-image".to_string());
     let excluded = HashSet::new();
     let acc = oauth_accounts::acquire_valid_account(client, "antigravity", &excluded).await?;
+    let effective_client = oauth_accounts::client_for_account(&acc).unwrap_or_else(|| client.clone());
     let project_id = match acc.project_id.clone() {
         Some(p) if !p.trim().is_empty() => p,
-        _ => oauth_accounts::fetch_antigravity_project_id(client, &acc.access_token).await,
+        _ => oauth_accounts::fetch_antigravity_project_id(&effective_client, &acc.access_token).await,
     };
 
     let mut gen_cfg = serde_json::json!({
@@ -851,7 +853,7 @@ pub async fn generate_antigravity_image(
     let url = "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent";
     crate::logger::info("AntigravityImage", &format!("Generating image with model={} account={}", model_id, acc.email));
     let trace_id = oauth_accounts::antigravity_trace_id();
-    let mut req_builder = client
+    let mut req_builder = effective_client
         .post(url)
         .bearer_auth(&acc.access_token)
         .header("Content-Type", "application/json")

@@ -76,19 +76,26 @@ impl PromptQueue {
 
     async fn persist(&self) {
         let _guard = self.write_lock.lock().await;
-        let snapshot = {
+        let mut snapshot = {
             let guard = self.chats.read().await;
             guard.clone()
         };
-        if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
-            if let Some(parent) = self.path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let tmp = self.path.with_extension("json.tmp");
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.path);
+        for bucket in snapshot.values_mut() {
+            for item in bucket.iter_mut() {
+                for att in item.attachments.iter_mut() {
+                    if !att.path.trim().is_empty() && att.data_url.as_ref().map(|u| u.len() > 4096).unwrap_or(false) {
+                        att.data_url = None;
+                    }
+                }
             }
         }
+        let path = self.path.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
+                let _ = crate::db::atomic_write(&path, json.as_bytes());
+            }
+        })
+        .await;
     }
 
     pub async fn list(&self, chat_id: &str) -> Vec<QueuedPrompt> {

@@ -191,12 +191,16 @@ pub fn resolve_against_base(raw_str: &str, working_dir: Option<&Path>) -> Result
     } else {
         #[cfg(target_os = "windows")]
         {
-            if (local_str.starts_with('\\') || local_str.starts_with('/')) && effective_base.is_some() {
-                let base_clean = strip_verbatim_prefix(effective_base.unwrap());
-                if let Some(Component::Prefix(pref)) = base_clean.components().next() {
-                    let mut rooted = PathBuf::from(pref.as_os_str());
-                    rooted.push(&local_str);
-                    rooted
+            if local_str.starts_with('\\') || local_str.starts_with('/') {
+                if let Some(base) = effective_base {
+                    let base_clean = strip_verbatim_prefix(base);
+                    if let Some(Component::Prefix(pref)) = base_clean.components().next() {
+                        let mut rooted = PathBuf::from(pref.as_os_str());
+                        rooted.push(&local_str);
+                        rooted
+                    } else {
+                        raw_path.to_path_buf()
+                    }
                 } else {
                     raw_path.to_path_buf()
                 }
@@ -272,6 +276,15 @@ pub fn validate_path_with_base(
     let base = working_dir.or_else(|| allowed_roots.first().map(|p| p.as_path()));
     let resolved = resolve_against_base(path_str, base)?;
     if allowed_roots.is_empty() {
+        if let Some(wd) = working_dir.filter(|p| !p.as_os_str().is_empty()) {
+            if is_within_root(&resolved, wd) {
+                return Ok(resolved);
+            }
+            return Err(format!(
+                "Access denied: path '{}' resolves outside working directory.",
+                path_str
+            ));
+        }
         return Ok(resolved);
     }
     for root in allowed_roots {

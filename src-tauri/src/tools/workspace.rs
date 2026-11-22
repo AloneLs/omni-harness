@@ -3,11 +3,17 @@ use regex::RegexBuilder;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+const MAX_GREP_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_READ_TEXT_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -143,6 +149,15 @@ pub fn read_file(
     if !target.exists() {
         return Err(format!("File does not exist: {}", path_str));
     }
+    let meta = fs::metadata(&target).map_err(|e| e.to_string())?;
+    if meta.len() > MAX_READ_TEXT_BYTES {
+        return Err(format!(
+            "File '{}' is too large to read directly ({} bytes, limit {} bytes)",
+            path_str,
+            meta.len(),
+            MAX_READ_TEXT_BYTES
+        ));
+    }
     let raw_bytes = fs::read(&target).map_err(|e| e.to_string())?;
     let is_pdf = target
         .extension()
@@ -218,8 +233,13 @@ pub fn write_file(
         .unwrap_or_default();
     let (added_lines, removed_lines) = compute_line_diff(&old_text, new_content);
 
-    let after_blob = Some(new_content.as_bytes().to_vec());
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
 
+    atomic_write_bytes_within(&target, new_content.as_bytes(), allowed_roots)?;
+
+    let after_blob = Some(new_content.as_bytes().to_vec());
     let snapshot_id = record_file_snapshot(
         conn,
         chat_id,
@@ -230,12 +250,6 @@ pub fn write_file(
         added_lines,
         removed_lines,
     )?;
-
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-
-    fs::write(&target, new_content.as_bytes()).map_err(|e| e.to_string())?;
 
     Ok(FileMutationResult {
         snapshot_id,
@@ -278,8 +292,9 @@ pub fn replace_in_file(
     };
 
     let (added_lines, removed_lines) = compute_line_diff(&old_content, &new_content);
-    let after_blob = Some(new_content.as_bytes().to_vec());
+    atomic_write_bytes_within(&target, new_content.as_bytes(), allowed_roots)?;
 
+    let after_blob = Some(new_content.as_bytes().to_vec());
     let snapshot_id = record_file_snapshot(
         conn,
         chat_id,
@@ -290,8 +305,6 @@ pub fn replace_in_file(
         added_lines,
         removed_lines,
     )?;
-
-    fs::write(&target, new_content.as_bytes()).map_err(|e| e.to_string())?;
 
     Ok(FileMutationResult {
         snapshot_id,
@@ -359,8 +372,9 @@ pub fn apply_unified_diff(
     }
 
     let result_content = new_lines.join("\n");
-    let after_blob = Some(result_content.as_bytes().to_vec());
+    atomic_write_bytes_within(&target, result_content.as_bytes(), allowed_roots)?;
 
+    let after_blob = Some(result_content.as_bytes().to_vec());
     let snapshot_id = record_file_snapshot(
         conn,
         chat_id,
@@ -371,8 +385,6 @@ pub fn apply_unified_diff(
         added_counter,
         removed_counter,
     )?;
-
-    fs::write(&target, result_content.as_bytes()).map_err(|e| e.to_string())?;
 
     Ok(FileMutationResult {
         snapshot_id,
@@ -411,6 +423,12 @@ pub fn move_path(
         .unwrap_or_default();
     let total_lines = old_text.lines().count() as i64;
 
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+
+    fs::rename(&src, &dst).map_err(|e| e.to_string())?;
+
     let snapshot_id = record_file_snapshot(
         conn,
         chat_id,
@@ -421,12 +439,6 @@ pub fn move_path(
         total_lines,
         0,
     )?;
-
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-
-    fs::rename(&src, &dst).map_err(|e| e.to_string())?;
 
     Ok(FileMutationResult {
         snapshot_id,
@@ -461,6 +473,16 @@ pub fn delete_path(
         .map(|b| String::from_utf8_lossy(b).lines().count() as i64)
         .unwrap_or(0);
 
+    if target.is_dir() {
+        if recursive {
+            fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
+        } else {
+            fs::remove_dir(&target).map_err(|e| e.to_string())?;
+        }
+    } else {
+        fs::remove_file(&target).map_err(|e| e.to_string())?;
+    }
+
     let snapshot_id = record_file_snapshot(
         conn,
         chat_id,
@@ -471,16 +493,6 @@ pub fn delete_path(
         0,
         removed_lines,
     )?;
-
-    if target.is_dir() {
-        if recursive {
-            fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
-        } else {
-            fs::remove_dir(&target).map_err(|e| e.to_string())?;
-        }
-    } else {
-        fs::remove_file(&target).map_err(|e| e.to_string())?;
-    }
 
     Ok(FileMutationResult {
         snapshot_id,
@@ -500,40 +512,84 @@ pub fn fast_grep(
     allowed_roots: &[PathBuf],
 ) -> Result<Vec<GrepMatch>, String> {
     let root = validate_path(root_path_str, allowed_roots)?;
-    let re = RegexBuilder::new(pattern)
-        .case_insensitive(!case_sensitive)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let re = Arc::new(
+        RegexBuilder::new(pattern)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .map_err(|e| e.to_string())?,
+    );
 
-    let mut matches = Vec::new();
+    let matches = Arc::new(Mutex::new(Vec::<GrepMatch>::new()));
+    let found_count = Arc::new(AtomicUsize::new(0));
+
     let walker = WalkBuilder::new(&root)
         .hidden(true)
         .git_ignore(true)
-        .build();
+        .build_parallel();
 
-    for entry in walker.filter_map(Result::ok) {
-        if entry.file_type().map(|f| f.is_file()).unwrap_or(false) {
+    walker.run(|| {
+        let re = re.clone();
+        let matches = matches.clone();
+        let found_count = found_count.clone();
+        Box::new(move |entry_res| {
+            if found_count.load(Ordering::Relaxed) >= max_results {
+                return ignore::WalkState::Quit;
+            }
+            let Ok(entry) = entry_res else {
+                return ignore::WalkState::Continue;
+            };
+            if !entry.file_type().map(|f| f.is_file()).unwrap_or(false) {
+                return ignore::WalkState::Continue;
+            }
             let path = entry.path();
-            if let Ok(file_content) = fs::read_to_string(path) {
-                for (idx, line) in file_content.lines().enumerate() {
-                    if let Some(m) = re.find(line) {
-                        matches.push(GrepMatch {
-                            file_path: path.to_string_lossy().to_string(),
-                            line_number: idx + 1,
-                            line_content: line.to_string(),
-                            match_start: m.start(),
-                            match_end: m.end(),
-                        });
-                        if matches.len() >= max_results {
-                            return Ok(matches);
-                        }
+            if entry.metadata().map(|m| m.len() > MAX_GREP_FILE_BYTES).unwrap_or(false) {
+                return ignore::WalkState::Continue;
+            }
+            let Ok(file) = File::open(path) else {
+                return ignore::WalkState::Continue;
+            };
+            let reader = BufReader::new(file);
+            let mut local_hits = Vec::new();
+            for (idx, line_res) in reader.lines().enumerate() {
+                let Ok(line) = line_res else {
+                    break;
+                };
+                if let Some(m) = re.find(&line) {
+                    let match_start = m.start();
+                    let match_end = m.end();
+                    local_hits.push(GrepMatch {
+                        file_path: path.to_string_lossy().to_string(),
+                        line_number: idx + 1,
+                        line_content: line,
+                        match_start,
+                        match_end,
+                    });
+                    if found_count.load(Ordering::Relaxed) + local_hits.len() >= max_results {
+                        break;
                     }
                 }
             }
-        }
-    }
+            if !local_hits.is_empty() {
+                if let Ok(mut guard) = matches.lock() {
+                    for hit in local_hits {
+                        if guard.len() >= max_results {
+                            break;
+                        }
+                        guard.push(hit);
+                    }
+                    found_count.store(guard.len(), Ordering::Relaxed);
+                }
+            }
+            if found_count.load(Ordering::Relaxed) >= max_results {
+                ignore::WalkState::Quit
+            } else {
+                ignore::WalkState::Continue
+            }
+        })
+    });
 
-    Ok(matches)
+    let out = matches.lock().map(|g| g.clone()).unwrap_or_default();
+    Ok(out)
 }
 
 pub fn find_files(
@@ -543,32 +599,56 @@ pub fn find_files(
     allowed_roots: &[PathBuf],
 ) -> Result<Vec<String>, String> {
     let root = validate_path(root_path_str, allowed_roots)?;
-    let re = RegexBuilder::new(pattern)
-        .case_insensitive(true)
-        .build()
-        .map_err(|e| e.to_string())?;
+    let re = Arc::new(
+        RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+            .map_err(|e| e.to_string())?,
+    );
 
-    let mut results = Vec::new();
+    let results = Arc::new(Mutex::new(Vec::<String>::new()));
+    let found_count = Arc::new(AtomicUsize::new(0));
+
     let walker = WalkBuilder::new(&root)
         .hidden(true)
         .git_ignore(true)
-        .build();
+        .build_parallel();
 
-    for entry in walker.filter_map(Result::ok) {
-        let path = entry.path();
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if re.is_match(&name) || re.is_match(&path.to_string_lossy()) {
-            results.push(path.to_string_lossy().to_string());
-            if results.len() >= max_results {
-                break;
+    walker.run(|| {
+        let re = re.clone();
+        let results = results.clone();
+        let found_count = found_count.clone();
+        Box::new(move |entry_res| {
+            if found_count.load(Ordering::Relaxed) >= max_results {
+                return ignore::WalkState::Quit;
             }
-        }
-    }
+            let Ok(entry) = entry_res else {
+                return ignore::WalkState::Continue;
+            };
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let path_str = path.to_string_lossy().to_string();
+            if re.is_match(&name) || re.is_match(&path_str) {
+                if let Ok(mut guard) = results.lock() {
+                    if guard.len() < max_results {
+                        guard.push(path_str);
+                        found_count.store(guard.len(), Ordering::Relaxed);
+                    }
+                }
+            }
+            if found_count.load(Ordering::Relaxed) >= max_results {
+                ignore::WalkState::Quit
+            } else {
+                ignore::WalkState::Continue
+            }
+        })
+    });
 
-    Ok(results)
+    let out = results.lock().map(|g| g.clone()).unwrap_or_default();
+    Ok(out)
 }
 
 pub fn pack_zip(
@@ -593,6 +673,7 @@ pub fn pack_zip(
         .compression_method(CompressionMethod::Deflated)
         .unix_permissions(0o755);
 
+    let out_key = crate::tools::path_norm::path_key(&output_zip);
     let walker = WalkBuilder::new(&source_dir)
         .hidden(false)
         .git_ignore(false)
@@ -602,7 +683,7 @@ pub fn pack_zip(
 
     for entry in walker.filter_map(Result::ok) {
         let path = entry.path();
-        if path == source_dir {
+        if path == source_dir || crate::tools::path_norm::path_key(path) == out_key {
             continue;
         }
 
@@ -617,10 +698,8 @@ pub fn pack_zip(
         if path.is_file() {
             zip.start_file(name, options).map_err(|e| e.to_string())?;
             let mut f = File::open(path).map_err(|e| e.to_string())?;
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-            zip.write_all(&buf).map_err(|e| e.to_string())?;
-            total_bytes += buf.len() as u64;
+            let copied = std::io::copy(&mut f, &mut zip).map_err(|e| e.to_string())?;
+            total_bytes = total_bytes.saturating_add(copied);
         } else if path.is_dir() {
             let dir_name = if name.ends_with('/') {
                 name
@@ -652,13 +731,15 @@ pub fn unpack_zip(
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        let raw_name = entry.name().to_string();
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or_else(|| format!("Unsafe path in archive: {}", entry.name()))?
+            .to_path_buf();
 
-        if raw_name.contains("..") || raw_name.starts_with('/') || raw_name.starts_with('\\') {
-            return Err(format!("Unsafe path in archive: {}", raw_name));
+        let outpath = dest_dir.join(&enclosed);
+        if !crate::tools::path_norm::is_within_root(&outpath, &dest_dir) {
+            return Err(format!("Archive entry escapes destination: {}", entry.name()));
         }
-
-        let outpath = dest_dir.join(raw_name);
 
         if entry.is_dir() {
             fs::create_dir_all(&outpath).map_err(|e| e.to_string())?;
@@ -681,7 +762,6 @@ pub fn unpack_zip(
 
     Ok(extracted_count)
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditOp {
@@ -731,12 +811,28 @@ fn check_bracket_balance(content: &str) -> Option<String> {
     }
 }
 
-pub fn atomic_write_bytes(target: &Path, bytes: &[u8]) -> Result<(), String> {
+pub fn atomic_write_bytes_within(
+    target: &Path,
+    bytes: &[u8],
+    allowed_roots: &[PathBuf],
+) -> Result<(), String> {
     let write_target = if fs::symlink_metadata(target)
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false)
     {
-        fs::canonicalize(target).map_err(|e| format!("Failed to resolve symlink target: {}", e))?
+        let resolved = fs::canonicalize(target)
+            .map_err(|e| format!("Failed to resolve symlink target: {}", e))?;
+        if !allowed_roots.is_empty()
+            && !allowed_roots
+                .iter()
+                .any(|root| crate::tools::path_norm::is_within_root(&resolved, root))
+        {
+            return Err(format!(
+                "Access denied: symlink '{}' resolves outside allowed workspace root.",
+                target.display()
+            ));
+        }
+        resolved
     } else {
         target.to_path_buf()
     };
@@ -756,7 +852,7 @@ pub fn atomic_write_bytes(target: &Path, bytes: &[u8]) -> Result<(), String> {
 
     {
         let mut f = File::create(&tmp_path).map_err(|e| e.to_string())?;
-        if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
+        if let Err(e) = f.write_all(bytes).and_then(|_| f.flush()) {
             let _ = fs::remove_file(&tmp_path);
             return Err(e.to_string());
         }
@@ -770,6 +866,10 @@ pub fn atomic_write_bytes(target: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = fs::remove_file(&tmp_path);
         e.to_string()
     })
+}
+
+pub fn atomic_write_bytes(target: &Path, bytes: &[u8]) -> Result<(), String> {
+    atomic_write_bytes_within(target, bytes, &[])
 }
 
 pub fn read_file_smart(
@@ -790,18 +890,87 @@ pub fn read_file_smart(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+    let is_media = matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg" | "bmp" | "ico"
+            | "wav" | "mp3" | "ogg" | "opus" | "m4a" | "flac" | "aac"
+            | "mp4" | "webm" | "mov" | "mkv"
+    );
+    let meta = fs::metadata(&target).map_err(|e| e.to_string())?;
+    let max_bytes = if is_media { MAX_MEDIA_BYTES } else { MAX_READ_TEXT_BYTES };
+    if meta.len() > max_bytes {
+        return Err(format!(
+            "File '{}' exceeds size limit ({} bytes > {} bytes)",
+            path_str,
+            meta.len(),
+            max_bytes
+        ));
+    }
+
     let raw_bytes = fs::read(&target).map_err(|e| e.to_string())?;
     guard.record_read(&target, &raw_bytes);
 
-    if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif") {
+    if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "svg" | "bmp" | "ico") {
         use base64::Engine;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
-        let mime = if ext == "jpg" { "jpeg" } else { ext.as_str() };
+        let final_bytes = if ext == "png" {
+            crate::llm::request_compat::resize_png_bytes_if_needed(&raw_bytes, 1568)
+                .unwrap_or(raw_bytes)
+        } else {
+            raw_bytes
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&final_bytes);
+        let mime = match ext.as_str() {
+            "jpg" => "jpeg",
+            "svg" => "svg+xml",
+            "ico" => "x-icon",
+            other => other,
+        };
         return Ok(serde_json::json!({
             "kind": "image",
             "path": target.to_string_lossy(),
-            "bytes": raw_bytes.len(),
+            "bytes": final_bytes.len(),
+            "mime": format!("image/{}", mime),
             "dataUrl": format!("data:image/{};base64,{}", mime, b64),
+        }));
+    }
+
+    if matches!(ext.as_str(), "wav" | "mp3" | "ogg" | "opus" | "m4a" | "flac" | "aac") {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
+        let mime = match ext.as_str() {
+            "mp3" => "audio/mpeg",
+            "wav" => "audio/wav",
+            "ogg" | "opus" => "audio/ogg",
+            "m4a" | "aac" => "audio/aac",
+            "flac" => "audio/flac",
+            _ => "audio/wav",
+        };
+        return Ok(serde_json::json!({
+            "kind": "audio",
+            "path": target.to_string_lossy(),
+            "bytes": raw_bytes.len(),
+            "format": ext,
+            "mime": mime,
+            "dataUrl": format!("data:{};base64,{}", mime, b64),
+        }));
+    }
+
+    if matches!(ext.as_str(), "mp4" | "webm" | "mov" | "mkv") {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&raw_bytes);
+        let mime = match ext.as_str() {
+            "mp4" => "video/mp4",
+            "webm" => "video/webm",
+            "mov" => "video/quicktime",
+            "mkv" => "video/x-matroska",
+            _ => "video/mp4",
+        };
+        return Ok(serde_json::json!({
+            "kind": "video",
+            "path": target.to_string_lossy(),
+            "bytes": raw_bytes.len(),
+            "mime": mime,
+            "dataUrl": format!("data:{};base64,{}", mime, b64),
         }));
     }
 
@@ -914,7 +1083,7 @@ pub fn edit_file_cascade(
     let after_hash = crate::tools::safety::FileReadGuard::hash_bytes(after_bytes);
     let truncated_or_unsaved = (after_bytes.len() as u64) > crate::tools::blob_store::MAX_BLOB_BYTES;
 
-    atomic_write_bytes(&target, after_bytes)?;
+    atomic_write_bytes_within(&target, after_bytes, allowed_roots)?;
     guard.record_read(&target, after_bytes);
 
     let snapshot_id = record_file_snapshot(
@@ -1039,7 +1208,7 @@ pub fn apply_unified_diff_safe(
     let after_hash = crate::tools::safety::FileReadGuard::hash_bytes(after_bytes);
     let truncated_or_unsaved = (after_bytes.len() as u64) > crate::tools::blob_store::MAX_BLOB_BYTES;
 
-    atomic_write_bytes(&target, after_bytes)?;
+    atomic_write_bytes_within(&target, after_bytes, allowed_roots)?;
     guard.record_read(&target, after_bytes);
 
     let snapshot_id = record_file_snapshot(
@@ -1093,7 +1262,7 @@ pub fn write_file_atomic(
     let after_bytes = new_content.as_bytes();
     let too_large = (after_bytes.len() as u64) > crate::tools::blob_store::MAX_BLOB_BYTES
         || before_blob.as_ref().map(|b| (b.len() as u64) > crate::tools::blob_store::MAX_BLOB_BYTES).unwrap_or(false);
-    atomic_write_bytes(&target, after_bytes)?;
+    atomic_write_bytes_within(&target, after_bytes, allowed_roots)?;
     guard.record_read(&target, after_bytes);
 
     let snapshot_id = record_file_snapshot(
@@ -1322,6 +1491,9 @@ pub fn grep_with_context(
 
     for entry in walker.flatten() {
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        if entry.metadata().map(|m| m.len() > MAX_GREP_FILE_BYTES).unwrap_or(false) {
             continue;
         }
         if let Some(ft) = file_type {

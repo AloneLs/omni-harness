@@ -1,6 +1,6 @@
 <script lang="ts">
 import { tick } from 'svelte';
-import { fade, fly } from 'svelte/transition';
+import { fly } from 'svelte/transition';
 import { cubicOut } from 'svelte/easing';
 import { Spring } from 'svelte/motion';
 import Icon from './Icon.svelte';
@@ -47,25 +47,49 @@ $effect(() => {
     : { opacity: 0, y: 8, scale: 0.9 };
 });
 
-function updateActiveTurn() {
-  if (!scrollContainerEl) return;
-  const els = scrollContainerEl.querySelectorAll('[data-user-turn-id]');
-  if (els.length === 0) return;
-  const { scrollTop, scrollHeight, clientHeight } = scrollContainerEl;
-  if (scrollHeight - scrollTop - clientHeight < 40) {
-    activeTurnIndex = els.length - 1;
-    return;
-  }
-  const containerRect = scrollContainerEl.getBoundingClientRect();
-  let lastVisibleIdx = 0;
-  els.forEach((el, idx) => {
-    const rect = el.getBoundingClientRect();
-    if (rect.top <= containerRect.bottom - 24) {
-      lastVisibleIdx = idx;
-    }
+$effect(() => {
+  const root = scrollContainerEl;
+  const _chatId = chatStore.activeChatId;
+  const _count = chatStore.messages.length;
+  if (!root || _count === 0 || typeof IntersectionObserver === 'undefined') return;
+
+  let observer: IntersectionObserver | null = null;
+  let cancelled = false;
+  const visibleIndices = new Set<number>();
+
+  void tick().then(() => {
+    if (cancelled || !scrollContainerEl) return;
+    const els = Array.from(scrollContainerEl.querySelectorAll('[data-user-turn-id]'));
+    if (els.length === 0) return;
+    const indexByEl = new Map<Element, number>();
+    els.forEach((el, idx) => indexByEl.set(el, idx));
+
+    observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const idx = indexByEl.get(entry.target);
+          if (idx === undefined) continue;
+          if (entry.isIntersecting) visibleIndices.add(idx);
+          else visibleIndices.delete(idx);
+        }
+        if (visibleIndices.size > 0) {
+          let maxIdx = 0;
+          for (const idx of visibleIndices) {
+            if (idx > maxIdx) maxIdx = idx;
+          }
+          activeTurnIndex = maxIdx;
+        }
+      },
+      { root: scrollContainerEl, threshold: 0.05 }
+    );
+    for (const el of els) observer.observe(el);
   });
-  activeTurnIndex = lastVisibleIdx;
-}
+
+  return () => {
+    cancelled = true;
+    if (observer) observer.disconnect();
+  };
+});
 
 function scrollToTurn(msgId: string) {
   if (!scrollContainerEl) return;
@@ -78,6 +102,7 @@ function scrollToTurn(msgId: string) {
 let lastObservedChatId: string | null = null;
 let wasStreaming = false;
 let programmaticScroll = false;
+let scrollCheckRaf: number | null = null;
 
 function handleUserWheel(e: WheelEvent) {
   if (e.deltaY < 0) {
@@ -90,19 +115,22 @@ function handleUserTouch() {
 }
 
 function handleScroll() {
-  if (!scrollContainerEl) return;
-  updateActiveTurn();
-  const { scrollTop, scrollHeight, clientHeight } = scrollContainerEl;
-  const distFromBottom = scrollHeight - scrollTop - clientHeight;
+  if (!scrollContainerEl || scrollCheckRaf !== null) return;
+  scrollCheckRaf = requestAnimationFrame(() => {
+    scrollCheckRaf = null;
+    if (!scrollContainerEl) return;
+    const { scrollTop, scrollHeight, clientHeight } = scrollContainerEl;
+    const distFromBottom = scrollHeight - scrollTop - clientHeight;
 
-  if (distFromBottom > 140) {
-    showScrollDown = true;
-  } else {
-    showScrollDown = false;
-    if (distFromBottom < 24) {
-      userHasScrolledUp = false;
+    if (distFromBottom > 140) {
+      showScrollDown = true;
+    } else {
+      showScrollDown = false;
+      if (distFromBottom < 24) {
+        userHasScrolledUp = false;
+      }
     }
-  }
+  });
 }
 
 let scrollRafId: number | null = null;

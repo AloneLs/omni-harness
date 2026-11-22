@@ -1,5 +1,5 @@
 <script lang="ts">
-import { onMount, tick } from 'svelte';
+import { onMount } from 'svelte';
 import { Spring } from 'svelte/motion';
 import { fly, slide, scale } from 'svelte/transition';
 import { cubicOut } from 'svelte/easing';
@@ -35,6 +35,10 @@ let showPlusMenu = $state<boolean>(false);
 let isDraggingOver = $state<boolean>(false);
 let attachments = $state<ChatAttachment[]>(chatStore.getDraftAttachments(chatStore.activeChatId));
 let showModelPopup = $state<boolean>(false);
+let modelPopupSearch = $state<string>('');
+let debouncedModelPopupSearch = $state<string>('');
+let modelPopupSearchTimer: ReturnType<typeof setTimeout> | null = null;
+let visibleModelsLimit = $state<number>(60);
 let showProjectPopup = $state<boolean>(false);
 let activePalette = $state<'slash' | 'at' | 'dollar' | null>(null);
 let paletteFilter = $state<string>('');
@@ -45,7 +49,17 @@ let planExpanded = $state<boolean>(true);
 let sideQuestionMaxHeight = $state<number>(224);
 let isResizingSideQuestion = $state<boolean>(false);
 let loadedSkills = $state<{ name: string; command: string; desc: string }[]>([]);
+let lastSkillsRefreshAt = 0;
 let oauthAccounts = $state<ComposerOAuthAccount[]>([]);
+
+function handleModelPopupSearchInput(e: Event) {
+  modelPopupSearch = (e.currentTarget as HTMLInputElement).value;
+  if (modelPopupSearchTimer) clearTimeout(modelPopupSearchTimer);
+  modelPopupSearchTimer = setTimeout(() => {
+    debouncedModelPopupSearch = modelPopupSearch.trim().toLowerCase();
+    visibleModelsLimit = 60;
+  }, 150);
+}
 
 async function refreshOAuthTiers() {
   try {
@@ -90,7 +104,10 @@ function tierBadgeClass(label: string): string {
   return 'border-white/[0.06] bg-white/[0.03] text-[#8E8E95]';
 }
 
-async function refreshLoadedSkills() {
+async function refreshLoadedSkills(force = false) {
+  const now = Date.now();
+  if (!force && lastSkillsRefreshAt > 0 && now - lastSkillsRefreshAt < 10000) return;
+  lastSkillsRefreshAt = now;
   try {
     const res = await invoke<any[]>('list_skills');
     if (Array.isArray(res)) {
@@ -171,9 +188,6 @@ $effect(() => {
   }
 });
 
-const plusMenuSpring = new Spring({ opacity: 0, y: 6, scale: 0.96 }, SPRING_POPUP);
-const projectMenuSpring = new Spring({ opacity: 0, scale: 0.95, y: 6 }, SPRING_POPUP);
-const modelMenuSpring = new Spring({ opacity: 0, y: 6, scale: 0.96 }, SPRING_POPUP);
 const paletteSpring = new Spring({ opacity: 0, y: 6 }, SPRING_POPUP);
 const keycapSpring = new Spring({ scale: 1, y: 0 }, SPRING_KEYCAP);
 const sliderSpring = new Spring(0, SPRING_SLIDER);
@@ -201,24 +215,8 @@ $effect(() => {
 });
 
 $effect(() => {
-  plusMenuSpring.target = showPlusMenu
-    ? { opacity: 1, y: 0, scale: 1 }
-    : { opacity: 0, y: 6, scale: 0.96 };
-});
-
-$effect(() => {
-  projectMenuSpring.target = showProjectPopup
-    ? { opacity: 1, scale: 1, y: 0 }
-    : { opacity: 0, scale: 0.95, y: 6 };
-  modelMenuSpring.target = showModelPopup
-    ? { opacity: 1, y: 0, scale: 1 }
-    : { opacity: 0, y: 6, scale: 0.96 };
-});
-
-$effect(() => {
   paletteSpring.target = activePalette ? { opacity: 1, y: 0 } : { opacity: 0, y: 6 };
 });
-
 
 function addDroppedPaths(paths: string[]) {
   for (const filePath of paths) {
@@ -285,19 +283,25 @@ function handleHtmlDrop(e: DragEvent) {
 }
 
 onMount(() => {
-  refreshLoadedSkills();
+  refreshLoadedSkills(true);
   refreshOAuthTiers();
   refreshWhisperAvailability();
   const onWhisperUpdated = () => refreshWhisperAvailability();
   window.addEventListener('omni-whisper-updated', onWhisperUpdated);
+  let disposed = false;
   let unlisten: (() => void) | null = null;
   let unlistenOAuth: (() => void) | null = null;
   listen('oauth-accounts-updated', () => {
     refreshOAuthTiers();
-  }).then((fn) => (unlistenOAuth = fn)).catch(() => {});
+  })
+    .then((fn) => {
+      if (disposed) fn();
+      else unlistenOAuth = fn;
+    })
+    .catch(() => {});
   import('@tauri-apps/api/webview')
     .then(async ({ getCurrentWebview }) => {
-      unlisten = await getCurrentWebview().onDragDropEvent((event) => {
+      const fn = await getCurrentWebview().onDragDropEvent((event) => {
         if (event.payload.type === 'over' || event.payload.type === 'enter') {
           isDraggingOver = true;
         } else if (event.payload.type === 'leave') {
@@ -309,19 +313,24 @@ onMount(() => {
           }
         }
       });
+      if (disposed) fn();
+      else unlisten = fn;
     })
     .catch(() => {});
   return () => {
+    disposed = true;
+    if (modelPopupSearchTimer) clearTimeout(modelPopupSearchTimer);
     window.removeEventListener('omni-whisper-updated', onWhisperUpdated);
     if (unlisten) unlisten();
     if (unlistenOAuth) unlistenOAuth();
   };
 });
 
-function detectAttachmentKind(name: string): 'image' | 'video' | 'file' {
+function detectAttachmentKind(name: string): 'image' | 'video' | 'audio' | 'file' {
   const ext = name.split('.').pop()?.toLowerCase() || '';
   if (['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg'].includes(ext)) return 'image';
   if (['mp4', 'webm', 'mov', 'mkv', 'avi'].includes(ext)) return 'video';
+  if (['mp3', 'wav', 'ogg', 'opus', 'm4a', 'flac', 'aac'].includes(ext)) return 'audio';
   return 'file';
 }
 
@@ -386,7 +395,6 @@ function handlePaste(e: ClipboardEvent) {
   }
 }
 
-
 let contextPercent = $derived.by(() => {
   const { usedTokens, contextWindow } = chatStore.contextTelemetry;
   if (!usedTokens || !contextWindow) return 0;
@@ -400,7 +408,6 @@ let contextTooltip = $derived.by(() => {
   const cacheStr = cacheHitRate > 0 ? ` · Cache ${Math.round(cacheHitRate)}%` : '';
   return `${usedK}k / ${winK}k (${contextPercent}%)${cacheStr}`;
 });
-
 
 function editQueuedItem(id: string) {
   const item = chatStore.pendingQueue.find((i) => i.id === id);
@@ -418,6 +425,9 @@ function closeAllPopups() {
   showModelPopup = false;
   showProjectPopup = false;
   localPopupProviderId = null;
+  modelPopupSearch = '';
+  debouncedModelPopupSearch = '';
+  visibleModelsLimit = 60;
 }
 
 function handleWindowPointerDown(e: PointerEvent) {
@@ -481,24 +491,19 @@ let popupProviderId = $derived.by(() => {
   return enabledProviders[0]?.id || '';
 });
 
-let popupProviderIndex = $derived(
-  Math.max(0, enabledProviders.findIndex((p) => p.id === popupProviderId))
-);
-
-const providerTabSpring = new Spring(0, SPRING_SLIDER);
-
-$effect(() => {
-  providerTabSpring.target = popupProviderIndex;
-});
-
 let availableModels = $derived.by(() => {
   const prov = settingsStore.data.providers[popupProviderId];
   if (!prov || !prov.enabled) return [];
   return groupProviderModels(prov.availableModels).map((g) => ({
     providerId: prov.id,
     model: g.displayId,
-    rawIds: g.rawIds
+    rawIdSet: new Set(g.rawIds)
   }));
+});
+
+let filteredAvailableModels = $derived.by(() => {
+  if (!debouncedModelPopupSearch) return availableModels;
+  return availableModels.filter((item) => item.model.toLowerCase().includes(debouncedModelPopupSearch));
 });
 
 let allSlashCommands = $derived.by(() => {
@@ -515,10 +520,13 @@ let filteredSlash = $derived.by(() => {
 });
 
 let filteredFiles = $derived.by(() => {
-  const q = paletteFilter.toLowerCase();
-  return workspaceStore.searchResults.slice(0, 8).filter(
-    (f) => f.name.toLowerCase().includes(q) || f.path.toLowerCase().includes(q)
-  );
+  const q = paletteFilter.trim().toLowerCase();
+  const matched = q
+    ? workspaceStore.searchResults.filter(
+        (f) => f.name.toLowerCase().includes(q) || f.path.toLowerCase().includes(q)
+      )
+    : workspaceStore.searchResults;
+  return matched.slice(0, 8);
 });
 
 let filteredSkills = $derived.by(() => {
@@ -550,11 +558,6 @@ function adjustHeight() {
   textareaEl.style.height = `${newHeight}px`;
 }
 
-$effect(() => {
-  const _val = inputText;
-  tick().then(() => adjustHeight());
-});
-
 function handleInput() {
   adjustHeight();
   checkPaletteTrigger();
@@ -582,18 +585,19 @@ function checkPaletteTrigger() {
     return;
   }
 
+  const prevPalette = activePalette;
   paletteFilter = query;
   paletteSelectedIndex = 0;
 
   if (maxTrigger === lastSlash) {
     activePalette = 'slash';
-    refreshLoadedSkills();
+    if (prevPalette !== 'slash') refreshLoadedSkills();
   } else if (maxTrigger === lastAt) {
     activePalette = 'at';
-    workspaceStore.searchFiles(query);
+    workspaceStore.searchFilesDebounced(query, 180);
   } else if (maxTrigger === lastDollar) {
     activePalette = 'dollar';
-    refreshLoadedSkills();
+    if (prevPalette !== 'dollar') refreshLoadedSkills();
   }
 }
 
@@ -664,6 +668,10 @@ function handleKeyDown(event: KeyboardEvent) {
   }
 }
 
+function resetTextareaHeight() {
+  if (textareaEl) textareaEl.style.height = '24px';
+}
+
 function handleSubmit() {
   activePalette = null;
   paletteFilter = '';
@@ -671,16 +679,19 @@ function handleSubmit() {
   const rawTrimmed = inputText.trim();
   if (/^\/btw(\s|$)/i.test(rawTrimmed)) {
     inputText = '';
+    resetTextareaHeight();
     chatStore.askSideQuestion(rawTrimmed);
     return;
   }
   if (/^\/goal\s+(clear|stop)$/i.test(rawTrimmed)) {
     inputText = '';
+    resetTextareaHeight();
     chatStore.clearGoal();
     return;
   }
   if (chatStore.isStreaming && /^\/goal(\s+status)?$/i.test(rawTrimmed)) {
     inputText = '';
+    resetTextareaHeight();
     chatStore.refreshGoalState();
     return;
   }
@@ -695,6 +706,7 @@ function handleSubmit() {
   if (dynamicButtonState === 'queue') {
     const qText = inputText.trim();
     inputText = '';
+    resetTextareaHeight();
     chatStore.setDraftText(chatStore.activeChatId, '');
     chatStore.setDraftText(null, '');
     chatStore.enqueueMessage(qText);
@@ -705,6 +717,7 @@ function handleSubmit() {
     const currentAttachments = [...attachments];
     inputText = '';
     attachments = [];
+    resetTextareaHeight();
     chatStore.setDraftText(chatStore.activeChatId, '');
     chatStore.setDraftAttachments(chatStore.activeChatId, []);
     chatStore.setDraftText(null, '');
@@ -786,11 +799,11 @@ async function stopAndTranscribe() {
       });
       if (transcribed && transcribed.trim()) {
         inputText = (inputText ? `${inputText} ` : '') + transcribed.trim();
-        adjustHeight();
+        setTimeout(adjustHeight, 0);
       }
     } catch {
       inputText = (inputText ? `${inputText} ` : '') + '[Transcribed audio]';
-      adjustHeight();
+      setTimeout(adjustHeight, 0);
     }
   } catch {
     cancelVoice();
@@ -858,7 +871,6 @@ async function stopAndSendVoice() {
       </div>
     </div>
   {/if}
-
 
   {#if chatStore.pendingPlan}
     {@const plan = chatStore.pendingPlan}
@@ -1209,7 +1221,7 @@ async function stopAndSendVoice() {
           onscroll={() => { if (mirrorEl && textareaEl) mirrorEl.scrollTop = textareaEl.scrollTop; }}
           data-omni-composer-input="" placeholder={themeStore.t('ask_placeholder', 'Ask OmniHarness anything, @ to add context, / for commands or capabilities')}
           rows="1"
-          class="relative z-10 w-full px-1 bg-transparent font-sans text-[13.5px] {slashLeadMatch ? 'text-transparent caret-[#EDEDEF] selection:bg-white/20' : 'text-[#E5E5E8]'} placeholder-[#686870] outline-none focus:outline-none focus:ring-0 resize-none min-h-[24px] max-h-[180px] leading-relaxed transition-[height] duration-150 ease-out"
+          class="relative z-10 w-full px-1 bg-transparent font-sans text-[13.5px] {slashLeadMatch ? 'text-transparent caret-[#EDEDEF] selection:bg-white/20' : 'text-[#E5E5E8]'} placeholder-[#686870] outline-none focus:outline-none focus:ring-0 resize-none min-h-[24px] max-h-[180px] leading-relaxed"
         ></textarea>
       </div>
 
@@ -1229,10 +1241,9 @@ async function stopAndSendVoice() {
             <Icon name="plus" class="w-4 h-4" strokeWidth={1.6} />
           </button>
 
-          {#if showPlusMenu || plusMenuSpring.current.opacity > 0.02}
+          {#if showPlusMenu}
             <div
-              class="absolute bottom-full mb-2 left-0 w-60 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-1.5 z-50 text-xs space-y-1 {showPlusMenu ? 'pointer-events-auto' : 'pointer-events-none'}"
-              style="opacity: {plusMenuSpring.current.opacity}; transform: translateY({plusMenuSpring.current.y}px) scale({plusMenuSpring.current.scale});"
+              class="absolute bottom-full mb-2 left-0 w-60 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-1.5 z-50 text-xs space-y-1"
             >
               <button
                 type="button"
@@ -1276,8 +1287,6 @@ async function stopAndSendVoice() {
                 <span>Attach files</span>
                 <span class="font-mono text-[10.5px] text-[#66666D]">FILE</span>
               </button>
-
-
             </div>
           {/if}
         </div>
@@ -1302,10 +1311,9 @@ async function stopAndSendVoice() {
                 <Icon name="chevron-down" class="w-3 h-3 text-[#66666D] shrink-0 block translate-y-[0.5px] transition-transform duration-150 {showProjectPopup ? 'rotate-180' : ''}" strokeWidth={1.8} />
               </button>
 
-              {#if showProjectPopup || projectMenuSpring.current.opacity > 0.02}
+              {#if showProjectPopup}
                 <div
-                  class="absolute bottom-full mb-2 right-0 w-64 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-1.5 z-50 text-xs space-y-1 shadow-2xl {showProjectPopup ? 'pointer-events-auto' : 'pointer-events-none'}"
-                  style="opacity: {projectMenuSpring.current.opacity}; transform: translateY({projectMenuSpring.current.y}px) scale({projectMenuSpring.current.scale});"
+                  class="absolute bottom-full mb-2 right-0 w-64 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-1.5 z-50 text-xs space-y-1 shadow-2xl"
                 >
                   <div class="px-2 py-0.5 font-mono text-[10px] text-[#66666D] uppercase tracking-wider">Workspace / Project</div>
                   <button
@@ -1407,12 +1415,11 @@ async function stopAndSendVoice() {
               <Icon name="chevron-down" class="w-3 h-3 text-[#66666D]" strokeWidth={1.8} />
             </button>
 
-            {#if showModelPopup || modelMenuSpring.current.opacity > 0.02}
+            {#if showModelPopup}
               {@const popupProv = settingsStore.data.providers[popupProviderId] || enabledProviders[0]}
               {@const popupTier = providerTierLabel(popupProv)}
               <div
-                class="absolute bottom-full mb-2 right-0 w-72 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-3 z-50 text-xs space-y-3 {showModelPopup ? 'pointer-events-auto' : 'pointer-events-none'}"
-                style="opacity: {modelMenuSpring.current.opacity}; transform: translateY({modelMenuSpring.current.y}px) scale({modelMenuSpring.current.scale});"
+                class="absolute bottom-full mb-2 right-0 w-72 bg-[#18181B] border border-white/[0.08] rounded-[6px] p-3 z-50 text-xs space-y-3 shadow-2xl"
               >
                 <div class="space-y-2">
                   <div class="flex items-center justify-between gap-2 px-1">
@@ -1444,6 +1451,9 @@ async function stopAndSendVoice() {
                           class="shrink-0 h-full px-2.5 rounded-[3px] font-mono text-[10px] whitespace-nowrap transition-colors {popupProviderId === prov.id ? 'bg-white/[0.12] border-t border-white/[0.18] text-[#EDEDEF] font-semibold' : 'text-[#73737A] hover:text-[#D4D4D8]'}"
                           onclick={() => {
                             localPopupProviderId = prov.id;
+                            visibleModelsLimit = 60;
+                            modelPopupSearch = '';
+                            debouncedModelPopupSearch = '';
                             const defModel = prov.defaultModel || prov.availableModels[0] || '';
                             chatStore.setSessionModel(prov.id, defModel);
                           }}
@@ -1468,27 +1478,43 @@ async function stopAndSendVoice() {
                       <Icon name="chevron-right" class="w-3.5 h-3.5 text-[#73737A]" strokeWidth={1.8} />
                     </button>
                   {:else}
-                    {#key popupProviderId}
-                      <div in:fly={{ y: 4, duration: 140 }} class="max-h-40 overflow-y-auto space-y-0.5">
-                        {#each availableModels as item (item.model)}
-                          {@const isSelected = currentProviderId === item.providerId && (displayActiveModel === item.model || item.rawIds.includes(currentModelId))}
-                          <button
-                            type="button"
-                            class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {isSelected ? 'bg-white/[0.09] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.04] hover:text-white'}"
-                            onclick={() => {
-                              const prev = displayActiveModel;
-                              chatStore.setSessionModel(item.providerId, item.model);
-                              if (prev && prev !== item.model) {
-                                chatStore.recordModelChanged(item.model);
-                              }
-                              closeAllPopups();
-                            }}
-                          >
-                            <span class="truncate">{item.model}</span>
-                          </button>
-                        {/each}
-                      </div>
-                    {/key}
+                    {#if availableModels.length > 10}
+                      <input
+                        value={modelPopupSearch}
+                        oninput={handleModelPopupSearchInput}
+                        type="text"
+                        placeholder="Filter models ({availableModels.length})..."
+                        class="w-full px-2 py-1 rounded-[4px] bg-[#121214] border border-white/[0.08] font-mono text-[11px] text-[#E5E5E8] placeholder-[#55555C] outline-none"
+                      />
+                    {/if}
+                    <div class="max-h-40 overflow-y-auto space-y-0.5">
+                      {#each filteredAvailableModels.slice(0, visibleModelsLimit) as item (item.model)}
+                        {@const isSelected = currentProviderId === item.providerId && (displayActiveModel === item.model || item.rawIdSet.has(currentModelId))}
+                        <button
+                          type="button"
+                          class="w-full px-2.5 py-1.5 rounded-[4px] text-left font-mono text-[11px] flex items-center justify-between transition-colors {isSelected ? 'bg-white/[0.09] text-[#EDEDEF]' : 'text-[#A3A3AA] hover:bg-white/[0.04] hover:text-white'}"
+                          onclick={() => {
+                            const prev = displayActiveModel;
+                            chatStore.setSessionModel(item.providerId, item.model);
+                            if (prev && prev !== item.model) {
+                              chatStore.recordModelChanged(item.model);
+                            }
+                            closeAllPopups();
+                          }}
+                        >
+                          <span class="truncate">{item.model}</span>
+                        </button>
+                      {/each}
+                      {#if filteredAvailableModels.length > visibleModelsLimit}
+                        <button
+                          type="button"
+                          onclick={() => (visibleModelsLimit += 60)}
+                          class="w-full px-2.5 py-1.5 rounded-[4px] text-center font-mono text-[10.5px] text-[#8E8E95] hover:text-[#EDEDEF] hover:bg-white/[0.04]"
+                        >
+                          Show more ({filteredAvailableModels.length - visibleModelsLimit})
+                        </button>
+                      {/if}
+                    </div>
                   {/if}
                 </div>
 

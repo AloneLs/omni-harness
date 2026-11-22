@@ -83,6 +83,8 @@ pub struct OAuthAccount {
     pub plan_tier: Option<String>,
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
+    #[serde(default)]
+    pub proxy_url: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -109,6 +111,7 @@ pub struct OAuthAccountPublic {
     pub quota_updated_at_ms: Option<i64>,
     pub plan_tier: Option<String>,
     pub allowed_models: Option<Vec<String>>,
+    pub proxy_url: Option<String>,
 }
 
 impl From<&OAuthAccount> for OAuthAccountPublic {
@@ -131,15 +134,37 @@ impl From<&OAuthAccount> for OAuthAccountPublic {
             quota_updated_at_ms: a.quota_updated_at_ms,
             plan_tier: a.plan_tier.clone(),
             allowed_models: a.allowed_models.clone(),
+            proxy_url: a.proxy_url.clone(),
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OAuthProxyConfig {
+    #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
     pub url: String,
+    #[serde(default)]
+    pub proxy_pool: Vec<String>,
+    #[serde(default = "default_rotation_mode")]
+    pub rotation_mode: String,
+}
+
+fn default_rotation_mode() -> String {
+    "sticky".to_string()
+}
+
+impl Default for OAuthProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: String::new(),
+            proxy_pool: Vec::new(),
+            rotation_mode: "sticky".to_string(),
+        }
+    }
 }
 
 fn oauth_proxy_file_path() -> PathBuf {
@@ -162,6 +187,90 @@ pub fn save_oauth_proxy(cfg: OAuthProxyConfig) -> Result<(), String> {
     crate::tools::workspace::atomic_write_bytes(&p, json.as_bytes())
 }
 
+pub fn resolve_account_proxy(acc: &OAuthAccount) -> (Option<bool>, Option<String>) {
+    if let Some(ref p) = acc.proxy_url {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return (Some(true), Some(trimmed.to_string()));
+        }
+    }
+    let saved = load_oauth_proxy();
+    let pool: Vec<String> = saved
+        .proxy_pool
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if saved.enabled && !pool.is_empty() && saved.rotation_mode != "none" {
+        let picked = match saved.rotation_mode.as_str() {
+            "round_robin" => {
+                static RR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let idx = RR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % pool.len();
+                pool[idx].clone()
+            }
+            "random" => {
+                let idx = (uuid::Uuid::new_v4().as_u128() as usize) % pool.len();
+                pool[idx].clone()
+            }
+            _ => {
+                let mut hash: u64 = 0xcbf29ce484222325;
+                for b in acc.id.as_bytes() {
+                    hash ^= *b as u64;
+                    hash = hash.wrapping_mul(0x100000001b3);
+                }
+                let idx = (hash as usize) % pool.len();
+                pool[idx].clone()
+            }
+        };
+        return (Some(true), Some(picked));
+    }
+    if saved.enabled && !saved.url.trim().is_empty() {
+        return (Some(true), Some(saved.url.trim().to_string()));
+    }
+    (None, None)
+}
+
+pub fn client_for_account(acc: &OAuthAccount) -> Option<reqwest::Client> {
+    let (en, url) = resolve_account_proxy(acc);
+    if en == Some(true) && url.is_some() {
+        crate::build_http_client(en, url.as_deref(), None).ok()
+    } else {
+        None
+    }
+}
+
+pub fn resolve_global_proxy_for_api() -> (Option<bool>, Option<String>) {
+    let saved = load_oauth_proxy();
+    if !saved.enabled {
+        return (None, None);
+    }
+    let pool: Vec<String> = saved
+        .proxy_pool
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !pool.is_empty() && saved.rotation_mode != "none" {
+        let picked = match saved.rotation_mode.as_str() {
+            "round_robin" => {
+                static API_RR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let idx = API_RR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % pool.len();
+                pool[idx].clone()
+            }
+            "random" => {
+                let idx = (uuid::Uuid::new_v4().as_u128() as usize) % pool.len();
+                pool[idx].clone()
+            }
+            _ => pool[0].clone(),
+        };
+        return (Some(true), Some(picked));
+    }
+    if !saved.url.trim().is_empty() {
+        return (Some(true), Some(saved.url.trim().to_string()));
+    }
+    (None, None)
+}
+
 pub fn resolve_oauth_proxy(proxy_enabled: Option<bool>, proxy_url: Option<&str>) -> (Option<bool>, Option<String>) {
     if proxy_enabled == Some(true) {
         if let Some(u) = proxy_url.map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -169,10 +278,43 @@ pub fn resolve_oauth_proxy(proxy_enabled: Option<bool>, proxy_url: Option<&str>)
         }
     }
     let saved = load_oauth_proxy();
+    let pool: Vec<String> = saved
+        .proxy_pool
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if saved.enabled && !pool.is_empty() && saved.rotation_mode != "none" {
+        let picked = match saved.rotation_mode.as_str() {
+            "round_robin" => {
+                static RR_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let idx = RR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % pool.len();
+                pool[idx].clone()
+            }
+            "random" => {
+                let idx = (uuid::Uuid::new_v4().as_u128() as usize) % pool.len();
+                pool[idx].clone()
+            }
+            _ => pool[0].clone(),
+        };
+        return (Some(true), Some(picked));
+    }
     if saved.enabled && !saved.url.trim().is_empty() {
         return (Some(true), Some(saved.url.trim().to_string()));
     }
     (proxy_enabled, proxy_url.map(|s| s.to_string()))
+}
+
+pub async fn set_account_proxy(id: &str, proxy_url: Option<String>) -> Result<(), String> {
+    let _guard = store_lock().lock().await;
+    let mut list = read_accounts_unlocked();
+    if let Some(acc) = list.iter_mut().find(|a| a.id == id) {
+        acc.proxy_url = proxy_url.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        write_accounts_unlocked(&list)?;
+        Ok(())
+    } else {
+        Err(format!("Account not found: {}", id))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1059,6 +1201,7 @@ async fn exchange_code_for_account(
                 quota_updated_at_ms: None,
                 plan_tier: None,
                 allowed_models: None,
+                proxy_url: None,
             };
             upsert_account(acc).await
         }
@@ -1108,6 +1251,7 @@ async fn exchange_code_for_account(
                 quota_updated_at_ms: None,
                 plan_tier: None,
                 allowed_models: None,
+                proxy_url: None,
             };
             upsert_account(acc).await
         }
@@ -1166,6 +1310,7 @@ async fn exchange_code_for_account(
                 quota_updated_at_ms: None,
                 plan_tier: None,
                 allowed_models: None,
+                proxy_url: None,
             };
             upsert_account(acc).await
         }
@@ -1242,6 +1387,7 @@ async fn exchange_code_for_account(
                 quota_updated_at_ms: None,
                 plan_tier: None,
                 allowed_models: None,
+                proxy_url: None,
             };
             upsert_account(acc).await
         }
@@ -1909,6 +2055,7 @@ pub async fn import_local_accounts(
                             quota_updated_at_ms: None,
                             plan_tier: None,
                             allowed_models: None,
+                            proxy_url: None,
                         };
                         let _ = refresh_account_tokens(&http_client, &mut acc).await;
                         if acc.project_id.is_none() && !acc.access_token.is_empty() {
@@ -1976,6 +2123,7 @@ pub async fn import_local_accounts(
                     quota_updated_at_ms: None,
                     plan_tier: None,
                     allowed_models: None,
+                    proxy_url: None,
                 };
                 if !acc.refresh_token.is_empty() {
                     let _ = refresh_account_tokens(&http_client, &mut acc).await;
@@ -2041,6 +2189,7 @@ pub async fn import_local_accounts(
                         quota_updated_at_ms: None,
                         plan_tier: None,
                         allowed_models: None,
+                        proxy_url: None,
                     };
                     if let Ok(saved) = upsert_account(acc).await {
                         imported.push(OAuthAccountPublic::from(&saved));
@@ -2081,6 +2230,7 @@ pub async fn import_local_accounts(
                         quota_updated_at_ms: None,
                         plan_tier: None,
                         allowed_models: None,
+                        proxy_url: None,
                     };
                     if let Ok(saved) = upsert_account(acc).await {
                         imported.push(OAuthAccountPublic::from(&saved));
@@ -2336,6 +2486,7 @@ async fn start_kimi_device_flow(
                     quota_updated_at_ms: None,
                     plan_tier: None,
                     allowed_models: None,
+                    proxy_url: None,
                 };
                 if let Ok(saved) = upsert_account(acc).await {
                     let _ = app_clone.emit(
@@ -2458,6 +2609,7 @@ async fn start_xai_device_flow(
                     quota_updated_at_ms: None,
                     plan_tier: None,
                     allowed_models: None,
+                    proxy_url: None,
                 };
                 if let Ok(saved) = upsert_account(acc).await {
                     let _ = app_clone.emit(
@@ -2514,6 +2666,7 @@ pub async fn add_manual_token_account(
         quota_updated_at_ms: None,
         plan_tier: None,
         allowed_models: None,
+        proxy_url: None,
     };
     let saved = upsert_account(acc).await?;
     let pub_acc = OAuthAccountPublic::from(&saved);

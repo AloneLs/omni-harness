@@ -36,15 +36,19 @@ pub struct BuildOutput {
     pub duration_ms: u128,
 }
 
+pub struct PtySessionInner {
+    pub master: Box<dyn MasterPty + Send>,
+    pub writer: Box<dyn Write + Send>,
+    pub child: Box<dyn portable_pty::Child + Send + Sync>,
+    pub exit_code: Option<i32>,
+}
+
 pub struct PtySession {
     pub session_id: String,
     pub chat_id: Option<String>,
-    pub master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
-    pub writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    pub child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+    pub inner: Arc<Mutex<PtySessionInner>>,
     pub buffer: Arc<Mutex<Vec<u8>>>,
     pub is_alive: Arc<AtomicBool>,
-    pub exit_code: Arc<Mutex<Option<i32>>>,
 }
 
 #[cfg(windows)]
@@ -747,7 +751,7 @@ impl PtyManager {
         &self,
         task_id: &str,
         wait_ms: u64,
-        cancel_notify: Option<&tokio::sync::Notify>,
+        cancel_rx: Option<tokio::sync::watch::Receiver<bool>>,
     ) -> Result<TaskExecOutcome, String> {
         let task = {
             let map = self.tasks.read().map_err(|e| e.to_string())?;
@@ -761,16 +765,33 @@ impl PtyManager {
         tokio::pin!(notified);
 
         if task.is_alive.load(Ordering::SeqCst) {
-            if let Some(cancel) = cancel_notify {
-                tokio::select! {
-                    _ = cancel.notified() => {
-                        let _ = self.kill_task(task_id).await;
-                        return Ok(TaskExecOutcome::Canceled {
-                            duration_ms: task.started_at.elapsed().as_millis() as u64,
-                        });
-                    }
-                    _ = &mut notified => {}
-                    _ = tokio::time::sleep(wait_dur) => {}
+            if let Some(mut rx) = cancel_rx {
+                let already_canceled = *rx.borrow();
+                if already_canceled {
+                    let _ = self.kill_task(task_id).await;
+                    return Ok(TaskExecOutcome::Canceled {
+                        duration_ms: task.started_at.elapsed().as_millis() as u64,
+                    });
+                }
+                let canceled = tokio::select! {
+                    _ = async {
+                        loop {
+                            if *rx.borrow() {
+                                break;
+                            }
+                            if rx.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    } => true,
+                    _ = &mut notified => false,
+                    _ = tokio::time::sleep(wait_dur) => false,
+                };
+                if canceled {
+                    let _ = self.kill_task(task_id).await;
+                    return Ok(TaskExecOutcome::Canceled {
+                        duration_ms: task.started_at.elapsed().as_millis() as u64,
+                    });
                 }
             } else {
                 tokio::select! {
@@ -864,7 +885,7 @@ impl PtyManager {
                     }
                 }
                 let alive = s.is_alive.load(Ordering::SeqCst);
-                let ec = s.exit_code.lock().ok().and_then(|g| *g);
+                let ec = s.inner.lock().ok().and_then(|g| g.exit_code);
                 items.push(json!({
                     "task_id": s.session_id,
                     "status": if alive { "running" } else { "completed" },
@@ -1121,7 +1142,6 @@ impl PtyManager {
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
         let is_alive = Arc::new(AtomicBool::new(true));
-        let exit_code = Arc::new(Mutex::new(None));
 
         let buf_clone = buffer.clone();
         let alive_clone = is_alive.clone();
@@ -1154,12 +1174,14 @@ impl PtyManager {
         let session = PtySession {
             session_id: session_id.clone(),
             chat_id: chat_id.map(|s| s.to_string()),
-            master: Arc::new(Mutex::new(pair.master)),
-            writer: Arc::new(Mutex::new(writer)),
-            child: Arc::new(Mutex::new(child)),
+            inner: Arc::new(Mutex::new(PtySessionInner {
+                master: pair.master,
+                writer,
+                child,
+                exit_code: None,
+            })),
             buffer,
             is_alive,
-            exit_code,
         };
 
         self.sessions
@@ -1176,9 +1198,9 @@ impl PtyManager {
             .get(session_id)
             .ok_or_else(|| format!("PTY session not found: {}", session_id))?;
 
-        let mut writer = session.writer.lock().map_err(|e| e.to_string())?;
-        writer.write_all(data).map_err(|e| e.to_string())?;
-        writer.flush().map_err(|e| e.to_string())?;
+        let mut inner = session.inner.lock().map_err(|e| e.to_string())?;
+        inner.writer.write_all(data).map_err(|e| e.to_string())?;
+        inner.writer.flush().map_err(|e| e.to_string())?;
         Ok(data.len())
     }
 
@@ -1200,8 +1222,9 @@ impl PtyManager {
             .get(session_id)
             .ok_or_else(|| format!("PTY session not found: {}", session_id))?;
 
-        let master = session.master.lock().map_err(|e| e.to_string())?;
-        master
+        let inner = session.inner.lock().map_err(|e| e.to_string())?;
+        inner
+            .master
             .resize(PtySize {
                 rows,
                 cols,
@@ -1223,11 +1246,9 @@ impl PtyManager {
                 if !s.is_alive.load(Ordering::SeqCst) {
                     return false;
                 }
-                if let Ok(mut ch) = s.child.lock() {
-                    if let Ok(Some(status)) = ch.try_wait() {
-                        if let Ok(mut ec) = s.exit_code.lock() {
-                            *ec = Some(status.exit_code() as i32);
-                        }
+                if let Ok(mut inner) = s.inner.lock() {
+                    if let Ok(Some(status)) = inner.child.try_wait() {
+                        inner.exit_code = Some(status.exit_code() as i32);
                         s.is_alive.store(false, Ordering::SeqCst);
                         return false;
                     }
@@ -1246,17 +1267,13 @@ impl PtyManager {
         }
         let guard = self.sessions.read().ok()?;
         let s = guard.get(session_id)?;
-        if let Ok(ec) = s.exit_code.lock() {
-            if ec.is_some() {
-                return *ec;
+        if let Ok(mut inner) = s.inner.lock() {
+            if inner.exit_code.is_some() {
+                return inner.exit_code;
             }
-        }
-        if let Ok(mut ch) = s.child.lock() {
-            if let Ok(Some(status)) = ch.try_wait() {
+            if let Ok(Some(status)) = inner.child.try_wait() {
                 let code = status.exit_code() as i32;
-                if let Ok(mut ec) = s.exit_code.lock() {
-                    *ec = Some(code);
-                }
+                inner.exit_code = Some(code);
                 s.is_alive.store(false, Ordering::SeqCst);
                 return Some(code);
             }
@@ -1268,14 +1285,14 @@ impl PtyManager {
         let mut sessions = self.sessions.write().map_err(|e| e.to_string())?;
         if let Some(session) = sessions.get(session_id) {
             session.is_alive.store(false, Ordering::SeqCst);
-            if let Ok(mut ch) = session.child.lock() {
+            if let Ok(mut inner) = session.inner.lock() {
                 #[cfg(windows)]
-                if let Some(pid) = ch.process_id() {
+                if let Some(pid) = inner.child.process_id() {
                     let mut tk = create_cmd("taskkill");
                     tk.args(["/F", "/T", "/PID", &pid.to_string()]);
                     let _ = tk.output();
                 }
-                let _ = ch.kill();
+                let _ = inner.child.kill();
             }
             if sessions.len() > 64 {
                 let dead_ids: Vec<String> = sessions
@@ -1327,8 +1344,8 @@ impl PtyManager {
         for sid in target_ids {
             if let Some(session) = sessions.remove(&sid) {
                 session.is_alive.store(false, Ordering::SeqCst);
-                if let Ok(mut ch) = session.child.lock() {
-                    let _ = ch.kill();
+                if let Ok(mut inner) = session.inner.lock() {
+                    let _ = inner.child.kill();
                 }
             }
         }
@@ -1357,8 +1374,8 @@ impl PtyManager {
         let mut sessions = self.sessions.write().map_err(|e| e.to_string())?;
         for (_, session) in sessions.drain() {
             session.is_alive.store(false, Ordering::SeqCst);
-            if let Ok(mut ch) = session.child.lock() {
-                let _ = ch.kill();
+            if let Ok(mut inner) = session.inner.lock() {
+                let _ = inner.child.kill();
             }
         }
         Ok(())

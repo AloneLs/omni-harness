@@ -169,6 +169,15 @@ class ChatStore {
   private activeSmoothMsgByChat: Record<string, string | null> = {};
   private activeStreamMsgIdByChat: Record<string, string | null> = {};
   private canceledMsgIds = new Set<string>();
+  private draftSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private unlisteners: Array<() => void> = [];
+  private unloadHandler: (() => void) | null = null;
+  private disposed = false;
+  private pullInFlight = false;
+  private pendingPullTargets = new Set<string>();
+  private pendingPullAll = false;
+  private saveChainByChat: Record<string, Promise<void>> = {};
+  private sideQuestionReqId = 0;
 
   messages = $derived.by(() => {
     return this.activeChatId ? this.messagesByChat[this.activeChatId] || [] : [];
@@ -242,7 +251,14 @@ class ChatStore {
   pinnedSessions = $derived.by(() => {
     const q = this.filterSearchQuery.toLowerCase().trim();
     return this.sessions.filter(
-      (s) => !s.isThemeStudio && !s.isDraft && !s.archived && s.pinned && !s.projectPath && Boolean(s.title) && (!q || s.title.toLowerCase().includes(q) || s.preview.toLowerCase().includes(q))
+      (s) =>
+        !s.isThemeStudio &&
+        !s.isDraft &&
+        !s.archived &&
+        s.pinned &&
+        !s.projectPath &&
+        Boolean(s.title) &&
+        (!q || s.title.toLowerCase().includes(q) || s.preview.toLowerCase().includes(q))
     );
   });
 
@@ -260,7 +276,7 @@ class ChatStore {
     return this.sessions.filter((s) => !s.isDraft && !s.isThemeStudio && Boolean(s.archived)).length;
   });
 
-  timelineStats = $derived.by(() => {
+  private baseTimelineStats = $derived.by(() => {
     let totalTools = 0;
     let activeTools = 0;
     let promptTokens = 0;
@@ -284,10 +300,21 @@ class ChatStore {
     return {
       totalToolsExecuted: totalTools,
       activeToolsCount: activeTools,
-      reasoningElapsedMs: this.reasoningElapsedMs,
-      totalTokens: promptTokens + completionTokens + this.currentStreamTokenCount,
       promptTokens,
-      completionTokens: completionTokens + this.currentStreamTokenCount
+      completionTokens
+    };
+  });
+
+  timelineStats = $derived.by(() => {
+    const base = this.baseTimelineStats;
+    const streamTok = this.currentStreamTokenCount;
+    return {
+      totalToolsExecuted: base.totalToolsExecuted,
+      activeToolsCount: base.activeToolsCount,
+      reasoningElapsedMs: this.reasoningElapsedMs,
+      totalTokens: base.promptTokens + base.completionTokens + streamTok,
+      promptTokens: base.promptTokens,
+      completionTokens: base.completionTokens + streamTok
     };
   });
 
@@ -314,7 +341,167 @@ class ChatStore {
         }
       } catch {}
     }
+    if (typeof window !== 'undefined') {
+      this.unloadHandler = () => {
+        this.flushAllBeforeClose();
+      };
+      window.addEventListener('beforeunload', this.unloadHandler);
+      window.addEventListener('pagehide', this.unloadHandler);
+    }
     this.init();
+  }
+
+  public destroy(): void {
+    this.disposed = true;
+    this.flushAllBeforeClose();
+    if (this.draftSaveTimer) {
+      clearTimeout(this.draftSaveTimer);
+      this.draftSaveTimer = null;
+    }
+    if (this.unloadHandler && typeof window !== 'undefined') {
+      window.removeEventListener('beforeunload', this.unloadHandler);
+      window.removeEventListener('pagehide', this.unloadHandler);
+      this.unloadHandler = null;
+    }
+    for (const cid of Object.keys(this.todoHideTimers)) {
+      clearTimeout(this.todoHideTimers[cid]);
+    }
+    for (const cid of Object.keys(this.reasoningTimers)) {
+      clearInterval(this.reasoningTimers[cid]);
+    }
+    for (const cid of Object.keys(this.streamSaveTimers)) {
+      clearTimeout(this.streamSaveTimers[cid]);
+    }
+    for (const cid of Object.keys(this.smoothRafByChat)) {
+      const raf = this.smoothRafByChat[cid];
+      if (raf) cancelAnimationFrame(raf);
+    }
+    this.todoHideTimers = {};
+    this.reasoningTimers = {};
+    this.streamSaveTimers = {};
+    this.smoothRafByChat = {};
+    for (const fn of this.unlisteners) {
+      try {
+        fn();
+      } catch {}
+    }
+    this.unlisteners = [];
+  }
+
+  private cleanupChatResources(id: string): void {
+    if (this.todoHideTimers[id]) {
+      clearTimeout(this.todoHideTimers[id]);
+      delete this.todoHideTimers[id];
+    }
+    if (this.reasoningTimers[id]) {
+      clearInterval(this.reasoningTimers[id]);
+      delete this.reasoningTimers[id];
+    }
+    if (this.streamSaveTimers[id]) {
+      clearTimeout(this.streamSaveTimers[id]);
+      delete this.streamSaveTimers[id];
+    }
+    const raf = this.smoothRafByChat[id];
+    if (raf) {
+      cancelAnimationFrame(raf);
+    }
+    delete this.smoothRafByChat[id];
+    delete this.pendingTextByChat[id];
+    delete this.pendingReasoningByChat[id];
+    delete this.activeSmoothMsgByChat[id];
+    delete this.activeStreamMsgIdByChat[id];
+    delete this.turnSnapshotByChat[id];
+    delete this.resolveByChat[id];
+    delete this.todosByChat[id];
+    delete this.contextTelemetryByChat[id];
+    delete this.goalByChat[id];
+    delete this.pendingPlanByChat[id];
+    delete this.reasoningElapsedByChat[id];
+    delete this.streamTokenCountByChat[id];
+    delete this.streamingChats[id];
+    delete this.pendingQueueByChat[id];
+    delete this.draftTextByChat[id];
+    delete this.draftAttachmentsByChat[id];
+    if (typeof localStorage !== 'undefined') {
+      try {
+        localStorage.removeItem(`omni_chat_msgs_${id}`);
+      } catch {}
+    }
+  }
+
+  public flushAllBeforeClose(): void {
+    this.flushDraftsNow();
+    const chatIds = new Set<string>();
+    if (this.activeChatId) chatIds.add(this.activeChatId);
+    for (const cid of Object.keys(this.streamingChats)) {
+      if (this.streamingChats[cid]) chatIds.add(cid);
+    }
+    for (const cid of Object.keys(this.streamSaveTimers)) {
+      clearTimeout(this.streamSaveTimers[cid]);
+      delete this.streamSaveTimers[cid];
+      chatIds.add(cid);
+    }
+    for (const cid of chatIds) {
+      this.flushSmoothBuffers(cid);
+      this.saveLocalOnly(cid);
+      const sess = this.sessions.find((s) => s.id === cid);
+      if (sess && !sess.isDraft && !sess.isThemeStudio && this.messagesByChat[cid]) {
+        const snapshotMsgs = this.buildRichSyncPayload(this.messagesByChat[cid]);
+        invoke('sync_chat_context', {
+          chatId: cid,
+          title: sess.title || cid,
+          messagesJson: JSON.stringify(snapshotMsgs),
+          projectPath: sess.projectPath || null,
+          modelId: sess.modelId || settingsStore.data.activeModel || null,
+          isPinned: Boolean(sess.pinned)
+        }).catch(() => {});
+      }
+    }
+  }
+
+  private buildRichSyncPayload(msgs: ChatMessage[]): any[] {
+    return this.compactMessagesForStorage(msgs).map((m) => ({
+      id: m.id,
+      chatId: m.chatId,
+      role: m.role,
+      content: m.content,
+      modelId: m.modelId,
+      attachments: m.attachments,
+      reasoningContent: m.reasoningContent,
+      toolCalls: m.toolCalls,
+      steps: m.steps,
+      todos: m.todos,
+      statusText: m.statusText,
+      startedAt: m.startedAt,
+      finishedAt: m.finishedAt,
+      error: m.error,
+      streaming: Boolean(m.streaming),
+      paused: Boolean(m.paused),
+      tokenUsage: m.tokenUsage,
+      createdAt: m.createdAt
+    }));
+  }
+
+  private normalizeLoadedMessages(chatId: string, parsedMsgs: ChatMessage[]): { msgs: ChatMessage[]; changed: boolean } {
+    let changed = false;
+    const isCurrentlyStreaming = Boolean(this.streamingChats[chatId]);
+    for (const m of parsedMsgs) {
+      if (m.streaming && !isCurrentlyStreaming) {
+        m.streaming = false;
+        m.paused = true;
+        m.statusText = 'Paused';
+        const lastToolEnd = Array.isArray(m.toolCalls)
+          ? m.toolCalls.reduce((mx: number, tc: any) => Math.max(mx, tc.finishedAt || tc.startedAt || 0), 0)
+          : 0;
+        const lastThoughtEnd = Array.isArray(m.steps)
+          ? m.steps.reduce((mx: number, st: any) => Math.max(mx, st.finishedAt || st.startedAt || 0), 0)
+          : 0;
+        m.finishedAt = m.finishedAt || Math.max(lastToolEnd, lastThoughtEnd) || m.startedAt || m.createdAt || Date.now();
+        this.finalizeRunningTools(m, 'paused');
+        changed = true;
+      }
+    }
+    return { msgs: parsedMsgs, changed };
   }
 
   public setSessionModel(providerId: string, modelId: string, targetChatId?: string): void {
@@ -324,13 +511,12 @@ class ChatStore {
     if (sess) {
       sess.providerId = providerId;
       sess.modelId = modelId;
-      this.sessions = [...this.sessions];
       const prov = settingsStore.data.providers[providerId] || settingsStore.currentProvider;
       const caps = prov?.modelCapabilities?.[modelId] || settingsStore.currentModelCapabilities;
       if (this.contextTelemetryByChat[cid]) {
         this.contextTelemetryByChat[cid].contextWindow = caps.contextWindow || 128000;
       }
-      this.saveSessions(cid);
+      void this.saveSessions(cid);
     }
   }
 
@@ -348,8 +534,8 @@ class ChatStore {
       content: newModelId,
       createdAt: Date.now()
     };
-    this.messagesByChat[cid] = [...list, sysMsg];
-    this.saveSessions(cid);
+    list.push(sysMsg);
+    void this.saveSessions(cid);
   }
 
   public isChatStreaming(chatId: string): boolean {
@@ -424,11 +610,12 @@ class ChatStore {
 
   public hideSideQuestion(): void {
     if (this.sideQuestion) {
-      this.sideQuestion = { ...this.sideQuestion, visible: false };
+      this.sideQuestion.visible = false;
     }
   }
 
   public clearSideQuestion(): void {
+    this.sideQuestionReqId++;
     this.sideQuestion = null;
   }
 
@@ -456,14 +643,15 @@ class ChatStore {
   }
 
   public addInlineReviewComment(c: Omit<InlineReviewComment, 'id'>): void {
-    this.inlineReviewComments = [
-      ...this.inlineReviewComments,
-      { ...c, id: `rev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}` }
-    ];
+    this.inlineReviewComments.push({
+      ...c,
+      id: `rev-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`
+    });
   }
 
   public removeInlineReviewComment(id: string): void {
-    this.inlineReviewComments = this.inlineReviewComments.filter((c) => c.id !== id);
+    const idx = this.inlineReviewComments.findIndex((c) => c.id === id);
+    if (idx >= 0) this.inlineReviewComments.splice(idx, 1);
   }
 
   public async sendInlineReviewComments(): Promise<void> {
@@ -482,11 +670,12 @@ class ChatStore {
     const chatId = this.activeChatId;
     if (!q) {
       if (this.sideQuestion && this.sideQuestion.chatId === chatId) {
-        this.sideQuestion = { ...this.sideQuestion, visible: !this.sideQuestion.visible };
+        this.sideQuestion.visible = !this.sideQuestion.visible;
       }
       return;
     }
 
+    const reqId = ++this.sideQuestionReqId;
     this.sideQuestion = {
       chatId: chatId || '',
       question: q,
@@ -521,20 +710,14 @@ class ChatStore {
 
       const onEvent = new Channel<any>();
       onEvent.onmessage = (evt: any) => {
-        if (!this.sideQuestion || this.sideQuestion.chatId !== chatId) return;
+        if (reqId !== this.sideQuestionReqId || !this.sideQuestion || this.sideQuestion.chatId !== (chatId || '')) return;
         if (evt.type === 'delta' && typeof evt.content === 'string') {
-          this.sideQuestion = {
-            ...this.sideQuestion,
-            answer: this.sideQuestion.answer + evt.content
-          };
+          this.sideQuestion.answer += evt.content;
         } else if (evt.type === 'done') {
-          this.sideQuestion = { ...this.sideQuestion, streaming: false };
+          this.sideQuestion.streaming = false;
         } else if (evt.type === 'error') {
-          this.sideQuestion = {
-            ...this.sideQuestion,
-            streaming: false,
-            error: evt.message || 'Side question failed'
-          };
+          this.sideQuestion.streaming = false;
+          this.sideQuestion.error = evt.message || 'Side question failed';
         }
       };
 
@@ -554,22 +737,20 @@ class ChatStore {
         history,
         onEvent
       });
-      if (this.sideQuestion && this.sideQuestion.streaming) {
-        this.sideQuestion = { ...this.sideQuestion, streaming: false };
+      if (reqId === this.sideQuestionReqId && this.sideQuestion && this.sideQuestion.streaming) {
+        this.sideQuestion.streaming = false;
       }
     } catch (err: any) {
-      if (this.sideQuestion) {
-        this.sideQuestion = {
-          ...this.sideQuestion,
-          streaming: false,
-          error: err instanceof Error ? err.message : String(err)
-        };
+      if (reqId === this.sideQuestionReqId && this.sideQuestion) {
+        this.sideQuestion.streaming = false;
+        this.sideQuestion.error = err instanceof Error ? err.message : String(err);
       }
     }
   }
 
   private async init(): Promise<void> {
     await this.loadSessions();
+    if (this.disposed) return;
     if (this.sessions.length > 0) {
       if (this.activeChatId && this.sessions.some((s) => s.id === this.activeChatId && !s.archived)) {
         await this.selectSession(this.activeChatId);
@@ -581,6 +762,7 @@ class ChatStore {
       }
     }
     await this.pullBackendChats();
+    if (this.disposed) return;
     if (this.sessions.length > 0 && !this.activeChatId) {
       const firstActive = this.sessions.find((s) => !s.archived && !s.isDraft);
       if (firstActive) {
@@ -588,11 +770,15 @@ class ChatStore {
       }
     }
     import('@tauri-apps/api/event')
-      .then(({ listen }) => {
-        listen<{ chatId?: string }>('telegram-chat-updated', (ev) => {
-          this.pullBackendChats(ev.payload?.chatId);
+      .then(async ({ listen }) => {
+        if (this.disposed) return;
+        const u1 = await listen<{ chatId?: string }>('telegram-chat-updated', (ev) => {
+          void this.pullBackendChats(ev.payload?.chatId);
         });
-        listen<{ providerId?: string | null; modelId?: string | null; chatId?: string | null }>(
+        if (this.disposed) { u1(); return; }
+        this.unlisteners.push(u1);
+
+        const u2 = await listen<{ providerId?: string | null; modelId?: string | null; chatId?: string | null }>(
           'telegram-settings-updated',
           (ev) => {
             const p = ev.payload;
@@ -607,31 +793,22 @@ class ChatStore {
             }
           }
         );
-        listen<{
-          chatId?: string;
-          type?: string;
-          userText?: string;
-          delta?: string;
-          id?: string;
-          name?: string;
-          arguments?: string;
-          success?: boolean;
-          output?: string;
-          elapsedMs?: number;
-          attempt?: number;
-          reason?: string;
-          error?: string;
-          beforeTokens?: number;
-          afterTokens?: number;
-          summary?: string;
-        }>('telegram-chat-stream', (ev) => {
+        if (this.disposed) { u2(); return; }
+        this.unlisteners.push(u2);
+
+        const u3 = await listen<any>('telegram-chat-stream', (ev) => {
           this.handleTelegramStreamEvent(ev.payload);
         });
-        listen<{ chatId?: string; items?: PendingQueueItem[] }>('prompt-queue-updated', (ev) => {
+        if (this.disposed) { u3(); return; }
+        this.unlisteners.push(u3);
+
+        const u4 = await listen<{ chatId?: string; items?: PendingQueueItem[] }>('prompt-queue-updated', (ev) => {
           const p = ev.payload;
           if (!p?.chatId) return;
           this.applyBackendQueue(p.chatId, p.items || []);
         });
+        if (this.disposed) { u4(); return; }
+        this.unlisteners.push(u4);
       })
       .catch(() => {});
   }
@@ -641,39 +818,19 @@ class ChatStore {
       if (sess.isDraft || sess.isThemeStudio || this.streamingChats[sess.id]) continue;
       const rawMsgs = this.messagesByChat[sess.id] || [];
       if (rawMsgs.length === 0) continue;
-      const msgs = rawMsgs.map((m) => ({
-        role: m.role,
-        content: m.content,
-        createdAt: m.createdAt
-      }));
+      const msgs = this.buildRichSyncPayload(rawMsgs);
       invoke('sync_chat_context', {
         chatId: sess.id,
         title: sess.title || sess.id,
         messagesJson: JSON.stringify(msgs),
         projectPath: sess.projectPath || null,
-        modelId: settingsStore.data.activeModel || null
+        modelId: sess.modelId || settingsStore.data.activeModel || null,
+        isPinned: Boolean(sess.pinned)
       }).catch(() => {});
     }
   }
 
-  private handleTelegramStreamEvent(payload: {
-    chatId?: string;
-    type?: string;
-    userText?: string;
-    delta?: string;
-    id?: string;
-    name?: string;
-    arguments?: string;
-    success?: boolean;
-    output?: string;
-    elapsedMs?: number;
-    attempt?: number;
-    reason?: string;
-    error?: string;
-    beforeTokens?: number;
-    afterTokens?: number;
-    summary?: string;
-  } | undefined): void {
+  private handleTelegramStreamEvent(payload: any): void {
     const chatId = payload?.chatId;
     const evtType = payload?.type;
     if (!chatId || !evtType) return;
@@ -691,7 +848,7 @@ class ChatStore {
           messageCount: 1,
           preview: userText.slice(0, 80)
         };
-        this.sessions = [sess, ...this.sessions];
+        this.sessions.unshift(sess);
       } else {
         sess.hasError = false;
         sess.isPaused = false;
@@ -699,8 +856,9 @@ class ChatStore {
         sess.updatedAt = Date.now();
         if (userText) sess.preview = userText.slice(0, 80);
       }
-      this.streamingChats = { ...this.streamingChats, [chatId]: true };
-      const list = [...(this.messagesByChat[chatId] || [])];
+      this.streamingChats[chatId] = true;
+      if (!this.messagesByChat[chatId]) this.messagesByChat[chatId] = [];
+      const list = this.messagesByChat[chatId];
       const lastMsg = list[list.length - 1];
       if (userText && (!lastMsg || lastMsg.role !== 'user' || lastMsg.content !== userText)) {
         list.push({
@@ -728,13 +886,12 @@ class ChatStore {
       } else {
         tail.error = undefined;
       }
-      this.messagesByChat[chatId] = list;
       this.safeSetStorage('omni_chat_sessions', JSON.stringify(this.sessions.filter((s) => !s.isDraft && !s.isThemeStudio)));
       return;
     }
 
     if (evtType === 'stopped') {
-      this.streamingChats = { ...this.streamingChats, [chatId]: false };
+      this.streamingChats[chatId] = false;
       const list = this.messagesByChat[chatId];
       if (list && list.length > 0) {
         const msg = list[list.length - 1];
@@ -743,7 +900,6 @@ class ChatStore {
           msg.statusText = undefined;
           msg.finishedAt = Date.now();
           this.finalizeRunningTools(msg, 'cancelled', 'Stopped from Telegram');
-          this.messagesByChat[chatId] = [...list];
           this.saveLocalOnly(chatId);
         }
       }
@@ -775,44 +931,33 @@ class ChatStore {
       });
       msg.toolCalls.push(rec);
       msg.steps.push({ kind: 'tool', record: rec });
-      this.messagesByChat[chatId] = [...list];
+      this.saveLocalOnly(chatId);
       return;
     }
     if (evtType === 'tool_end' && payload?.id) {
       const nextStatus = payload.success === false ? 'error' : 'success';
       const now = Date.now();
       if (msg.toolCalls) {
-        msg.toolCalls = msg.toolCalls.map((t) =>
-          t.toolCallId === payload.id
-            ? {
-                ...t,
-                status: nextStatus,
-                finishedAt: now,
-                elapsedMs: payload.elapsedMs,
-                output: payload.output ?? t.output,
-                error: payload.error ?? t.error
-              }
-            : t
-        );
+        const tc = msg.toolCalls.find((t) => t.toolCallId === payload.id);
+        if (tc) {
+          tc.status = nextStatus;
+          tc.finishedAt = now;
+          tc.elapsedMs = payload.elapsedMs;
+          tc.output = payload.output ?? tc.output;
+          tc.error = payload.error ?? tc.error;
+        }
       }
       if (msg.steps) {
-        msg.steps = msg.steps.map((s) =>
-          s.kind === 'tool' && s.record.toolCallId === payload.id
-            ? {
-                kind: 'tool',
-                record: {
-                  ...s.record,
-                  status: nextStatus,
-                  finishedAt: now,
-                  elapsedMs: payload.elapsedMs,
-                  output: payload.output ?? s.record.output,
-                  error: payload.error ?? s.record.error
-                }
-              }
-            : s
-        );
+        const st = msg.steps.find((s) => s.kind === 'tool' && s.record.toolCallId === payload.id);
+        if (st && st.kind === 'tool') {
+          st.record.status = nextStatus;
+          st.record.finishedAt = now;
+          st.record.elapsedMs = payload.elapsedMs;
+          st.record.output = payload.output ?? st.record.output;
+          st.record.error = payload.error ?? st.record.error;
+        }
       }
-      this.messagesByChat[chatId] = [...list];
+      this.saveLocalOnly(chatId);
       return;
     }
     if (evtType === 'context_compacted') {
@@ -824,22 +969,19 @@ class ChatStore {
         afterTokens: payload?.afterTokens || 0,
         summary: payload?.summary || ''
       });
-      this.messagesByChat[chatId] = [...list];
       return;
     }
     if (evtType === 'retry') {
       msg.statusText = `Reconnecting (attempt ${payload?.attempt || 1})...`;
       msg.retryReason = payload?.reason;
-      this.messagesByChat[chatId] = [...list];
       return;
     }
     if (evtType === 'error') {
       msg.error = payload?.error || 'Telegram execution failed';
       msg.streaming = false;
       msg.finishedAt = Date.now();
-      this.streamingChats = { ...this.streamingChats, [chatId]: false };
+      this.streamingChats[chatId] = false;
       if (sess) sess.hasError = true;
-      this.messagesByChat[chatId] = [...list];
       this.saveLocalOnly(chatId);
       return;
     }
@@ -847,16 +989,40 @@ class ChatStore {
       msg.streaming = false;
       msg.statusText = undefined;
       msg.finishedAt = Date.now();
-      this.streamingChats = { ...this.streamingChats, [chatId]: false };
+      this.streamingChats[chatId] = false;
       if (sess && this.activeChatId !== chatId && !msg.error) {
         sess.hasUnreadCompletion = true;
       }
-      this.messagesByChat[chatId] = [...list];
       this.saveLocalOnly(chatId);
     }
   }
 
   public async pullBackendChats(targetChatId?: string): Promise<void> {
+    if (this.pullInFlight) {
+      if (targetChatId) this.pendingPullTargets.add(targetChatId);
+      else this.pendingPullAll = true;
+      return;
+    }
+    this.pullInFlight = true;
+    try {
+      await this.pullBackendChatsInner(targetChatId);
+    } finally {
+      this.pullInFlight = false;
+      if (this.pendingPullAll) {
+        this.pendingPullAll = false;
+        this.pendingPullTargets.clear();
+        void this.pullBackendChats();
+      } else if (this.pendingPullTargets.size > 0) {
+        const nextId = this.pendingPullTargets.values().next().value;
+        if (nextId) {
+          this.pendingPullTargets.delete(nextId);
+          void this.pullBackendChats(nextId);
+        }
+      }
+    }
+  }
+
+  private async pullBackendChatsInner(targetChatId?: string): Promise<void> {
     try {
       const backendChats = await invoke<
         Array<{
@@ -875,15 +1041,17 @@ class ChatStore {
       let sessionsChanged = false;
 
       if (targetChatId && !backendIds.has(targetChatId)) {
-        const hadSess = this.sessions.find((s) => s.id === targetChatId);
-        if (hadSess && !hadSess.isDraft) {
-          this.sessions = this.sessions.filter((s) => s.id !== targetChatId);
+        const hadIdx = this.sessions.findIndex((s) => s.id === targetChatId);
+        if (hadIdx >= 0 && !this.sessions[hadIdx].isDraft) {
+          this.sessions.splice(hadIdx, 1);
           delete this.messagesByChat[targetChatId];
+          this.cleanupChatResources(targetChatId);
           sessionsChanged = true;
         }
       }
 
       let newChatPullBudget = 3;
+      const newSessionsToAdd: ChatSession[] = [];
       for (const bc of backendChats) {
         const existing = this.sessions.find((s) => s.id === bc.id);
         const bcUpdatedMs = Date.parse(bc.updatedAt) || Date.now();
@@ -901,7 +1069,7 @@ class ChatStore {
             messageCount: 0,
             preview: ''
           };
-          this.sessions = [newSess, ...this.sessions];
+          newSessionsToAdd.push(newSess);
           sessionsChanged = true;
         } else {
           if (bc.title && existing.title !== bc.title) {
@@ -933,7 +1101,7 @@ class ChatStore {
 
         const shouldPullMsgs =
           targetChatId === bc.id ||
-          (!targetChatId && bc.id === this.activeChatId && (!this.messagesByChat[bc.id] || bcUpdatedMs > ((existing?.updatedAt || 0) + 1000))) ||
+          (!targetChatId && bc.id === this.activeChatId && (!this.messagesByChat[bc.id] || bcUpdatedMs > (existing?.updatedAt || 0) + 1000)) ||
           (!targetChatId && isBrandNew && newChatPullBudget > 0);
 
         if (shouldPullMsgs) {
@@ -944,6 +1112,14 @@ class ChatStore {
           if (this.streamingChats[bc.id] && !(targetChatId === bc.id && isTgStreaming)) {
             continue;
           }
+
+          const hasTrailingIncompleteLocal =
+            lastLocal?.role === 'assistant' &&
+            (Boolean(lastLocal.paused) ||
+              Boolean(lastLocal.streaming) ||
+              (lastLocal.content.trim() === '' &&
+                ((lastLocal.steps && lastLocal.steps.length > 0) || (lastLocal.toolCalls && lastLocal.toolCalls.length > 0))));
+
           const dbMsgs = await invoke<
             Array<{
               id: string;
@@ -954,6 +1130,7 @@ class ChatStore {
               createdAt: string;
             }>
           >('list_messages', { chatId: bc.id });
+
           if (Array.isArray(dbMsgs)) {
             const lastDb = dbMsgs[dbMsgs.length - 1];
             const changed =
@@ -966,9 +1143,11 @@ class ChatStore {
               Boolean(lastDb.content?.trim()) &&
               (dbMsgs.length > localMsgs.length || lastDb.id !== lastLocal?.id);
             if (isTgDoneInDb) {
-              this.streamingChats = { ...this.streamingChats, [bc.id]: false };
+              this.streamingChats[bc.id] = false;
             }
-            const allowReplace = dbMsgs.length >= localMsgs.length && changed;
+            const allowReplace =
+              dbMsgs.length > localMsgs.length ||
+              (dbMsgs.length === localMsgs.length && changed && !hasTrailingIncompleteLocal);
             if (!this.streamingChats[bc.id] && (allowReplace || isTgDoneInDb)) {
               const dedupedDb: typeof dbMsgs = [];
               for (const m of dbMsgs) {
@@ -989,22 +1168,32 @@ class ChatStore {
                 }
                 if (prev) usedPrevIds.add(prev.id);
                 return {
-                  id: m.id,
+                  id: prev?.id || m.id,
                   chatId: m.chatId,
                   role: m.role,
                   content: m.content,
+                  modelId: prev?.modelId,
+                  attachments: prev?.attachments,
                   reasoningContent: prev?.reasoningContent || m.reasoningContent || undefined,
                   toolCalls: prev?.toolCalls,
                   steps: prev?.steps,
+                  todos: prev?.todos,
+                  statusText: prev?.statusText,
                   startedAt: prev?.startedAt,
                   finishedAt: prev?.finishedAt,
+                  paused: prev?.paused,
+                  error: prev?.error,
+                  tokenUsage: prev?.tokenUsage,
                   createdAt: prev?.createdAt || Date.parse(m.createdAt) || Date.now(),
                   streaming: false
                 };
               });
+              if (hasTrailingIncompleteLocal && lastLocal && !usedPrevIds.has(lastLocal.id)) {
+                converted.push(lastLocal);
+              }
               this.messagesByChat[bc.id] = converted;
               this.saveChatMessagesToStorage(bc.id, converted);
-              const sess = this.sessions.find((s) => s.id === bc.id);
+              const sess = this.sessions.find((s) => s.id === bc.id) || newSessionsToAdd.find((s) => s.id === bc.id);
               if (sess) {
                 sess.messageCount = converted.length;
                 if (lastDb && lastDb.content) {
@@ -1016,6 +1205,10 @@ class ChatStore {
             }
           }
         }
+      }
+
+      if (newSessionsToAdd.length > 0) {
+        this.sessions.unshift(...newSessionsToAdd);
       }
 
       if (sessionsChanged) {
@@ -1037,31 +1230,31 @@ class ChatStore {
       const compactedTools = m.toolCalls?.map((tc) => ({
         ...tc,
         output: tc.output && tc.output.length > (isRecent ? 4000 : 800)
-          ? tc.output.slice(0, isRecent ? 4000 : 800) + "..."
+          ? tc.output.slice(0, isRecent ? 4000 : 800) + '...'
           : tc.output,
         terminalData: tc.terminalData
           ? {
               ...tc.terminalData,
               stdout: tc.terminalData.stdout && tc.terminalData.stdout.length > (isRecent ? 4000 : 800)
-                ? tc.terminalData.stdout.slice(0, isRecent ? 4000 : 800) + "..."
+                ? tc.terminalData.stdout.slice(0, isRecent ? 4000 : 800) + '...'
                 : tc.terminalData.stdout
             }
           : undefined
       }));
       const compactedSteps = m.steps?.map((s) => {
-        if (s.kind !== "tool") return s;
+        if (s.kind !== 'tool') return s;
         return {
-          kind: "tool" as const,
+          kind: 'tool' as const,
           record: {
             ...s.record,
             output: s.record.output && s.record.output.length > (isRecent ? 4000 : 800)
-              ? s.record.output.slice(0, isRecent ? 4000 : 800) + "..."
+              ? s.record.output.slice(0, isRecent ? 4000 : 800) + '...'
               : s.record.output,
             terminalData: s.record.terminalData
               ? {
                   ...s.record.terminalData,
                   stdout: s.record.terminalData.stdout && s.record.terminalData.stdout.length > (isRecent ? 4000 : 800)
-                    ? s.record.terminalData.stdout.slice(0, isRecent ? 4000 : 800) + "..."
+                    ? s.record.terminalData.stdout.slice(0, isRecent ? 4000 : 800) + '...'
                     : s.record.terminalData.stdout
                 }
               : undefined
@@ -1074,14 +1267,14 @@ class ChatStore {
         toolCalls: compactedTools,
         steps: compactedSteps,
         reasoningContent: !isRecent && m.reasoningContent && m.reasoningContent.length > 1000
-          ? m.reasoningContent.slice(0, 1000) + "..."
+          ? m.reasoningContent.slice(0, 1000) + '...'
           : m.reasoningContent
       };
     });
   }
 
   private safeSetStorage(key: string, value: string, protectChatId?: string): boolean {
-    if (typeof localStorage === "undefined") return false;
+    if (typeof localStorage === 'undefined') return false;
     try {
       localStorage.setItem(key, value);
       return true;
@@ -1109,18 +1302,34 @@ class ChatStore {
     this.safeSetStorage(`omni_chat_msgs_${chatId}`, compacted, chatId);
   }
 
-  private persistDrafts(): void {
+  private persistDraftsNow(): void {
     this.safeSetStorage(
       'omni_chat_drafts',
       JSON.stringify({
-        texts: this.draftTextByChat,
-        attachments: this.draftAttachmentsByChat
+        texts: $state.snapshot(this.draftTextByChat),
+        attachments: $state.snapshot(this.draftAttachmentsByChat)
       })
     );
   }
 
+  private scheduleDraftPersist(): void {
+    if (this.draftSaveTimer) clearTimeout(this.draftSaveTimer);
+    this.draftSaveTimer = setTimeout(() => {
+      this.draftSaveTimer = null;
+      this.persistDraftsNow();
+    }, 350);
+  }
+
+  private flushDraftsNow(): void {
+    if (this.draftSaveTimer) {
+      clearTimeout(this.draftSaveTimer);
+      this.draftSaveTimer = null;
+      this.persistDraftsNow();
+    }
+  }
+
   private persistPendingQueues(): void {
-    this.safeSetStorage('omni_pending_queues', JSON.stringify(this.pendingQueueByChat));
+    this.safeSetStorage('omni_pending_queues', JSON.stringify($state.snapshot(this.pendingQueueByChat)));
   }
 
   private getDraftKey(chatId: string | null): string {
@@ -1143,7 +1352,7 @@ class ChatStore {
     } else {
       this.draftTextByChat[key] = text;
     }
-    this.persistDrafts();
+    this.scheduleDraftPersist();
   }
 
   public getDraftAttachments(chatId: string | null): ChatAttachment[] {
@@ -1161,15 +1370,14 @@ class ChatStore {
       kind: a.kind,
       previewUrl: a.previewUrl && a.previewUrl.startsWith('data:') ? undefined : a.previewUrl
     }));
-    const prevJson = JSON.stringify(this.draftAttachmentsByChat[key] || []);
-    const nextJson = JSON.stringify(clean);
-    if (prevJson === nextJson) return;
+    const prev = this.draftAttachmentsByChat[key] || [];
+    if (prev.length === clean.length && JSON.stringify(prev) === JSON.stringify(clean)) return;
     if (clean.length === 0) {
       delete this.draftAttachmentsByChat[key];
     } else {
       this.draftAttachmentsByChat[key] = clean;
     }
-    this.persistDrafts();
+    this.scheduleDraftPersist();
   }
 
   public async loadSessions(): Promise<void> {
@@ -1213,7 +1421,7 @@ class ChatStore {
 
   private saveLocalOnly(targetChatId?: string): void {
     const cid = targetChatId || this.activeChatId;
-    const persistableSessions = this.sessions.filter((s) => !s.isDraft && !s.isThemeStudio);
+    const persistableSessions = $state.snapshot(this.sessions).filter((s) => !s.isDraft && !s.isThemeStudio);
     try {
       this.safeSetStorage('omni_chat_sessions', JSON.stringify(persistableSessions), cid || undefined);
       if (cid) {
@@ -1221,7 +1429,7 @@ class ChatStore {
         if (sess && !sess.isDraft && !sess.isThemeStudio) {
           const msgs = this.messagesByChat[cid];
           if (msgs) {
-            this.saveChatMessagesToStorage(cid, msgs);
+            this.saveChatMessagesToStorage(cid, $state.snapshot(msgs));
           }
         }
       }
@@ -1234,19 +1442,20 @@ class ChatStore {
     if (syncBackend && cid) {
       const sess = this.sessions.find((s) => s.id === cid);
       if (sess && !sess.isDraft && !sess.isThemeStudio && this.messagesByChat[cid]) {
-        const msgs = (this.messagesByChat[cid] || []).map((m) => ({
-          role: m.role,
-          content: m.content,
-          createdAt: m.createdAt
-        }));
-        invoke('sync_chat_context', {
+        const payload = {
           chatId: cid,
           title: sess.title || cid,
-          messagesJson: JSON.stringify(msgs),
+          messagesJson: JSON.stringify(this.buildRichSyncPayload($state.snapshot(this.messagesByChat[cid]))),
           projectPath: sess.projectPath || null,
           modelId: sess.modelId || settingsStore.data.activeModel || null,
           isPinned: Boolean(sess.pinned)
-        }).catch(() => {});
+        };
+        const prev = this.saveChainByChat[cid] || Promise.resolve();
+        const next = prev
+          .then(() => invoke('sync_chat_context', payload))
+          .catch(() => {});
+        this.saveChainByChat[cid] = next;
+        await next;
       }
     }
   }
@@ -1258,40 +1467,30 @@ class ChatStore {
   ): void {
     const now = Date.now();
     if (Array.isArray(msg.steps)) {
-      msg.steps = msg.steps.map((st) => {
+      for (const st of msg.steps) {
         if (st.kind === 'thought' && !st.finishedAt) {
-          return { ...st, finishedAt: now };
+          st.finishedAt = now;
         }
-        return st;
-      });
+      }
     }
     if (Array.isArray(msg.toolCalls)) {
-      msg.toolCalls = msg.toolCalls.map((tc) => {
-        if (tc.status !== 'running' && tc.status !== 'pending') return tc;
-        return {
-          ...tc,
-          status: targetStatus,
-          finishedAt: now,
-          elapsedMs: tc.startedAt ? now - tc.startedAt : tc.elapsedMs,
-          error: errText ?? tc.error
-        };
-      });
+      for (const tc of msg.toolCalls) {
+        if (tc.status !== 'running' && tc.status !== 'pending') continue;
+        tc.status = targetStatus;
+        tc.finishedAt = now;
+        tc.elapsedMs = tc.startedAt ? now - tc.startedAt : tc.elapsedMs;
+        if (errText !== undefined) tc.error = errText;
+      }
     }
     if (Array.isArray(msg.steps)) {
-      msg.steps = msg.steps.map((s) => {
-        if (s.kind !== 'tool') return s;
-        if (s.record.status !== 'running' && s.record.status !== 'pending') return s;
-        return {
-          kind: 'tool',
-          record: {
-            ...s.record,
-            status: targetStatus,
-            finishedAt: now,
-            elapsedMs: s.record.startedAt ? now - s.record.startedAt : s.record.elapsedMs,
-            error: errText ?? s.record.error
-          }
-        };
-      });
+      for (const s of msg.steps) {
+        if (s.kind !== 'tool') continue;
+        if (s.record.status !== 'running' && s.record.status !== 'pending') continue;
+        s.record.status = targetStatus;
+        s.record.finishedAt = now;
+        s.record.elapsedMs = s.record.startedAt ? now - s.record.startedAt : s.record.elapsedMs;
+        if (errText !== undefined) s.record.error = errText;
+      }
     }
   }
 
@@ -1300,7 +1499,7 @@ class ChatStore {
     this.streamSaveTimers[chatId] = window.setTimeout(() => {
       delete this.streamSaveTimers[chatId];
       this.saveLocalOnly(chatId);
-    }, 2200);
+    }, 6000);
   }
 
   private takeSmoothSlice(buf: string): [string, string] {
@@ -1430,7 +1629,7 @@ class ChatStore {
         messageCount: 0,
         preview: ''
       };
-      this.sessions = [existing, ...this.sessions];
+      this.sessions.unshift(existing);
     } else {
       existing.themeId = themeId;
     }
@@ -1447,14 +1646,13 @@ class ChatStore {
     const sess = this.sessions.find((s) => s.id === cid);
     if (!sess || sess.isThemeStudio) return;
     sess.projectPath = path.trim() ? path.trim() : undefined;
-    this.sessions = [...this.sessions];
     if (!sess.isDraft) {
-      this.saveSessions(cid).catch(() => {});
+      void this.saveSessions(cid);
     }
   }
 
   public async createSession(title = '', projectPath?: string): Promise<string> {
-    const resolvedProject = projectPath !== undefined ? projectPath : (workspaceStore.currentPath || undefined);
+    const resolvedProject = projectPath !== undefined ? projectPath : workspaceStore.currentPath || undefined;
     const existingDraft = this.sessions.find(
       (s) => s.isDraft && (!this.messagesByChat[s.id] || this.messagesByChat[s.id].length === 0)
     );
@@ -1468,7 +1666,7 @@ class ChatStore {
     const id = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
     const newSession: ChatSession = {
       id,
-      title: (title && title !== 'New task') ? title : '',
+      title: title && title !== 'New task' ? title : '',
       createdAt: Date.now(),
       updatedAt: Date.now(),
       pinned: false,
@@ -1484,7 +1682,7 @@ class ChatStore {
     };
 
     this.showArchived = false;
-    this.sessions = [newSession, ...this.sessions];
+    this.sessions.unshift(newSession);
     this.messagesByChat[id] = [];
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem('omni_active_chat_id', id);
@@ -1505,10 +1703,13 @@ class ChatStore {
 
   public async selectSession(id: string): Promise<void> {
     if (this.activeChatId && this.activeChatId !== id) {
-      const prev = this.sessions.find((s) => s.id === this.activeChatId);
-      if (prev && prev.isDraft && (!this.messagesByChat[prev.id] || this.messagesByChat[prev.id].length === 0)) {
-        this.sessions = this.sessions.filter((s) => s.id !== prev.id);
-        delete this.messagesByChat[prev.id];
+      const prevIdx = this.sessions.findIndex((s) => s.id === this.activeChatId);
+      if (prevIdx >= 0) {
+        const prev = this.sessions[prevIdx];
+        if (prev.isDraft && (!this.messagesByChat[prev.id] || this.messagesByChat[prev.id].length === 0)) {
+          this.sessions.splice(prevIdx, 1);
+          delete this.messagesByChat[prev.id];
+        }
       }
     }
     this.activeChatId = id;
@@ -1525,10 +1726,10 @@ class ChatStore {
     }
     if (session && session.hasUnreadCompletion) {
       session.hasUnreadCompletion = false;
-      this.saveSessions(id);
+      void this.saveSessions(id);
     }
 
-    this.refreshGoalState(id);
+    void this.refreshGoalState(id);
     if (this.messagesByChat[id]) {
       return;
     }
@@ -1539,32 +1740,56 @@ class ChatStore {
         try {
           const parsedMsgs = JSON.parse(saved);
           if (Array.isArray(parsedMsgs)) {
-            let changed = false;
-            for (const m of parsedMsgs) {
-              if (m.streaming && !this.streamingChats[id]) {
-                m.streaming = false;
-                m.paused = true;
-                m.statusText = 'Paused';
-                const lastToolEnd = Array.isArray(m.toolCalls)
-                  ? m.toolCalls.reduce((mx: number, tc: any) => Math.max(mx, tc.finishedAt || tc.startedAt || 0), 0)
-                  : 0;
-                m.finishedAt = m.finishedAt || lastToolEnd || m.startedAt || m.createdAt || Date.now();
-                this.finalizeRunningTools(m, 'paused');
-                changed = true;
-              }
-            }
-            this.messagesByChat[id] = parsedMsgs;
+            const { msgs, changed } = this.normalizeLoadedMessages(id, parsedMsgs);
+            this.messagesByChat[id] = msgs;
             if (changed) {
-              this.saveChatMessagesToStorage(id, parsedMsgs);
+              this.saveChatMessagesToStorage(id, msgs);
             }
             if (!session?.isDraft && !session?.isThemeStudio) {
-              this.pullBackendChats(id).catch(() => {});
+              void this.pullBackendChats(id);
             }
             return;
           }
         } catch {}
       }
     }
+
+    if (!session?.isDraft && !session?.isThemeStudio) {
+      try {
+        const cachedJson = await invoke<string | null>('get_cached_chat_messages', { chatId: id });
+        if (cachedJson) {
+          const parsed = JSON.parse(cachedJson);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            const hydrated: ChatMessage[] = parsed.map((m: any, idx: number) => ({
+              id: m.id || `cached-${idx}-${Date.now()}`,
+              chatId: id,
+              role: m.role || 'assistant',
+              content: typeof m.content === 'string' ? m.content : '',
+              modelId: m.modelId,
+              attachments: m.attachments,
+              reasoningContent: m.reasoningContent,
+              toolCalls: m.toolCalls,
+              steps: m.steps,
+              todos: m.todos,
+              statusText: m.statusText,
+              startedAt: m.startedAt,
+              finishedAt: m.finishedAt,
+              error: m.error,
+              streaming: Boolean(m.streaming),
+              paused: Boolean(m.paused),
+              tokenUsage: m.tokenUsage,
+              createdAt: typeof m.createdAt === 'number' ? m.createdAt : Date.now()
+            }));
+            const { msgs } = this.normalizeLoadedMessages(id, hydrated);
+            this.messagesByChat[id] = msgs;
+            this.saveChatMessagesToStorage(id, msgs);
+            void this.pullBackendChats(id);
+            return;
+          }
+        }
+      } catch {}
+    }
+
     this.messagesByChat[id] = [];
     if (!session?.isDraft && !session?.isThemeStudio) {
       await this.pullBackendChats(id);
@@ -1575,22 +1800,13 @@ class ChatStore {
     if (this.streamingChats[id]) {
       await this.stopStreaming(id);
     }
-    this.sessions = this.sessions.filter((s) => s.id !== id);
+    const idx = this.sessions.findIndex((s) => s.id === id);
+    if (idx >= 0) this.sessions.splice(idx, 1);
     delete this.messagesByChat[id];
-    delete this.streamingChats[id];
-    delete this.pendingQueueByChat[id];
-    delete this.draftTextByChat[id];
-    delete this.draftAttachmentsByChat[id];
+    this.cleanupChatResources(id);
     this.persistPendingQueues();
-    this.persistDrafts();
-    delete this.todosByChat[id];
-    delete this.contextTelemetryByChat[id];
-    delete this.reasoningElapsedByChat[id];
-    delete this.streamTokenCountByChat[id];
+    this.persistDraftsNow();
 
-    if (typeof localStorage !== 'undefined') {
-      localStorage.removeItem(`omni_chat_msgs_${id}`);
-    }
     try {
       await invoke('delete_chat', { id });
     } catch {}
@@ -1659,10 +1875,11 @@ class ChatStore {
       streaming: true
     };
 
-    this.messagesByChat[chatId] = [...(this.messagesByChat[chatId] || []), assistantMessage];
+    if (!this.messagesByChat[chatId]) this.messagesByChat[chatId] = [];
+    this.messagesByChat[chatId].push(assistantMessage);
     this.saveLocalOnly(chatId);
     this.activeStreamMsgIdByChat[chatId] = assistantMsgId;
-    this.streamingChats = { ...this.streamingChats, [chatId]: true };
+    this.streamingChats[chatId] = true;
     this.streamTokenCountByChat[chatId] = 0;
     this.reasoningElapsedByChat[chatId] = 0;
 
@@ -1672,7 +1889,7 @@ class ChatStore {
     }
     this.reasoningTimers[chatId] = window.setInterval(() => {
       this.reasoningElapsedByChat[chatId] = Date.now() - startTime;
-    }, 250);
+    }, 500);
 
     let failed = false;
     try {
@@ -1689,6 +1906,7 @@ class ChatStore {
           list[idx].error = rawErr;
           list[idx].streaming = false;
           list[idx].paused = false;
+          list[idx].finishedAt = Date.now();
           this.finalizeRunningTools(list[idx], 'error', rawErr);
         }
       }
@@ -1704,12 +1922,13 @@ class ChatStore {
           clearTimeout(this.streamSaveTimers[chatId]);
           delete this.streamSaveTimers[chatId];
         }
-        this.streamingChats = { ...this.streamingChats, [chatId]: false };
+        this.streamingChats[chatId] = false;
       }
       const list = this.messagesByChat[chatId] || [];
       const idx = list.findIndex((m) => m.id === assistantMsgId);
       if (idx !== -1 && !this.canceledMsgIds.has(assistantMsgId)) {
         list[idx].streaming = false;
+        if (!list[idx].finishedAt) list[idx].finishedAt = Date.now();
         this.finalizeRunningTools(list[idx], failed ? 'error' : 'success');
       }
       if (isCurrentStream) {
@@ -1746,7 +1965,7 @@ class ChatStore {
     delete this.draftAttachmentsByChat[chatId];
     delete this.draftTextByChat['__new__'];
     delete this.draftAttachmentsByChat['__new__'];
-    this.persistDrafts();
+    this.persistDraftsNow();
 
     const userMsgId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
     const userMessage: ChatMessage = {
@@ -1759,25 +1978,23 @@ class ChatStore {
       modifiedFiles: options.files
     };
 
-    const existingList = (this.messagesByChat[chatId] || []).map((m) => {
+    if (!this.messagesByChat[chatId]) this.messagesByChat[chatId] = [];
+    const existingList = this.messagesByChat[chatId];
+    for (const m of existingList) {
       const wasCanceled = m.error === 'User canceled execution';
       if (m.paused || wasCanceled) {
-        return {
-          ...m,
-          paused: false,
-          error: wasCanceled ? undefined : m.error,
-          statusText: m.statusText === 'Paused' ? undefined : m.statusText
-        };
+        m.paused = false;
+        if (wasCanceled) m.error = undefined;
+        if (m.statusText === 'Paused') m.statusText = undefined;
       }
-      return m;
-    });
-    this.messagesByChat[chatId] = [...existingList, userMessage];
+    }
+    existingList.push(userMessage);
 
     const currentSession = this.sessions.find((s) => s.id === chatId);
     if (currentSession) {
       currentSession.isDraft = false;
       currentSession.updatedAt = Date.now();
-      currentSession.messageCount = this.messagesByChat[chatId].length;
+      currentSession.messageCount = existingList.length;
       currentSession.preview = text.trim().slice(0, 80);
       currentSession.hasError = false;
       currentSession.isPaused = false;
@@ -1915,7 +2132,7 @@ class ChatStore {
     if (!cid) return;
     this.flushSmoothBuffers(cid);
     this.activeStreamMsgIdByChat[cid] = null;
-    this.streamingChats = { ...this.streamingChats, [cid]: false };
+    this.streamingChats[cid] = false;
     const resFn = this.resolveByChat[cid];
     if (resFn) {
       resFn();
@@ -1923,6 +2140,10 @@ class ChatStore {
     if (this.reasoningTimers[cid]) {
       clearInterval(this.reasoningTimers[cid]);
       delete this.reasoningTimers[cid];
+    }
+    if (this.streamSaveTimers[cid]) {
+      clearTimeout(this.streamSaveTimers[cid]);
+      delete this.streamSaveTimers[cid];
     }
     const list = this.messagesByChat[cid] || [];
     for (const msg of list) {
@@ -1980,7 +2201,7 @@ class ChatStore {
     const targetMsg = list[targetIdx];
     if (this.streamingChats[chatId] && targetMsg.streaming) return;
     if (this.streamingChats[chatId]) {
-      this.streamingChats = { ...this.streamingChats, [chatId]: false };
+      this.streamingChats[chatId] = false;
     }
     let prevUserPrompt = '';
     for (let i = targetIdx - 1; i >= 0; i--) {
@@ -2014,7 +2235,7 @@ class ChatStore {
 
     this.canceledMsgIds.delete(targetMsg.id);
     this.activeStreamMsgIdByChat[chatId] = targetMsg.id;
-    this.streamingChats = { ...this.streamingChats, [chatId]: true };
+    this.streamingChats[chatId] = true;
     this.streamTokenCountByChat[chatId] = 0;
     const startTime = targetMsg.startedAt;
     if (this.reasoningTimers[chatId]) {
@@ -2022,7 +2243,7 @@ class ChatStore {
     }
     this.reasoningTimers[chatId] = window.setInterval(() => {
       this.reasoningElapsedByChat[chatId] = Date.now() - startTime;
-    }, 250);
+    }, 500);
 
     const resumePrompt = hasPriorWork
       ? 'Continue from where you stopped without repeating already completed steps or tool calls.'
@@ -2039,6 +2260,7 @@ class ChatStore {
         targetMsg.error = rawErr;
         targetMsg.streaming = false;
         targetMsg.paused = false;
+        targetMsg.finishedAt = Date.now();
         this.finalizeRunningTools(targetMsg, 'error', rawErr);
       }
     } finally {
@@ -2053,10 +2275,11 @@ class ChatStore {
           clearTimeout(this.streamSaveTimers[chatId]);
           delete this.streamSaveTimers[chatId];
         }
-        this.streamingChats = { ...this.streamingChats, [chatId]: false };
+        this.streamingChats[chatId] = false;
       }
       if (!this.canceledMsgIds.has(targetMsg.id)) {
         targetMsg.streaming = false;
+        if (!targetMsg.finishedAt) targetMsg.finishedAt = Date.now();
         this.finalizeRunningTools(targetMsg, failed ? 'error' : 'success');
       }
       if (isCurrentStream) {
@@ -2092,7 +2315,7 @@ class ChatStore {
     }
     if (!prevUserPrompt) return;
 
-    this.messagesByChat[chatId] = list.slice(0, targetIdx);
+    list.splice(targetIdx);
     this.syncTodosFromMessages(chatId);
     const currentSession = this.sessions.find((s) => s.id === chatId);
     if (currentSession) {
@@ -2114,7 +2337,7 @@ class ChatStore {
     }
 
     targetMsg.content = newText.trim();
-    this.messagesByChat[chatId] = list.slice(0, idx + 1);
+    list.splice(idx + 1);
     this.syncTodosFromMessages(chatId);
     const currentSession = this.sessions.find((s) => s.id === chatId);
     if (currentSession) {
@@ -2305,16 +2528,14 @@ class ChatStore {
     }
 
     if (event.type === 'context_compacted') {
-      currentAssistantMsg.steps = [
-        ...currentAssistantMsg.steps,
-        {
-          kind: 'compact',
-          id: `cmp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          beforeTokens: event.beforeTokens || 0,
-          afterTokens: event.afterTokens || 0,
-          summary: event.summary || ''
-        }
-      ];
+      currentAssistantMsg.steps.push({
+        kind: 'compact',
+        id: `cmp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        beforeTokens: event.beforeTokens || 0,
+        afterTokens: event.afterTokens || 0,
+        summary: event.summary || ''
+      });
+      this.saveLocalOnly(cid);
       return;
     }
 
@@ -2324,24 +2545,20 @@ class ChatStore {
         return;
       }
       const now = Date.now();
-      currentAssistantMsg.toolCalls = curTools.map((tc) =>
-        tc.status === 'running' || tc.status === 'pending'
-          ? { ...tc, status, finishedAt: tc.finishedAt || now, elapsedMs: tc.elapsedMs ?? (now - tc.startedAt) }
-          : tc
-      );
-      currentAssistantMsg.steps = (currentAssistantMsg.steps || []).map((s) =>
-        s.kind === 'tool' && (s.record.status === 'running' || s.record.status === 'pending')
-          ? {
-              kind: 'tool',
-              record: {
-                ...s.record,
-                status,
-                finishedAt: s.record.finishedAt || now,
-                elapsedMs: s.record.elapsedMs ?? (now - s.record.startedAt)
-              }
-            }
-          : s
-      );
+      for (const tc of curTools) {
+        if (tc.status === 'running' || tc.status === 'pending') {
+          tc.status = status;
+          tc.finishedAt = tc.finishedAt || now;
+          tc.elapsedMs = tc.elapsedMs ?? now - tc.startedAt;
+        }
+      }
+      for (const s of currentAssistantMsg.steps || []) {
+        if (s.kind === 'tool' && (s.record.status === 'running' || s.record.status === 'pending')) {
+          s.record.status = status;
+          s.record.finishedAt = s.record.finishedAt || now;
+          s.record.elapsedMs = s.record.elapsedMs ?? now - s.record.startedAt;
+        }
+      }
     };
 
     if (!this.turnSnapshotByChat[cid]) {
@@ -2393,16 +2610,13 @@ class ChatStore {
       const text = event.reasoningContent || '';
       currentAssistantMsg.reasoningContent = text;
       if (text) {
-        currentAssistantMsg.steps = [
-          ...currentAssistantMsg.steps,
-          {
-            kind: 'thought',
-            id: `th-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-            text,
-            startedAt: Date.now(),
-            finishedAt: Date.now()
-          }
-        ];
+        currentAssistantMsg.steps.push({
+          kind: 'thought',
+          id: `th-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          text,
+          startedAt: Date.now(),
+          finishedAt: Date.now()
+        });
       }
     } else if (event.type === 'tool_call_delta') {
       if (isInternalArtifactTool(event.name, event.argumentsDelta || event.arguments)) return;
@@ -2419,16 +2633,16 @@ class ChatStore {
           status: 'running',
           startedAt: Date.now()
         });
-        currentAssistantMsg.toolCalls = [...currentAssistantMsg.toolCalls, record];
-        currentAssistantMsg.steps = [...currentAssistantMsg.steps, { kind: 'tool', record }];
+        currentAssistantMsg.toolCalls.push(record);
+        currentAssistantMsg.steps.push({ kind: 'tool', record });
       }
     } else if (event.type === 'tool_call_complete' || event.type === 'tool_start') {
       if (isInternalArtifactTool(event.name, event.arguments)) return;
       this.flushSmoothBuffers(cid);
       currentAssistantMsg.statusText = undefined;
       currentAssistantMsg.retryReason = undefined;
-      const existingTool = currentAssistantMsg.toolCalls.find((c) => c.toolCallId === event.id);
-      const startedAt = existingTool?.startedAt || Date.now();
+      const existingIdx = currentAssistantMsg.toolCalls.findIndex((c) => c.toolCallId === event.id);
+      const startedAt = existingIdx >= 0 ? currentAssistantMsg.toolCalls[existingIdx].startedAt : Date.now();
       const record = formatToolExecution({
         id: event.id,
         name: event.name,
@@ -2436,90 +2650,71 @@ class ChatStore {
         status: 'running',
         startedAt
       });
-      if (existingTool) {
-        currentAssistantMsg.toolCalls = currentAssistantMsg.toolCalls.map((c) =>
-          c.toolCallId === event.id ? record : c
-        );
-        currentAssistantMsg.steps = currentAssistantMsg.steps.map((s) =>
-          s.kind === 'tool' && s.record.toolCallId === event.id ? { kind: 'tool', record } : s
-        );
+      if (existingIdx >= 0) {
+        currentAssistantMsg.toolCalls[existingIdx] = record;
+        const stepIdx = currentAssistantMsg.steps.findIndex((s) => s.kind === 'tool' && s.record.toolCallId === event.id);
+        if (stepIdx >= 0) currentAssistantMsg.steps[stepIdx] = { kind: 'tool', record };
       } else {
-        currentAssistantMsg.toolCalls = [...currentAssistantMsg.toolCalls, record];
-        currentAssistantMsg.steps = [...currentAssistantMsg.steps, { kind: 'tool', record }];
+        currentAssistantMsg.toolCalls.push(record);
+        currentAssistantMsg.steps.push({ kind: 'tool', record });
       }
-      this.scheduleStreamingSave(cid);
+      this.saveLocalOnly(cid);
     } else if (event.type === 'tool_output_delta') {
       const chunk = event.chunk || '';
       if (!chunk) return;
-      currentAssistantMsg.toolCalls = currentAssistantMsg.toolCalls.map((tc) => {
-        if (tc.toolCallId !== event.id) return tc;
-        const nextOut = (tc.output || '') + chunk;
-        return {
-          ...tc,
-          output: nextOut,
-          terminalData: tc.terminalData
-            ? { ...tc.terminalData, stdout: (tc.terminalData.stdout || '') + chunk }
-            : undefined
-        };
-      });
-      currentAssistantMsg.steps = currentAssistantMsg.steps.map((s) => {
-        if (s.kind !== 'tool' || s.record.toolCallId !== event.id) return s;
-        const nextOut = (s.record.output || '') + chunk;
-        return {
-          kind: 'tool',
-          record: {
-            ...s.record,
-            output: nextOut,
-            terminalData: s.record.terminalData
-              ? { ...s.record.terminalData, stdout: (s.record.terminalData.stdout || '') + chunk }
-              : undefined
-          }
-        };
-      });
+      const tc = currentAssistantMsg.toolCalls.find((t) => t.toolCallId === event.id);
+      if (tc) {
+        tc.output = (tc.output || '') + chunk;
+        if (tc.terminalData) {
+          tc.terminalData.stdout = (tc.terminalData.stdout || '') + chunk;
+        }
+      }
+      const st = currentAssistantMsg.steps.find((s) => s.kind === 'tool' && s.record.toolCallId === event.id);
+      if (st && st.kind === 'tool' && st.record !== tc) {
+        st.record.output = (st.record.output || '') + chunk;
+        if (st.record.terminalData) {
+          st.record.terminalData.stdout = (st.record.terminalData.stdout || '') + chunk;
+        }
+      }
     } else if (event.type === 'tool_end') {
       const now = Date.now();
       const isErr = event.success === false || Boolean(event.error);
-      currentAssistantMsg.toolCalls = currentAssistantMsg.toolCalls.map((tc) => {
-        if (tc.toolCallId !== event.id) return tc;
-        return {
-          ...tc,
-          status: isErr ? 'error' : 'success',
-          finishedAt: now,
-          elapsedMs: typeof event.elapsedMs === 'number' ? event.elapsedMs : now - tc.startedAt,
-          output: event.output,
-          error: event.error
-        };
-      });
-      currentAssistantMsg.steps = currentAssistantMsg.steps.map((s) => {
-        if (s.kind !== 'tool' || s.record.toolCallId !== event.id) return s;
-        return {
-          kind: 'tool',
-          record: {
-            ...s.record,
-            status: isErr ? 'error' : 'success',
-            finishedAt: now,
-            elapsedMs: typeof event.elapsedMs === 'number' ? event.elapsedMs : now - s.record.startedAt,
-            output: event.output,
-            error: event.error
-          }
-        };
-      });
+      const tc = currentAssistantMsg.toolCalls.find((t) => t.toolCallId === event.id);
+      if (tc) {
+        tc.status = isErr ? 'error' : 'success';
+        tc.finishedAt = now;
+        tc.elapsedMs = typeof event.elapsedMs === 'number' ? event.elapsedMs : now - tc.startedAt;
+        tc.output = event.output;
+        tc.error = event.error;
+      }
+      const st = currentAssistantMsg.steps.find((s) => s.kind === 'tool' && s.record.toolCallId === event.id);
+      if (st && st.kind === 'tool' && st.record !== tc) {
+        st.record.status = isErr ? 'error' : 'success';
+        st.record.finishedAt = now;
+        st.record.elapsedMs = typeof event.elapsedMs === 'number' ? event.elapsedMs : now - st.record.startedAt;
+        st.record.output = event.output;
+        st.record.error = event.error;
+      }
       this.turnSnapshotByChat[cid] = {
         contentLen: currentAssistantMsg.content.length,
         reasoningLen: (currentAssistantMsg.reasoningContent || '').length,
         stepsLen: (currentAssistantMsg.steps || []).length,
         toolsLen: (currentAssistantMsg.toolCalls || []).length
       };
-      this.scheduleStreamingSave(cid);
+      this.saveLocalOnly(cid);
     } else if (event.type === 'done') {
       currentAssistantMsg.imageGenerating = false;
       delete this.turnSnapshotByChat[cid];
       settleRunningTools('success');
       this.flushSmoothBuffers(cid);
-      this.streamingChats = { ...this.streamingChats, [cid]: false };
+      this.streamingChats[cid] = false;
       if (this.reasoningTimers[cid]) {
         clearInterval(this.reasoningTimers[cid]);
         delete this.reasoningTimers[cid];
+      }
+      if (this.streamSaveTimers[cid]) {
+        clearTimeout(this.streamSaveTimers[cid]);
+        delete this.streamSaveTimers[cid];
       }
       if (event.usage) {
         currentAssistantMsg.tokenUsage = {
@@ -2541,14 +2736,18 @@ class ChatStore {
           this.todosByChat[cid] = [];
         }, 3500);
       }
-      this.saveSessions(cid);
+      void this.saveSessions(cid);
     } else if (event.type === 'error') {
       currentAssistantMsg.imageGenerating = false;
       this.flushSmoothBuffers(cid);
-      this.streamingChats = { ...this.streamingChats, [cid]: false };
+      this.streamingChats[cid] = false;
       if (this.reasoningTimers[cid]) {
         clearInterval(this.reasoningTimers[cid]);
         delete this.reasoningTimers[cid];
+      }
+      if (this.streamSaveTimers[cid]) {
+        clearTimeout(this.streamSaveTimers[cid]);
+        delete this.streamSaveTimers[cid];
       }
       currentAssistantMsg.finishedAt = Date.now();
       currentAssistantMsg.statusText = undefined;
@@ -2562,7 +2761,7 @@ class ChatStore {
         s.hasError = !isCancel;
         s.isPaused = false;
       }
-      this.saveSessions(cid);
+      void this.saveSessions(cid);
     }
   }
 }

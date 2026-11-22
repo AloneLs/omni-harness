@@ -55,7 +55,7 @@ struct EventWriteItem {
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
-    event_tx: std::sync::mpsc::Sender<EventWriteItem>,
+    event_tx: std::sync::mpsc::SyncSender<EventWriteItem>,
 }
 
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
@@ -68,10 +68,10 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<(), AppError> {
         None => PathBuf::from(temp_name),
     };
     std::fs::write(&temp_path, data)?;
-    if path.exists() {
-        std::fs::remove_file(path)?;
+    if let Err(err) = std::fs::rename(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err.into());
     }
-    std::fs::rename(&temp_path, path)?;
     Ok(())
 }
 
@@ -298,7 +298,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_events_session_seq ON events (session_id, seq);",
         )?;
 
-        let (event_tx, event_rx) = std::sync::mpsc::channel::<EventWriteItem>();
+        let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<EventWriteItem>(2048);
         let writer_db_path = db_path.to_path_buf();
         std::thread::spawn(move || {
             if let Ok(wconn) = Connection::open(&writer_db_path) {
@@ -569,7 +569,7 @@ impl Database {
             payload: payload.to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
         };
-        let _ = self.event_tx.send(item);
+        let _ = self.event_tx.try_send(item);
     }
 
     pub fn list_events_since(&self, session_id: &str, last_seq: i64) -> Result<Vec<EventRecord>, AppError> {

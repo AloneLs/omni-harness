@@ -42,37 +42,51 @@ interface UpdateInfo {
 let hoverTip = $state<{ text: string; x: number; y: number } | null>(null);
 let hoverEl: HTMLElement | null = null;
 let hoverTimer: ReturnType<typeof setTimeout> | null = null;
+let hoverRafId: number | null = null;
 
 function handleGlobalMouseOver(e: MouseEvent) {
-  const el = (e.target as HTMLElement | null)?.closest?.('[title],[data-omni-tip]') as HTMLElement | null;
-  if (!el) {
+  const target = e.target as HTMLElement | null;
+  if (!target) return;
+  if (hoverEl && (target === hoverEl || hoverEl.contains(target))) return;
+  if (hoverRafId !== null) cancelAnimationFrame(hoverRafId);
+  hoverRafId = requestAnimationFrame(() => {
+    hoverRafId = null;
+    const el = target.closest?.('[data-omni-tip]') as HTMLElement | null;
+    if (!el) {
+      if (hoverTimer) {
+        clearTimeout(hoverTimer);
+        hoverTimer = null;
+      }
+      hoverTip = null;
+      hoverEl = null;
+      return;
+    }
+    const tipText = el.getAttribute('data-omni-tip') || '';
+    if (!tipText.trim()) return;
+    hoverEl = el;
     if (hoverTimer) clearTimeout(hoverTimer);
-    hoverTip = null;
-    hoverEl = null;
-    return;
-  }
-  const rawTitle = el.getAttribute('title');
-  if (rawTitle) {
-    el.setAttribute('data-omni-tip', rawTitle);
-    el.removeAttribute('title');
-  }
-  const tipText = el.getAttribute('data-omni-tip') || '';
-  if (!tipText.trim()) return;
-  if (hoverEl === el && hoverTip) return;
-  hoverEl = el;
-  if (hoverTimer) clearTimeout(hoverTimer);
-  const rect = el.getBoundingClientRect();
-  hoverTimer = setTimeout(() => {
-    const x = Math.min(Math.max(10, rect.left + rect.width / 2), window.innerWidth - 160);
-    const y = rect.top > 44 ? rect.top - 8 : rect.bottom + 8;
-    hoverTip = { text: tipText, x, y };
-  }, 320);
+    hoverTimer = setTimeout(() => {
+      hoverTimer = null;
+      if (!hoverEl || !hoverEl.isConnected) return;
+      const rect = hoverEl.getBoundingClientRect();
+      const x = Math.min(Math.max(10, rect.left + rect.width / 2), window.innerWidth - 160);
+      const y = rect.top > 44 ? rect.top - 8 : rect.bottom + 8;
+      hoverTip = { text: tipText, x, y };
+    }, 320);
+  });
 }
 
 function handleGlobalMouseOut(e: MouseEvent) {
   const rel = e.relatedTarget as HTMLElement | null;
   if (hoverEl && rel && hoverEl.contains(rel)) return;
-  if (hoverTimer) clearTimeout(hoverTimer);
+  if (hoverRafId !== null) {
+    cancelAnimationFrame(hoverRafId);
+    hoverRafId = null;
+  }
+  if (hoverTimer) {
+    clearTimeout(hoverTimer);
+    hoverTimer = null;
+  }
   hoverTip = null;
   hoverEl = null;
 }
@@ -87,9 +101,10 @@ async function handleInstallUpdate() {
   if (!updateInfo?.assetUrl || !updateInfo?.assetName || updateInstalling) return;
   updateInstalling = true;
   updateStatusText = 'Downloading...';
+  let unlisten: (() => void) | null = null;
   try {
     const { listen } = await import('@tauri-apps/api/event');
-    const unlisten = await listen<{ status?: string; percent?: number }>('update-download-progress', (ev) => {
+    unlisten = await listen<{ status?: string; percent?: number }>('update-download-progress', (ev) => {
       if (typeof ev.payload?.percent === 'number') updatePercent = ev.payload.percent;
       if (ev.payload?.status) updateStatusText = ev.payload.status;
     });
@@ -97,10 +112,11 @@ async function handleInstallUpdate() {
       assetUrl: updateInfo.assetUrl,
       assetName: updateInfo.assetName
     });
-    unlisten();
   } catch (err: any) {
     updateStatusText = err instanceof Error ? err.message : String(err);
     updateInstalling = false;
+  } finally {
+    if (unlisten) unlisten();
   }
 }
 
@@ -133,7 +149,7 @@ onMount(() => {
     invoke('window_show').catch(() => {});
     launchSpring.target = { opacity: 1, scale: 1, y: 0 };
   });
-  setTimeout(() => {
+  const updateTimer = setTimeout(() => {
     invoke<UpdateInfo>('check_github_update')
       .then((info) => {
         if (info?.hasUpdate) {
@@ -151,6 +167,9 @@ onMount(() => {
   window.addEventListener('keydown', blockAltCapture, { capture: true });
   window.addEventListener('keyup', blockAltCapture, { capture: true });
   return () => {
+    clearTimeout(updateTimer);
+    if (hoverTimer) clearTimeout(hoverTimer);
+    if (hoverRafId !== null) cancelAnimationFrame(hoverRafId);
     window.removeEventListener('keydown', blockAltCapture, { capture: true });
     window.removeEventListener('keyup', blockAltCapture, { capture: true });
   };
@@ -183,12 +202,6 @@ function toggleContractsPanel() {
   contractsPanelOpen = !contractsPanelOpen;
 }
 
-function handleDragMouseDown(e: MouseEvent) {
-  if (e.buttons !== 1) return;
-  if ((e.target as HTMLElement).closest('button')) return;
-  invoke('window_start_dragging').catch(() => {});
-}
-
 function handleMinimize() {
   invoke('window_minimize').catch(() => {});
 }
@@ -198,6 +211,8 @@ function handleToggleMaximize() {
 }
 
 function handleClose() {
+  chatStore.flushAllBeforeClose();
+  settingsStore.flushPendingSaves();
   invoke('window_close').catch(() => {});
 }
 
@@ -231,6 +246,7 @@ function handleGlobalKeydown(e: KeyboardEvent) {
     }
   }
 }
+
 let ctxMenu = $state<{
   open: boolean;
   x: number;
@@ -259,8 +275,8 @@ function handleGlobalContextMenu(e: MouseEvent) {
 }
 
 function closeCtxMenu() {
-  if (ctxMenu.open) {
-    ctxMenu = { ...ctxMenu, open: false };
+  if (ctxMenu.open || ctxMenu.targetEl) {
+    ctxMenu = { open: false, x: 0, y: 0, selectedText: '', isEditable: false, targetEl: null };
   }
 }
 
@@ -304,6 +320,7 @@ async function ctxAction(action: string) {
   } else if (action === 'open_settings') {
     settingsStore.openSettings();
   } else if (action === 'reload') {
+    chatStore.flushAllBeforeClose();
     window.location.reload();
   }
 }
@@ -455,8 +472,6 @@ $effect(() => {
       {#if themeStore.isStudioOpen}
         <ThemeStudio />
       {:else}
-
-
       <div class="flex-1 flex overflow-hidden">
         <aside class="w-52 bg-[#121214] border-r border-white/[0.06] p-2.5 overflow-y-auto shrink-0 text-xs">
           <div class="relative">
@@ -599,7 +614,6 @@ $effect(() => {
   onComplete={() => settingsStore.closeFirstRun()}
 />
 
-
 {#if ctxMenu.open}
   <div
     data-omni-context-menu=""
@@ -648,7 +662,6 @@ $effect(() => {
     </button>
   </div>
 {/if}
-
 
 {#if updateInfo?.hasUpdate && !updateDismissed}
   <div
@@ -703,7 +716,6 @@ $effect(() => {
     {/if}
   </div>
 {/if}
-
 
 {#if hoverTip}
   <div

@@ -1,4 +1,4 @@
-use crate::db::Database;
+use crate::db::{atomic_write, Database};
 use crate::error::AppError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,9 +48,17 @@ impl AppState {
 
     pub fn resolve_chat_temp_dir(chat_id: Option<&str>) -> PathBuf {
         let base = Self::resolve_chats_root_dir();
-        match chat_id {
-            Some(cid) if !cid.trim().is_empty() => base.join(cid.trim()).join("tmp"),
-            _ => base.join("_shared").join("tmp"),
+        let sanitized: String = chat_id
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(80)
+            .collect();
+        if sanitized.is_empty() {
+            base.join("_shared").join("tmp")
+        } else {
+            base.join(sanitized).join("tmp")
         }
     }
 
@@ -97,7 +105,7 @@ impl AppState {
         } else {
             let default_cfg = BootstrapConfig::default();
             let data = serde_json::to_string_pretty(&default_cfg)?;
-            std::fs::write(&bootstrap_path, data)?;
+            atomic_write(&bootstrap_path, data.as_bytes())?;
             default_cfg
         };
 
@@ -172,19 +180,27 @@ impl AppState {
         } else {
             new_dir.clone()
         };
-        std::fs::create_dir_all(&target)?;
-        let mut lock = self.workspace_dir.write().await;
-        *lock = target;
+        let target_for_fs = target.clone();
+        tokio::task::spawn_blocking(move || std::fs::create_dir_all(&target_for_fs))
+            .await
+            .map_err(|e| AppError::Execution(e.to_string()))??;
 
-        let mut b_lock = self.bootstrap.write().await;
-        b_lock.workspace_dir = if is_empty {
-            None
-        } else {
-            Some(new_dir.to_string_lossy().to_string())
+        let serialized = {
+            let mut b_lock = self.bootstrap.write().await;
+            let mut ws_lock = self.workspace_dir.write().await;
+            *ws_lock = target;
+            b_lock.workspace_dir = if is_empty {
+                None
+            } else {
+                Some(new_dir.to_string_lossy().to_string())
+            };
+            serde_json::to_string_pretty(&*b_lock)?
         };
+
         let bootstrap_path = self.data_dir.join("bootstrap.json");
-        let data = serde_json::to_string_pretty(&*b_lock)?;
-        std::fs::write(&bootstrap_path, data)?;
+        tokio::task::spawn_blocking(move || atomic_write(&bootstrap_path, serialized.as_bytes()))
+            .await
+            .map_err(|e| AppError::Execution(e.to_string()))??;
         Ok(())
     }
 
@@ -193,23 +209,37 @@ impl AppState {
         workspace_dir: Option<String>,
         default_model_id: Option<String>,
     ) -> Result<(), AppError> {
-        let mut b_lock = self.bootstrap.write().await;
-        b_lock.first_run_completed = true;
-        if let Some(ws) = workspace_dir {
-            if !ws.trim().is_empty() {
-                let p = PathBuf::from(&ws);
-                std::fs::create_dir_all(&p)?;
-                b_lock.workspace_dir = Some(ws);
-                let mut ws_lock = self.workspace_dir.write().await;
+        let parsed_ws = workspace_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| (s.to_string(), PathBuf::from(s)));
+
+        if let Some((_, ref p)) = parsed_ws {
+            let p_clone = p.clone();
+            tokio::task::spawn_blocking(move || std::fs::create_dir_all(&p_clone))
+                .await
+                .map_err(|e| AppError::Execution(e.to_string()))??;
+        }
+
+        let serialized = {
+            let mut b_lock = self.bootstrap.write().await;
+            let mut ws_lock = self.workspace_dir.write().await;
+            b_lock.first_run_completed = true;
+            if let Some((ws_str, p)) = parsed_ws {
+                b_lock.workspace_dir = Some(ws_str);
                 *ws_lock = p;
             }
-        }
-        if let Some(mid) = default_model_id {
-            b_lock.default_model_id = Some(mid);
-        }
+            if let Some(mid) = default_model_id {
+                b_lock.default_model_id = Some(mid);
+            }
+            serde_json::to_string_pretty(&*b_lock)?
+        };
+
         let bootstrap_path = self.data_dir.join("bootstrap.json");
-        let data = serde_json::to_string_pretty(&*b_lock)?;
-        std::fs::write(&bootstrap_path, data)?;
+        tokio::task::spawn_blocking(move || atomic_write(&bootstrap_path, serialized.as_bytes()))
+            .await
+            .map_err(|e| AppError::Execution(e.to_string()))??;
         Ok(())
     }
 
@@ -219,30 +249,60 @@ impl AppState {
     }
 
     pub async fn set_credential(&self, key_name: &str, secret: &str) -> Result<(), AppError> {
-        let entry_result = keyring::Entry::new(&self.keyring_service, key_name);
-        let keyring_saved = match entry_result {
-            Ok(entry) => entry.set_password(secret).is_ok(),
-            Err(_) => false,
-        };
+        let service = self.keyring_service.clone();
+        let key_owned = key_name.to_string();
+        let secret_owned = secret.to_string();
+        let keyring_saved = tokio::task::spawn_blocking(move || {
+            match keyring::Entry::new(&service, &key_owned) {
+                Ok(entry) => entry.set_password(&secret_owned).is_ok(),
+                Err(_) => false,
+            }
+        })
+        .await
+        .unwrap_or(false);
 
-        if !keyring_saved {
-            let mut lock = self.credentials_fallback.write().await;
-            lock.insert(key_name.to_string(), secret.to_string());
-            let creds_file = self.data_dir.join("credentials.json");
-            if let Ok(raw) = serde_json::to_string_pretty(&*lock) {
-                let _ = std::fs::write(creds_file, raw);
+        if keyring_saved {
+            let maybe_raw = {
+                let mut lock = self.credentials_fallback.write().await;
+                if lock.remove(key_name).is_some() {
+                    serde_json::to_string_pretty(&*lock).ok()
+                } else {
+                    None
+                }
+            };
+            if let Some(raw) = maybe_raw {
+                let creds_file = self.data_dir.join("credentials.json");
+                let _ = tokio::task::spawn_blocking(move || atomic_write(&creds_file, raw.as_bytes())).await;
             }
             return Ok(());
         }
 
+        let raw = {
+            let mut lock = self.credentials_fallback.write().await;
+            lock.insert(key_name.to_string(), secret.to_string());
+            serde_json::to_string_pretty(&*lock)?
+        };
+        let creds_file = self.data_dir.join("credentials.json");
+        tokio::task::spawn_blocking(move || atomic_write(&creds_file, raw.as_bytes()))
+            .await
+            .map_err(|e| AppError::Execution(e.to_string()))??;
         Ok(())
     }
 
     pub async fn get_credential(&self, key_name: &str) -> Result<String, AppError> {
-        if let Ok(entry) = keyring::Entry::new(&self.keyring_service, key_name) {
-            if let Ok(pwd) = entry.get_password() {
-                return Ok(pwd);
-            }
+        let service = self.keyring_service.clone();
+        let key_owned = key_name.to_string();
+        let from_keyring = tokio::task::spawn_blocking(move || {
+            keyring::Entry::new(&service, &key_owned)
+                .ok()
+                .and_then(|entry| entry.get_password().ok())
+        })
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(pwd) = from_keyring {
+            return Ok(pwd);
         }
 
         let lock = self.credentials_fallback.read().await;
@@ -254,15 +314,28 @@ impl AppState {
     }
 
     pub async fn delete_credential(&self, key_name: &str) -> Result<(), AppError> {
-        if let Ok(entry) = keyring::Entry::new(&self.keyring_service, key_name) {
-            let _ = entry.delete_password();
-        }
+        let service = self.keyring_service.clone();
+        let key_owned = key_name.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Ok(entry) = keyring::Entry::new(&service, &key_owned) {
+                let _ = entry.delete_password();
+            }
+        })
+        .await;
 
-        let mut lock = self.credentials_fallback.write().await;
-        lock.remove(key_name);
-        let creds_file = self.data_dir.join("credentials.json");
-        if let Ok(raw) = serde_json::to_string_pretty(&*lock) {
-            let _ = std::fs::write(creds_file, raw);
+        let maybe_raw = {
+            let mut lock = self.credentials_fallback.write().await;
+            if lock.remove(key_name).is_some() {
+                Some(serde_json::to_string_pretty(&*lock)?)
+            } else {
+                None
+            }
+        };
+        if let Some(raw) = maybe_raw {
+            let creds_file = self.data_dir.join("credentials.json");
+            tokio::task::spawn_blocking(move || atomic_write(&creds_file, raw.as_bytes()))
+                .await
+                .map_err(|e| AppError::Execution(e.to_string()))??;
         }
         Ok(())
     }

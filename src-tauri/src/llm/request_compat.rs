@@ -67,7 +67,11 @@ impl MessageContent {
                     match part {
                         ContentPart::Text { text } => out.push_str(text),
                         ContentPart::InputAudio { .. } => out.push_str("[audio input]"),
-                        ContentPart::ImageUrl { .. } => {}
+                        ContentPart::ImageUrl { image_url } => {
+                            if image_url.url.starts_with("data:video/") {
+                                out.push_str("[video input]");
+                            }
+                        }
                     }
                 }
                 out
@@ -116,7 +120,7 @@ impl InputAudioDetail {
     pub fn from_file(path: &str, format_hint: &str) -> Option<Self> {
         use base64::Engine;
         let bytes = std::fs::read(path).ok()?;
-        if bytes.is_empty() {
+        if bytes.is_empty() || bytes.len() > 20 * 1024 * 1024 {
             return None;
         }
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -129,6 +133,82 @@ impl InputAudioDetail {
             data: b64,
             format: if ext.is_empty() { format_hint.to_string() } else { ext },
         })
+    }
+}
+
+pub fn resize_png_bytes_if_needed(bytes: &[u8], max_dim: u32) -> Option<Vec<u8>> {
+    if bytes.len() < 8 || &bytes[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return None;
+    }
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().ok()?;
+    let info = reader.info();
+    let w = info.width;
+    let h = info.height;
+    if w <= max_dim && h <= max_dim {
+        return None;
+    }
+    let color_type = info.color_type;
+    let bit_depth = info.bit_depth;
+    if bit_depth != png::BitDepth::Eight {
+        return None;
+    }
+    let bpp = match color_type {
+        png::ColorType::Rgb => 3usize,
+        png::ColorType::Rgba => 4usize,
+        png::ColorType::Grayscale => 1usize,
+        png::ColorType::GrayscaleAlpha => 2usize,
+        _ => return None,
+    };
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let out_info = reader.next_frame(&mut buf).ok()?;
+    let src = &buf[..out_info.buffer_size()];
+
+    let scale = (w.max(h) as f64) / (max_dim as f64);
+    let nw = ((w as f64 / scale).round() as u32).max(1);
+    let nh = ((h as f64 / scale).round() as u32).max(1);
+    let mut dst = vec![0u8; (nw as usize) * (nh as usize) * bpp];
+
+    for y in 0..nh {
+        let sy = (((y as u64) * (h as u64)) / (nh as u64)).min((h - 1) as u64) as usize;
+        for x in 0..nw {
+            let sx = (((x as u64) * (w as u64)) / (nw as u64)).min((w - 1) as u64) as usize;
+            let s_off = (sy * (w as usize) + sx) * bpp;
+            let d_off = ((y as usize) * (nw as usize) + (x as usize)) * bpp;
+            if s_off + bpp <= src.len() && d_off + bpp <= dst.len() {
+                dst[d_off..d_off + bpp].copy_from_slice(&src[s_off..s_off + bpp]);
+            }
+        }
+    }
+
+    let mut out_bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out_bytes, nw, nh);
+        encoder.set_color(color_type);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(&dst).ok()?;
+    }
+    if out_bytes.len() < bytes.len() {
+        Some(out_bytes)
+    } else {
+        None
+    }
+}
+
+pub fn resize_image_data_url_if_needed(data_url: &str, max_dim: u32) -> String {
+    use base64::Engine;
+    let Some(rest) = data_url.strip_prefix("data:image/png;base64,") else {
+        return data_url.to_string();
+    };
+    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(rest) else {
+        return data_url.to_string();
+    };
+    if let Some(resized) = resize_png_bytes_if_needed(&raw, max_dim) {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&resized);
+        format!("data:image/png;base64,{}", b64)
+    } else {
+        data_url.to_string()
     }
 }
 
@@ -252,15 +332,18 @@ pub fn normalize_request(req: &mut ChatRequest, caps: &ModelCapabilities) {
                         ContentPart::Text { text } => {
                             sanitized_parts.push(ContentPart::Text { text });
                         }
-                        ContentPart::ImageUrl { .. } => {
+                        ContentPart::ImageUrl { image_url } => {
+                            let kind = if image_url.url.starts_with("data:video/") {
+                                "video"
+                            } else {
+                                "image"
+                            };
                             sanitized_parts.push(ContentPart::Text {
-                                text: "[Image omitted: model does not support vision]".to_string(),
+                                text: format!("[{} omitted: model does not support vision]", kind),
                             });
                         }
-                        ContentPart::InputAudio { .. } => {
-                            sanitized_parts.push(ContentPart::InputAudio {
-                                input_audio: InputAudioDetail { data: String::new(), format: String::new() },
-                            });
+                        ContentPart::InputAudio { input_audio } => {
+                            sanitized_parts.push(ContentPart::InputAudio { input_audio });
                         }
                     }
                 }

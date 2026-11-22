@@ -4,10 +4,47 @@ use crate::llm::request_compat::{apply_retry_action, handle_provider_error, norm
 use crate::llm::{LlmError, StreamEvent, TokenUsage};
 use futures_util::StreamExt;
 use std::collections::HashMap;
+use std::time::Duration;
+
+const STREAM_CHUNK_TIMEOUT_SECS: u64 = 90;
+const MAX_RETROACTIVE_THINK_BUFFER: usize = 8192;
+
+fn drain_valid_utf8(raw_buf: &mut Vec<u8>, out: &mut String) {
+    loop {
+        if raw_buf.is_empty() {
+            break;
+        }
+        match std::str::from_utf8(raw_buf) {
+            Ok(s) => {
+                out.push_str(s);
+                raw_buf.clear();
+                break;
+            }
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                if valid_up_to > 0 {
+                    if let Ok(valid) = std::str::from_utf8(&raw_buf[..valid_up_to]) {
+                        out.push_str(valid);
+                    }
+                    raw_buf.drain(..valid_up_to);
+                }
+                match err.error_len() {
+                    Some(invalid_len) => {
+                        out.push('\u{FFFD}');
+                        let drop_n = invalid_len.min(raw_buf.len());
+                        raw_buf.drain(..drop_n);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
 
 struct ThinkExtractor {
     in_think: bool,
     emitted_initial_content: String,
+    retroactive_disabled: bool,
     pending_prefix: String,
 }
 
@@ -16,7 +53,20 @@ impl ThinkExtractor {
         Self {
             in_think: false,
             emitted_initial_content: String::new(),
+            retroactive_disabled: false,
             pending_prefix: String::new(),
+        }
+    }
+
+    fn record_initial(&mut self, s: &str) {
+        if self.retroactive_disabled {
+            return;
+        }
+        if self.emitted_initial_content.len() + s.len() > MAX_RETROACTIVE_THINK_BUFFER {
+            self.emitted_initial_content.clear();
+            self.retroactive_disabled = true;
+        } else {
+            self.emitted_initial_content.push_str(s);
         }
     }
 
@@ -33,7 +83,7 @@ impl ThinkExtractor {
                 if let Some(pos) = text.find("<think>") {
                     let before = &text[..pos];
                     if !before.is_empty() {
-                        self.emitted_initial_content.push_str(before);
+                        self.record_initial(before);
                         sender
                             .send(StreamEvent::ContentDelta {
                                 delta: before.to_string(),
@@ -45,13 +95,12 @@ impl ThinkExtractor {
                     if !self.emitted_initial_content.is_empty() {
                         sender
                             .send(StreamEvent::RetroactiveReasoningMove {
-                                text: self.emitted_initial_content.clone(),
+                                text: std::mem::take(&mut self.emitted_initial_content),
                             })
                             .await
                             .map_err(|e| LlmError::StreamError(e.to_string()))?;
-                        self.emitted_initial_content.clear();
                     }
-
+                    self.retroactive_disabled = true;
                     self.in_think = true;
                     text = text[pos + 7..].to_string();
                 } else {
@@ -69,7 +118,7 @@ impl ThinkExtractor {
                     }
 
                     if !text.is_empty() {
-                        self.emitted_initial_content.push_str(&text);
+                        self.record_initial(&text);
                         sender
                             .send(StreamEvent::ContentDelta {
                                 delta: text.clone(),
@@ -247,33 +296,48 @@ pub async fn stream_openai_chat(
             key_pool.mark_success(provider_name, base_url, &api_key).await;
 
             let mut byte_stream = response.bytes_stream();
+            let mut raw_utf8_buf: Vec<u8> = Vec::new();
             let mut line_buffer = String::new();
             let mut think_extractor = ThinkExtractor::new();
             let mut tool_calls_map: HashMap<usize, (String, String, String)> = HashMap::new();
             let mut finish_reason: Option<String> = None;
             let mut token_usage: Option<TokenUsage> = None;
 
-            while let Some(chunk_res) = byte_stream.next().await {
-                let chunk = match chunk_res {
+            'stream_loop: loop {
+                let next_chunk = match tokio::time::timeout(
+                    Duration::from_secs(STREAM_CHUNK_TIMEOUT_SECS),
+                    byte_stream.next(),
+                )
+                .await
+                {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(_) => {
+                        return Err(LlmError::StreamError(
+                            "Stream stalled: no data received within 90s".to_string(),
+                        ))
+                    }
+                };
+                let chunk = match next_chunk {
                     Ok(c) => c,
                     Err(e) => return Err(LlmError::Network(e)),
                 };
 
-                let text = String::from_utf8_lossy(&chunk);
-                line_buffer.push_str(&text);
+                raw_utf8_buf.extend_from_slice(&chunk);
+                drain_valid_utf8(&mut raw_utf8_buf, &mut line_buffer);
 
                 while let Some(pos) = line_buffer.find('\n') {
                     let line = line_buffer[..pos].trim_end_matches('\r').to_string();
-                    line_buffer = line_buffer[pos + 1..].to_string();
+                    line_buffer.drain(..=pos);
 
                     if line.is_empty() || line.starts_with(':') {
                         continue;
                     }
 
-                    if let Some(stripped) = line.strip_prefix("data: ") {
+                    if let Some(stripped) = line.strip_prefix("data:") {
                         let data_str = stripped.trim();
                         if data_str == "[DONE]" {
-                            break;
+                            break 'stream_loop;
                         }
 
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_str) {
@@ -544,7 +608,6 @@ pub async fn stream_openai_chat(
     })
 }
 
-
 pub async fn stream_perplexity_oauth(
     client: &reqwest::Client,
     caps_registry: &CapabilityRegistry,
@@ -555,10 +618,12 @@ pub async fn stream_perplexity_oauth(
     let acc = crate::llm::oauth_accounts::acquire_valid_account(client, "perplexity_oauth", &excluded)
         .await
         .map_err(|e| LlmError::ProviderError { status: 401, message: e })?;
+    let acc_client_opt = crate::llm::oauth_accounts::client_for_account(&acc);
+    let effective_client = acc_client_opt.as_ref().unwrap_or(client);
     let pool = KeyPool::new();
     pool.set_keys("perplexity_oauth", vec![acc.access_token]);
     stream_openai_chat(
-        client,
+        effective_client,
         "https://api.perplexity.ai",
         &pool,
         "perplexity_oauth",

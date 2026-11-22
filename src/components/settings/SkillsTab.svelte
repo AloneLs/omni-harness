@@ -1,5 +1,5 @@
 <script lang="ts">
-import { flip } from 'svelte/animate';
+import { onMount } from 'svelte';
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { settingsStore } from '../../lib/stores/settings.svelte';
@@ -16,8 +16,18 @@ interface SkillItem {
 
 let skills = $state<SkillItem[]>([]);
 let searchQuery = $state<string>('');
+let debouncedQuery = $state<string>('');
+let searchTimer: ReturnType<typeof setTimeout> | null = null;
 let statusText = $state<string | null>(null);
 let confirmDeleteId = $state<string | null>(null);
+
+function handleSearchInput(e: Event) {
+  searchQuery = (e.currentTarget as HTMLInputElement).value;
+  if (searchTimer) clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    debouncedQuery = searchQuery.trim().toLowerCase();
+  }, 150);
+}
 
 async function loadSkills() {
   try {
@@ -28,38 +38,40 @@ async function loadSkills() {
           const n = String(r?.metadata?.name || r?.name || '').trim().toLowerCase();
           return n !== 'skill-creator' && !n.startsWith('system:');
         })
-        .map((r, i) => {
-        const meta = r.metadata || r;
-        const rootDir = r.root_dir || r.filePath || r.path || '';
-        const scope = rootDir.includes('.claude')
-          ? 'claude'
-          : rootDir.includes('.agents')
-            ? 'agents'
-            : 'omni';
-        return {
-          id: `${i}-${meta.name || 'unnamed'}-${rootDir}`,
-          name: meta.name || 'unnamed',
-          description: meta.description || '',
-          version: meta.version || '1.0.0',
-          scope,
-          filePath: rootDir
-        };
-      });
+        .map((r) => {
+          const meta = r.metadata || r;
+          const rootDir = r.root_dir || r.filePath || r.path || '';
+          const scope = rootDir.includes('.claude')
+            ? 'claude'
+            : rootDir.includes('.agents')
+              ? 'agents'
+              : 'omni';
+          return {
+            id: `${meta.name || 'unnamed'}-${rootDir}`,
+            name: meta.name || 'unnamed',
+            description: meta.description || '',
+            version: meta.version || '1.0.0',
+            scope,
+            filePath: rootDir
+          };
+        });
     }
   } catch (err: unknown) {
     statusText = err instanceof Error ? err.message : String(err);
   }
 }
 
-$effect(() => {
+onMount(() => {
   loadSkills();
+  return () => {
+    if (searchTimer) clearTimeout(searchTimer);
+  };
 });
 
 let filteredSkills = $derived(
   skills.filter((s) => {
-    if (!searchQuery.trim()) return true;
-    const q = searchQuery.toLowerCase();
-    return s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q);
+    if (!debouncedQuery) return true;
+    return s.name.toLowerCase().includes(debouncedQuery) || s.description.toLowerCase().includes(debouncedQuery);
   })
 );
 
@@ -139,15 +151,6 @@ async function createSkillViaChat() {
       >
         Import .zip
       </button>
-      {#if skills[0]}
-        <button
-          type="button"
-          class="h-8 px-3 rounded-[6px] bg-[#1E1E22] hover:bg-[#27272A] border border-white/[0.08] text-xs text-[#E5E5E8] active:scale-[0.97] transition-all whitespace-nowrap"
-          onclick={() => exportSkill(skills[0].name)}
-        >
-          Export
-        </button>
-      {/if}
       <button
         type="button"
         class="h-8 px-3.5 rounded-[6px] bg-[#EDEDEF] hover:bg-white text-[#111113] text-xs font-medium active:scale-[0.97] transition-all whitespace-nowrap"
@@ -165,7 +168,8 @@ async function createSkillViaChat() {
   {/if}
 
   <input
-    bind:value={searchQuery}
+    value={searchQuery}
+    oninput={handleSearchInput}
     type="text"
     placeholder="Filter skills..."
     class="w-full max-w-xs px-3 py-1.5 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] text-xs text-[#E5E5E8] placeholder-[#66666D] outline-none"
@@ -178,10 +182,7 @@ async function createSkillViaChat() {
   {:else}
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
       {#each filteredSkills as sk (sk.id)}
-        <div
-          animate:flip={{ duration: 160 }}
-          class="p-4 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] flex flex-col justify-between gap-3"
-        >
+        <div class="p-4 rounded-[6px] bg-[#1C1C1F] border border-white/[0.08] flex flex-col justify-between gap-3">
           <div class="space-y-1.5">
             <div class="flex items-center justify-between gap-2">
               <span class="font-mono text-xs font-medium text-[#EDEDEF] truncate">{sk.name}</span>
