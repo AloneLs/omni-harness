@@ -25,7 +25,7 @@ import MockHarnessPreview from './components/themes/MockHarnessPreview.svelte';
 import { themeStore, compileThemeCss } from './lib/stores/theme.svelte';
 import { settingsStore } from './lib/stores/settings.svelte';
 import { chatStore } from './lib/stores/chat.svelte';
-import { omniBridge } from './lib/runtime/omniBridge';
+import { omniBridge } from './lib/runtime/omniBridge.svelte';
 import { SPRING_LAUNCH, SPRING_PANEL, SPRING_POPUP, attachPressScale } from './lib/motion';
 
 interface UpdateInfo {
@@ -168,10 +168,8 @@ onMount(() => {
   try {
     themeStore.syncCustomRuntime();
   } catch (_) {}
-  requestAnimationFrame(() => {
-    invoke('window_show').catch(() => {});
-    launchSpring.target = { opacity: 1, scale: 1, y: 0 };
-  });
+  invoke('window_show').catch(() => {});
+  launchSpring.target = { opacity: 1, scale: 1, y: 0 };
   const updateTimer = setTimeout(() => {
     invoke<UpdateInfo>('check_github_update')
       .then((info) => {
