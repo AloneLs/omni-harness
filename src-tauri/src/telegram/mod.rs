@@ -1315,7 +1315,14 @@ async fn ensure_active_chat(
         let map = sessions.read().await;
         if let Some(sess) = map.get(&tg_chat_id) {
             if let Some(cid) = &sess.active_chat_id {
-                if ctx.app_state.db.get_chat(cid).is_ok() {
+                if let Ok(c) = ctx.app_state.db.get_chat(cid) {
+                    if (c.title == "Telegram Chat" || c.title == "Новая сессия") && initial_title.is_some() {
+                        let short = compact_text(initial_title.unwrap(), 42);
+                        if !short.is_empty() {
+                            let _ = ctx.app_state.db.update_chat_title(cid, &short);
+                            emit_chat_updated(ctx, cid).await;
+                        }
+                    }
                     return Ok(cid.clone());
                 }
             }
@@ -1353,6 +1360,62 @@ async fn ensure_active_chat(
     {
         let mut map = sessions.write().await;
         map.entry(tg_chat_id).or_default().active_chat_id = Some(chat_id.clone());
+    }
+    emit_chat_updated(ctx, &chat_id).await;
+    Ok(chat_id)
+}
+
+async fn create_new_telegram_chat(
+    ctx: &TelegramRuntimeContext,
+    providers_snap: &Arc<RwLock<ProvidersSnapshotFile>>,
+    sessions: &Arc<RwLock<HashMap<i64, TelegramChatSession>>>,
+    tg_chat_id: i64,
+) -> Result<String, String> {
+    let existing_empty = {
+        let map = sessions.read().await;
+        if let Some(sess) = map.get(&tg_chat_id) {
+            if let Some(ref cid) = sess.active_chat_id {
+                let msgs = ctx.app_state.db.list_messages(cid).unwrap_or_default();
+                if msgs.is_empty() {
+                    Some(cid.clone())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(cid) = existing_empty {
+        return Ok(cid);
+    }
+
+    let (_, model) = resolve_provider_and_model(ctx, providers_snap, sessions, tg_chat_id).await?;
+    let chat_id = uuid::Uuid::new_v4().to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let project_id = sessions
+        .read()
+        .await
+        .get(&tg_chat_id)
+        .and_then(|s| s.project_path.clone());
+    let chat = crate::db::chats::Chat {
+        id: chat_id.clone(),
+        project_id,
+        title: "Новая сессия".to_string(),
+        model_id: model.id,
+        system_prompt: String::new(),
+        is_pinned: false,
+        created_at: now.clone(),
+        updated_at: now,
+    };
+    ctx.app_state.db.create_chat(&chat).map_err(|e| e.to_string())?;
+    {
+        let mut map = sessions.write().await;
+        let entry = map.entry(tg_chat_id).or_default();
+        entry.active_chat_id = Some(chat_id.clone());
+        entry.pending_rename = false;
     }
     emit_chat_updated(ctx, &chat_id).await;
     Ok(chat_id)
@@ -1591,6 +1654,16 @@ async fn build_status_html(
     } else {
         false
     };
+    let all_active = ctx.stream_mgr.list_active_sessions().await;
+    let bg_running = all_active
+        .iter()
+        .filter(|cid| Some(cid.as_str()) != sess.active_chat_id.as_deref())
+        .count();
+    let bg_suffix = if bg_running > 0 {
+        format!("\n⚡ <i>Фоновых задач: {}</i>", bg_running)
+    } else {
+        String::new()
+    };
     let reasoning = if sess.reasoning_effort.is_empty() {
         "medium"
     } else {
@@ -1608,8 +1681,8 @@ async fn build_status_html(
     };
     let state_badge = if running { "● В работе" } else { "○ Ожидание" };
     let html = format!(
-        "<b>OmniHarness Control Center</b>\n{}\n\nСессия: {}\n{}",
-        state_badge, chat_label, model_lines
+        "<b>OmniHarness Control Center</b>\n{}{}\n\nСессия: {}\n{}",
+        state_badge, bg_suffix, chat_label, model_lines
     );
     (html, running, has_chat)
 }
@@ -1662,11 +1735,17 @@ async fn render_chats_page(
     let slice: Vec<_> = chats.into_iter().skip(start).take(CHAT_PAGE_SIZE).collect();
     let ids: Vec<String> = slice.iter().map(|c| c.id.clone()).collect();
     let token = store_choices(choices_arc, tg_chat_id, "chat", ids).await;
-    let items: Vec<(usize, String, bool)> = slice
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (i, c.title.clone(), active_id.as_deref() == Some(c.id.as_str())))
-        .collect();
+    let mut items: Vec<(usize, String, bool)> = Vec::with_capacity(slice.len());
+    for (i, c) in slice.iter().enumerate() {
+        let is_running = ctx.stream_mgr.get_session(&c.id).await.is_some();
+        let is_sel = active_id.as_deref() == Some(c.id.as_str());
+        let display_title = if is_running {
+            format!("▶ {}", c.title)
+        } else {
+            c.title.clone()
+        };
+        items.push((i, display_title, is_sel));
+    }
     let rm = serde_json::to_value(TelegramMenuBuilder::chats_menu(
         &items,
         &token,
@@ -2339,22 +2418,19 @@ async fn handle_authorized_message(
             let _ = tg_client.send_html(tg_chat_id, help_html, rm.as_ref()).await;
         }
         "/new" => {
-            {
-                let mut map = sessions.write().await;
-                let entry = map.entry(tg_chat_id).or_default();
-                entry.active_chat_id = None;
-                entry.pending_rename = false;
-            }
+            let res = create_new_telegram_chat(ctx, providers_snap, sessions, tg_chat_id).await;
             persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
-            let (html, _, _) =
+            let (html, running, has_chat) =
                 build_status_html(ctx, providers_snap, sessions, tg_chat_id).await;
-            let rm = serde_json::to_value(TelegramMenuBuilder::main_menu()).ok();
+            let rm = serde_json::to_value(TelegramMenuBuilder::session_menu(running, has_chat)).ok();
+            let note = match res {
+                Ok(_) => "<i>Новая сессия готова — отправьте сообщение, чтобы запустить задачу.</i>",
+                Err(ref e) => &format!("<i>Не удалось создать сессию: {}</i>", escape_html(e)),
+            };
             let _ = tg_client
                 .send_html(
                     tg_chat_id,
-                    &format!("{}
-
-<i>Новая сессия готова — отправьте сообщение, чтобы создать чат.</i>", html),
+                    &format!("{}\n\n{}", html, note),
                     rm.as_ref(),
                 )
                 .await;
@@ -2583,6 +2659,7 @@ async fn handle_authorized_message(
             let msg_owned = msg.clone();
             let config_owned = config_arc.clone();
             let config_path_owned = config_path_arc.clone();
+            let choices_owned = choices_arc.clone();
 
             tokio::spawn(async move {
                 run_tg_turn_draining(
@@ -2593,6 +2670,7 @@ async fn handle_authorized_message(
                     ctx_owned,
                     snap_owned,
                     sessions_owned,
+                    choices_owned,
                     config_owned,
                     config_path_owned,
                 )
@@ -2694,6 +2772,7 @@ async fn handle_callback_query(
         let sessions_owned = sessions.clone();
         let config_owned = config_arc.clone();
         let config_path_owned = config_path_arc.clone();
+        let choices_owned = choices_arc.clone();
         let item_text = item.text.clone();
         tokio::spawn(async move {
             run_tg_turn_draining(
@@ -2704,6 +2783,7 @@ async fn handle_callback_query(
                 ctx_owned,
                 snap_owned,
                 sessions_owned,
+                choices_owned,
                 config_owned,
                 config_path_owned,
             )
@@ -2726,23 +2806,20 @@ async fn handle_callback_query(
             send_or_edit(tg_client, tg_chat_id, Some(msg_id), &html, rm.as_ref()).await;
         }
         "tg:cmd:new" => {
-            {
-                let mut map = sessions.write().await;
-                let entry = map.entry(tg_chat_id).or_default();
-                entry.active_chat_id = None;
-                entry.pending_rename = false;
-            }
+            let res = create_new_telegram_chat(ctx, providers_snap, sessions, tg_chat_id).await;
             persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
-            let (html, _, _) =
+            let (html, running, has_chat) =
                 build_status_html(ctx, providers_snap, sessions, tg_chat_id).await;
-            let rm = serde_json::to_value(TelegramMenuBuilder::main_menu()).ok();
+            let rm = serde_json::to_value(TelegramMenuBuilder::session_menu(running, has_chat)).ok();
+            let note = match res {
+                Ok(_) => "<i>Новая сессия готова — отправьте сообщение, чтобы запустить задачу.</i>",
+                Err(ref e) => &format!("<i>Не удалось создать сессию: {}</i>", escape_html(e)),
+            };
             send_or_edit(
                 tg_client,
                 tg_chat_id,
                 Some(msg_id),
-                &format!("{}
-
-<i>Новая сессия готова — отправьте сообщение, чтобы создать чат.</i>", html),
+                &format!("{}\n\n{}", html, note),
                 rm.as_ref(),
             )
             .await;
@@ -3203,6 +3280,7 @@ async fn run_telegram_agent_turn(
     ctx: TelegramRuntimeContext,
     providers_snap: Arc<RwLock<ProvidersSnapshotFile>>,
     sessions: Arc<RwLock<HashMap<i64, TelegramChatSession>>>,
+    choices_arc: Arc<RwLock<HashMap<String, Vec<String>>>>,
     config_arc: Arc<RwLock<TelegramConfigFile>>,
     config_path_arc: Arc<RwLock<Option<PathBuf>>>,
 ) -> String {
@@ -3386,9 +3464,17 @@ async fn run_telegram_agent_turn(
     let typing_active = Arc::new(AtomicBool::new(true));
     let typing_flag = typing_active.clone();
     let typing_client = tg_client.clone();
+    let typing_sessions = sessions.clone();
+    let typing_chat_id = chat_id.clone();
     let typing_task = tokio::spawn(async move {
         while typing_flag.load(Ordering::SeqCst) {
-            typing_client.send_chat_action(tg_chat_id, "typing").await;
+            let is_focused = {
+                let map = typing_sessions.read().await;
+                map.get(&tg_chat_id).and_then(|s| s.active_chat_id.as_deref()) == Some(typing_chat_id.as_str())
+            };
+            if is_focused {
+                typing_client.send_chat_action(tg_chat_id, "typing").await;
+            }
             tokio::time::sleep(Duration::from_secs(4)).await;
         }
     });
@@ -3399,10 +3485,17 @@ async fn run_telegram_agent_turn(
         tg_chat_id,
         model.display_name.clone(),
     );
-    tool_stream.start().await;
+    let is_initially_focused = {
+        let map = sessions.read().await;
+        map.get(&tg_chat_id).and_then(|s| s.active_chat_id.as_deref()) == Some(chat_id.as_str())
+    };
+    if is_initially_focused {
+        tool_stream.start().await;
+    }
 
     let stream_chat_id = chat_id.clone();
     let stream_app_ev = stream_app_handle.clone();
+    let event_sessions = sessions.clone();
     let event_task = tokio::spawn(async move {
         let mut final_text = String::new();
         let mut reasoning_text = String::new();
@@ -3441,7 +3534,13 @@ async fn run_telegram_agent_turn(
                         );
                     }
                     tool_stream.on_tool_start(&id, &name, &arguments);
-                    tool_stream.maybe_flush(false).await;
+                    let is_focused = {
+                        let map = event_sessions.read().await;
+                        map.get(&tg_chat_id).and_then(|s| s.active_chat_id.as_deref()) == Some(stream_chat_id.as_str())
+                    };
+                    if is_focused {
+                        tool_stream.maybe_flush(false).await;
+                    }
                 }
                 crate::llm::StreamEvent::ToolExecEnd {
                     id,
@@ -3466,7 +3565,13 @@ async fn run_telegram_agent_turn(
                         );
                     }
                     tool_stream.on_tool_end(&id, success, elapsed_ms);
-                    tool_stream.maybe_flush(false).await;
+                    let is_focused = {
+                        let map = event_sessions.read().await;
+                        map.get(&tg_chat_id).and_then(|s| s.active_chat_id.as_deref()) == Some(stream_chat_id.as_str())
+                    };
+                    if is_focused {
+                        tool_stream.maybe_flush(false).await;
+                    }
                 }
                 crate::llm::StreamEvent::RetryNotice {
                     attempt, reason, ..
@@ -3478,7 +3583,13 @@ async fn run_telegram_agent_turn(
                         );
                     }
                     tool_stream.on_retry(attempt, &reason);
-                    tool_stream.maybe_flush(false).await;
+                    let is_focused = {
+                        let map = event_sessions.read().await;
+                        map.get(&tg_chat_id).and_then(|s| s.active_chat_id.as_deref()) == Some(stream_chat_id.as_str())
+                    };
+                    if is_focused {
+                        tool_stream.maybe_flush(false).await;
+                    }
                 }
                 crate::llm::StreamEvent::ContextCompacted {
                     before_tokens,
@@ -3502,7 +3613,13 @@ async fn run_telegram_agent_turn(
                         "📦 Контекст сжат: {} → {} токенов",
                         before_tokens, after_tokens
                     ));
-                    tool_stream.maybe_flush(false).await;
+                    let is_focused = {
+                        let map = event_sessions.read().await;
+                        map.get(&tg_chat_id).and_then(|s| s.active_chat_id.as_deref()) == Some(stream_chat_id.as_str())
+                    };
+                    if is_focused {
+                        tool_stream.maybe_flush(false).await;
+                    }
                 }
                 crate::llm::StreamEvent::GoalStatusUpdated {
                     status,
@@ -3514,7 +3631,13 @@ async fn run_telegram_agent_turn(
                         "◎ /goal {} (ход {}/{})",
                         status, turn, max_turns
                     ));
-                    tool_stream.maybe_flush(false).await;
+                    let is_focused = {
+                        let map = event_sessions.read().await;
+                        map.get(&tg_chat_id).and_then(|s| s.active_chat_id.as_deref()) == Some(stream_chat_id.as_str())
+                    };
+                    if is_focused {
+                        tool_stream.maybe_flush(false).await;
+                    }
                 }
                 crate::llm::StreamEvent::PlanApprovalRequired { plan_summary } => {
                     if !plan_summary.trim().is_empty() {
@@ -3558,7 +3681,13 @@ async fn run_telegram_agent_turn(
                 _ => {}
             }
         }
-        tool_stream.finish_and_cleanup().await;
+        let is_finally_focused = {
+            let map = event_sessions.read().await;
+            map.get(&tg_chat_id).and_then(|s| s.active_chat_id.as_deref()) == Some(stream_chat_id.as_str())
+        };
+        if is_finally_focused {
+            tool_stream.finish_and_cleanup().await;
+        }
         (final_text, reasoning_text, error_text)
     });
 
@@ -3865,23 +3994,49 @@ async fn run_telegram_agent_turn(
                 .map(|re| re.replace_all(&final_text, "").trim().to_string())
                 .unwrap_or_else(|_| final_text.clone())
         };
-        if !clean_text.trim().is_empty() {
-            let html = markdown_to_telegram_html(&clean_text);
-            let send_text = if html.trim().is_empty() { escape_html(&clean_text) } else { html };
-            if tg_client.send_html(tg_chat_id, &send_text, None).await.is_err() {
-                let _ = tg_client.send_html(tg_chat_id, &escape_html(&clean_text), None).await;
+        let is_active = {
+            let map = sessions.read().await;
+            map.get(&tg_chat_id).and_then(|s| s.active_chat_id.as_deref()) == Some(chat_id.as_str())
+        };
+        if is_active {
+            if !clean_text.trim().is_empty() {
+                let html = markdown_to_telegram_html(&clean_text);
+                let send_text = if html.trim().is_empty() { escape_html(&clean_text) } else { html };
+                if tg_client.send_html(tg_chat_id, &send_text, None).await.is_err() {
+                    let _ = tg_client.send_html(tg_chat_id, &escape_html(&clean_text), None).await;
+                }
             }
-        }
-        for (kind, src) in media_list {
-            let _ = TelegramUploadManager::enqueue_with_client(
-                tg_client.clone(),
-                tg_chat_id,
-                &chat_id,
-                &src,
-                &kind,
-                None,
-            )
-            .await;
+            for (kind, src) in media_list {
+                let _ = TelegramUploadManager::enqueue_with_client(
+                    tg_client.clone(),
+                    tg_chat_id,
+                    &chat_id,
+                    &src,
+                    &kind,
+                    None,
+                )
+                .await;
+            }
+        } else {
+            let chat_title = ctx
+                .app_state
+                .db
+                .get_chat(&chat_id)
+                .map(|c| c.title)
+                .unwrap_or_else(|_| "Сессия".to_string());
+            let preview = compact_text(&clean_text, 140);
+            let token = store_choices(&choices_arc, tg_chat_id, "chat", vec![chat_id.clone()]).await;
+            let kb = serde_json::json!({
+                "inline_keyboard": [[
+                    { "text": "💬 Открыть результат", "callback_data": format!("tg:chat:{}:0", token) }
+                ]]
+            });
+            let notif = format!(
+                "✅ <b>Фоновая сессия завершена</b>\nСессия: <b>{}</b>\n\n<i>{}</i>",
+                escape_html(&compact_text(&chat_title, 42)),
+                escape_html(&preview)
+            );
+            let _ = tg_client.send_html(tg_chat_id, &notif, Some(&kb)).await;
         }
     } else {
         let err_msg = error_text
@@ -3916,9 +4071,34 @@ async fn run_telegram_agent_turn(
             );
         }
         emit_chat_updated(&ctx, &chat_id).await;
-        let _ = tg_client
-            .send_html(tg_chat_id, &escape_html(&format_user_error(&err_msg)), None)
-            .await;
+        let is_active = {
+            let map = sessions.read().await;
+            map.get(&tg_chat_id).and_then(|s| s.active_chat_id.as_deref()) == Some(chat_id.as_str())
+        };
+        if is_active {
+            let _ = tg_client
+                .send_html(tg_chat_id, &escape_html(&format_user_error(&err_msg)), None)
+                .await;
+        } else {
+            let chat_title = ctx
+                .app_state
+                .db
+                .get_chat(&chat_id)
+                .map(|c| c.title)
+                .unwrap_or_else(|_| "Сессия".to_string());
+            let token = store_choices(&choices_arc, tg_chat_id, "chat", vec![chat_id.clone()]).await;
+            let kb = serde_json::json!({
+                "inline_keyboard": [[
+                    { "text": "💬 Открыть сессию", "callback_data": format!("tg:chat:{}:0", token) }
+                ]]
+            });
+            let notif = format!(
+                "⚠️ <b>Фоновая сессия завершена с ошибкой</b>\nСессия: <b>{}</b>\n\n<i>{}</i>",
+                escape_html(&compact_text(&chat_title, 42)),
+                escape_html(&compact_text(&err_msg, 140))
+            );
+            let _ = tg_client.send_html(tg_chat_id, &notif, Some(&kb)).await;
+        }
     }
 
     chat_id
@@ -3932,6 +4112,7 @@ async fn run_tg_turn_draining(
     ctx: TelegramRuntimeContext,
     providers_snap: Arc<RwLock<ProvidersSnapshotFile>>,
     sessions: Arc<RwLock<HashMap<i64, TelegramChatSession>>>,
+    choices_arc: Arc<RwLock<HashMap<String, Vec<String>>>>,
     config_arc: Arc<RwLock<TelegramConfigFile>>,
     config_path_arc: Arc<RwLock<Option<PathBuf>>>,
 ) {
@@ -3946,6 +4127,7 @@ async fn run_tg_turn_draining(
             ctx.clone(),
             providers_snap.clone(),
             sessions.clone(),
+            choices_arc.clone(),
             config_arc.clone(),
             config_path_arc.clone(),
         )
@@ -3958,16 +4140,22 @@ async fn run_tg_turn_draining(
         };
         let remaining = ctx.prompt_queue.list(&chat_id).await;
         emit_prompt_queue_updated(&ctx, &chat_id, &remaining).await;
-        let _ = tg_client
-            .send_html(
-                tg_chat_id,
-                &format!(
-                    "▶️ <b>Запускаю следующую задачу из очереди</b>\n\n<code>{}</code>",
-                    escape_html(item.text.chars().take(200).collect::<String>().trim())
-                ),
-                None,
-            )
-            .await;
+        let is_active = {
+            let map = sessions.read().await;
+            map.get(&tg_chat_id).and_then(|s| s.active_chat_id.as_deref()) == Some(chat_id.as_str())
+        };
+        if is_active {
+            let _ = tg_client
+                .send_html(
+                    tg_chat_id,
+                    &format!(
+                        "▶️ <b>Запускаю следующую задачу из очереди</b>\n\n<code>{}</code>",
+                        escape_html(item.text.chars().take(200).collect::<String>().trim())
+                    ),
+                    None,
+                )
+                .await;
+        }
         next_msg = json!({ "message_id": item.tg_message_id.unwrap_or(0) });
         next_text = item.text;
     }
