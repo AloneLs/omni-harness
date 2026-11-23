@@ -58,6 +58,10 @@ impl TelegramMenuBuilder {
                 InlineKeyboardButton::callback("🛑 Остановить", "tg:cmd:stop"),
                 InlineKeyboardButton::callback("🔄 Обновить", "tg:cmd:status"),
             ]);
+            rows.push(vec![
+                InlineKeyboardButton::callback("⚡ Новая сессия", "tg:cmd:new"),
+                InlineKeyboardButton::callback("💬 Все сессии", "tg:cmd:chats"),
+            ]);
         } else {
             rows.push(vec![
                 InlineKeyboardButton::callback("⚡ Новая сессия", "tg:cmd:new"),

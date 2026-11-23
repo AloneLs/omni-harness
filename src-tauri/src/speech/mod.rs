@@ -220,6 +220,68 @@ impl SpeechEngine {
         Ok(())
     }
 
+    pub async fn ensure_whisper_cli(&self) -> Result<PathBuf, String> {
+        let whisper_exe = self.models_dir.join("whisper.exe");
+        if whisper_exe.is_file() {
+            return Ok(whisper_exe);
+        }
+
+        let zip_url = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.9.2/whisper-bin-x64.zip";
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(90))
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .build()
+            .map_err(|e| format!("Failed to create client: {}", e))?;
+
+        let resp = client
+            .get(zip_url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to download whisper CLI binaries: {}", e))?;
+
+        if !resp.status().is_success() {
+            return Err(format!("Whisper CLI download returned HTTP {}", resp.status()));
+        }
+
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| format!("Failed to read whisper CLI bytes: {}", e))?;
+
+        let reader = std::io::Cursor::new(bytes);
+        let mut archive = zip::ZipArchive::new(reader)
+            .map_err(|e| format!("Failed to open whisper binary zip: {}", e))?;
+
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).map_err(|e| e.to_string())?;
+            let name = match file.enclosed_name() {
+                Some(p) => p.file_name().map(|f| f.to_os_string()),
+                None => continue,
+            };
+            if let Some(file_name) = name {
+                let out_path = self.models_dir.join(file_name);
+                let mut out_file = std::fs::File::create(&out_path)
+                    .map_err(|e| format!("Failed to create file {:?}: {}", out_path, e))?;
+                std::io::copy(&mut file, &mut out_file)
+                    .map_err(|e| format!("Failed to extract file {:?}: {}", out_path, e))?;
+            }
+        }
+
+        let cli_exe = self.models_dir.join("whisper-cli.exe");
+        let main_exe = self.models_dir.join("main.exe");
+        if cli_exe.is_file() {
+            let _ = std::fs::copy(&cli_exe, &whisper_exe);
+        } else if main_exe.is_file() {
+            let _ = std::fs::copy(&main_exe, &whisper_exe);
+        }
+
+        if whisper_exe.is_file() {
+            Ok(whisper_exe)
+        } else {
+            Err("whisper.exe was not found in extracted archive".to_string())
+        }
+    }
+
     pub async fn download_model(
         &self,
         model_id: &str,
@@ -664,6 +726,7 @@ impl SpeechEngine {
 
         let whisper_exe = self.models_dir.join("whisper.exe");
         if let Some(model_path) = self.resolve_model_path(preferred_model) {
+            let _ = self.ensure_whisper_cli().await;
             if whisper_exe.exists() {
                 let base = std::env::temp_dir().join(format!("whisper_in_{}", uuid::Uuid::new_v4()));
                 let temp_wav = base.with_extension("wav");
@@ -676,10 +739,14 @@ impl SpeechEngine {
                 std_cmd.arg("-f").arg(&temp_wav);
                 std_cmd.arg("-oj");
                 std_cmd.arg("-of").arg(&base);
+                std_cmd.arg("-l").arg("auto");
 
                 let accel = *self.acceleration.read().await;
                 if accel == AccelerationMode::Cpu {
-                    std_cmd.arg("-t").arg("4");
+                    let threads = std::thread::available_parallelism()
+                        .map(|n| n.get().min(8).to_string())
+                        .unwrap_or_else(|_| "4".to_string());
+                    std_cmd.arg("-t").arg(&threads);
                 }
 
                 let output = tokio::process::Command::from(std_cmd)
