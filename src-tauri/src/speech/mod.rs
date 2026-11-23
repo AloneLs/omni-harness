@@ -4,6 +4,7 @@ use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 
@@ -239,18 +240,50 @@ impl SpeechEngine {
             return Ok(dest_path);
         }
 
+        let part_path = self.models_dir.join(format!("{}.part", target.filename));
+
+        // Check if existing .part file is already fully downloaded
+        if let Ok(meta) = std::fs::metadata(&part_path) {
+            if meta.len() >= target.size_bytes.saturating_sub(1024 * 1024) && meta.len() > 10_000_000 {
+                let _ = tokio::fs::rename(&part_path, &dest_path).await;
+                if Self::is_valid_weight_file(&dest_path) {
+                    return Ok(dest_path);
+                }
+            }
+        }
+
         self.is_downloading.store(true, Ordering::SeqCst);
         let total_hint = target.size_bytes;
         if let Ok(mut g) = self.active_download.write() {
             *g = Some(ActiveWhisperDownload {
                 model_id: model_id.to_string(),
-                downloaded_bytes: 0,
+                downloaded_bytes: std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0),
                 total_bytes: total_hint,
                 percent: 0,
             });
         }
 
-        let mut builder = reqwest::Client::builder();
+        struct DownloadGuard {
+            is_dl: Arc<AtomicBool>,
+            active: Arc<std::sync::RwLock<Option<ActiveWhisperDownload>>>,
+        }
+        impl Drop for DownloadGuard {
+            fn drop(&mut self) {
+                self.is_dl.store(false, Ordering::SeqCst);
+                if let Ok(mut g) = self.active.write() {
+                    *g = None;
+                }
+            }
+        }
+        let _guard = DownloadGuard {
+            is_dl: self.is_downloading.clone(),
+            active: self.active_download.clone(),
+        };
+
+        let mut builder = reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+            .connect_timeout(Duration::from_secs(25))
+            .tcp_keepalive(Duration::from_secs(15));
         if let Some(sys_proxy) = crate::resolve_windows_system_proxy() {
             if let Ok(px) = reqwest::Proxy::all(&sys_proxy) {
                 builder = builder.proxy(px);
@@ -258,77 +291,171 @@ impl SpeechEngine {
         }
         let client = builder.build().unwrap_or_else(|_| reqwest::Client::new());
 
-        let resp = match client.get(&target.download_url).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                self.is_downloading.store(false, Ordering::SeqCst);
-                if let Ok(mut g) = self.active_download.write() { *g = None; }
-                return Err(format!("Download failed: {}", e));
-            }
+        let primary_url = target.download_url.clone();
+        let mirror_url = if primary_url.contains("huggingface.co") {
+            primary_url.replace("https://huggingface.co/", "https://hf-mirror.com/")
+        } else {
+            primary_url.clone()
         };
 
-        if !resp.status().is_success() {
-            self.is_downloading.store(false, Ordering::SeqCst);
-            if let Ok(mut g) = self.active_download.write() { *g = None; }
-            return Err(format!("HTTP error downloading model: {}", resp.status()));
-        }
+        let max_retries = 8usize;
+        let mut last_error = String::new();
 
-        let total_size = resp.content_length().unwrap_or(target.size_bytes);
-        let part_path = self.models_dir.join(format!("{}.part", target.filename));
+        for attempt in 0..max_retries {
+            let active_url = if attempt >= 2 && mirror_url != primary_url {
+                &mirror_url
+            } else {
+                &primary_url
+            };
 
-        let mut file = match tokio::fs::File::create(&part_path).await {
-            Ok(f) => f,
-            Err(e) => {
-                self.is_downloading.store(false, Ordering::SeqCst);
-                if let Ok(mut g) = self.active_download.write() { *g = None; }
-                return Err(format!("Failed to create model file: {}", e));
+            let mut existing_bytes = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+            if existing_bytes >= target.size_bytes && target.size_bytes > 0 {
+                let _ = tokio::fs::rename(&part_path, &dest_path).await;
+                if Self::is_valid_weight_file(&dest_path) {
+                    return Ok(dest_path);
+                }
             }
-        };
 
-        let mut stream = resp.bytes_stream();
-        let mut downloaded = 0u64;
+            let mut req = client.get(active_url);
+            if existing_bytes > 0 {
+                req = req.header("Range", format!("bytes={}-", existing_bytes));
+            }
 
-        while let Some(chunk_res) = stream.next().await {
-            match chunk_res {
-                Ok(chunk) => {
-                    if let Err(e) = file.write_all(&chunk).await {
-                        self.is_downloading.store(false, Ordering::SeqCst);
-                        if let Ok(mut g) = self.active_download.write() { *g = None; }
-                        return Err(format!("Failed to write chunk: {}", e));
+            let resp = match req.send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last_error = format!("Network connect error (attempt {}): {}", attempt + 1, e);
+                    let backoff = (attempt as u64 + 1) * 1500;
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            if status == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+                if existing_bytes >= target.size_bytes.saturating_sub(1024 * 1024) && existing_bytes > 10_000_000 {
+                    let _ = tokio::fs::rename(&part_path, &dest_path).await;
+                    if Self::is_valid_weight_file(&dest_path) {
+                        return Ok(dest_path);
                     }
-                    downloaded += chunk.len() as u64;
-                    let pct = if total_size > 0 { ((downloaded as f64 / total_size as f64) * 100.0).round() as u32 } else { 0 };
-                    if let Ok(mut g) = self.active_download.write() {
-                        if let Some(ref mut ad) = *g {
-                            ad.downloaded_bytes = downloaded;
-                            ad.total_bytes = total_size;
-                            ad.percent = pct.min(100);
+                }
+                let _ = tokio::fs::remove_file(&part_path).await;
+                existing_bytes = 0;
+                continue;
+            }
+
+            if !status.is_success() {
+                last_error = format!("HTTP {} from {} (attempt {})", status, active_url, attempt + 1);
+                let backoff = (attempt as u64 + 1) * 2000;
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
+                continue;
+            }
+
+            let is_partial = status == reqwest::StatusCode::PARTIAL_CONTENT;
+            let total_size = if is_partial {
+                resp.content_length().map(|cl| cl + existing_bytes).unwrap_or(target.size_bytes)
+            } else {
+                resp.content_length().unwrap_or(target.size_bytes)
+            };
+
+            let mut file = match if is_partial && existing_bytes > 0 {
+                tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&part_path)
+                    .await
+            } else {
+                existing_bytes = 0;
+                tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&part_path)
+                    .await
+            } {
+                Ok(f) => f,
+                Err(e) => {
+                    last_error = format!("Failed to open part file: {}", e);
+                    let backoff = (attempt as u64 + 1) * 1500;
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                    continue;
+                }
+            };
+
+            let mut stream = resp.bytes_stream();
+            let mut downloaded = existing_bytes;
+            let mut stream_interrupted = false;
+
+            loop {
+                let chunk_step = tokio::time::timeout(Duration::from_secs(30), stream.next()).await;
+                match chunk_step {
+                    Ok(Some(Ok(chunk))) => {
+                        if let Err(e) = file.write_all(&chunk).await {
+                            last_error = format!("Failed to write chunk: {}", e);
+                            stream_interrupted = true;
+                            break;
+                        }
+                        downloaded += chunk.len() as u64;
+                        let pct = if total_size > 0 {
+                            ((downloaded as f64 / total_size as f64) * 100.0).round() as u32
+                        } else {
+                            0
+                        };
+                        if let Ok(mut g) = self.active_download.write() {
+                            if let Some(ref mut ad) = *g {
+                                ad.downloaded_bytes = downloaded;
+                                ad.total_bytes = total_size;
+                                ad.percent = pct.min(100);
+                            }
+                        }
+                        if let Some(tx) = &progress_tx {
+                            let _ = tx.send((downloaded, total_size)).await;
                         }
                     }
-                    if let Some(tx) = &progress_tx {
-                        let _ = tx.send((downloaded, total_size)).await;
+                    Ok(Some(Err(e))) => {
+                        last_error = format!("Stream read error: {}", e);
+                        stream_interrupted = true;
+                        break;
+                    }
+                    Ok(None) => {
+                        // Stream completed
+                        break;
+                    }
+                    Err(_) => {
+                        // Chunk 30s timeout
+                        last_error = "Download stream stalled (30s timeout on chunk)".to_string();
+                        stream_interrupted = true;
+                        break;
                     }
                 }
-                Err(e) => {
-                    self.is_downloading.store(false, Ordering::SeqCst);
-                    if let Ok(mut g) = self.active_download.write() { *g = None; }
-                    return Err(format!("Stream error during model download: {}", e));
+            }
+
+            let _ = file.flush().await;
+            drop(file);
+
+            if !stream_interrupted {
+                let final_len = std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0);
+                if final_len >= target.size_bytes.saturating_sub(1024 * 1024) && final_len > 10_000_000 {
+                    if let Err(e) = tokio::fs::rename(&part_path, &dest_path).await {
+                        return Err(format!("Failed to finalize model file: {}", e));
+                    }
+                    return Ok(dest_path);
+                } else if total_size > 0 && final_len < total_size {
+                    // Incomplete stream without explicit error, loop will resume with Range
+                    let backoff = (attempt as u64 + 1) * 1000;
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                    continue;
+                } else {
+                    let _ = tokio::fs::rename(&part_path, &dest_path).await;
+                    return Ok(dest_path);
                 }
+            } else {
+                let backoff = (attempt as u64 + 1) * 2000;
+                tokio::time::sleep(Duration::from_millis(backoff)).await;
             }
         }
 
-        let _ = file.flush().await;
-        drop(file);
-
-        if let Err(e) = tokio::fs::rename(&part_path, &dest_path).await {
-            self.is_downloading.store(false, Ordering::SeqCst);
-            if let Ok(mut g) = self.active_download.write() { *g = None; }
-            return Err(format!("Failed to finalize model file: {}", e));
-        }
-
-        self.is_downloading.store(false, Ordering::SeqCst);
-        if let Ok(mut g) = self.active_download.write() { *g = None; }
-        Ok(dest_path)
+        Err(format!("Whisper model download failed after {} attempts. Last error: {}", max_retries, last_error))
     }
 
     pub fn parse_wav_samples(wav_bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {

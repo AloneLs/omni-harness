@@ -42,7 +42,6 @@ impl TelegramClient {
         }
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(60))
             .tcp_keepalive(Duration::from_secs(15))
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(8);
@@ -97,7 +96,7 @@ impl TelegramClient {
         let req_timeout = if method == "getUpdates" {
             Duration::from_secs(40)
         } else {
-            Duration::from_secs(15)
+            Duration::from_secs(30)
         };
         let mut last_err: Option<TelegramApiError> = None;
 
@@ -358,7 +357,7 @@ impl TelegramClient {
         let resp = self
             .http
             .get(&url)
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_secs(300))
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -413,27 +412,54 @@ impl TelegramClient {
             .and_then(|n| n.to_str())
             .unwrap_or("attachment")
             .to_string();
-        let part = reqwest::multipart::Part::bytes(bytes).file_name(fname);
-        let mut form = reqwest::multipart::Form::new()
-            .text("chat_id", chat_id.to_string())
-            .part(field.to_string(), part);
-        if let Some(cap) = caption.filter(|c| !c.trim().is_empty()) {
-            form = form.text("caption", cap.to_string());
+
+        let max_allowed = if field == "photo" { 20 * 1024 * 1024 } else { 50 * 1024 * 1024 };
+        if bytes.len() > max_allowed {
+            return Err(format!(
+                "Размер файла '{}' ({:.1} МБ) превыш��ет лимит Telegram Bot API ({} МБ).",
+                fname,
+                bytes.len() as f64 / (1024.0 * 1024.0),
+                max_allowed / (1024 * 1024)
+            ));
         }
-        let url = format!("{}/{}", self.base_url, method);
-        let resp = self
-            .http
-            .post(&url)
-            .multipart(form)
-            .timeout(Duration::from_secs(300))
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        if !resp.status().is_success() {
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(format!("Telegram {} failed: {}", method, txt));
+
+        let mut last_err = String::new();
+        for attempt in 0..3 {
+            let part = reqwest::multipart::Part::bytes(bytes.clone()).file_name(fname.clone());
+            let mut form = reqwest::multipart::Form::new()
+                .text("chat_id", chat_id.to_string())
+                .part(field.to_string(), part);
+            if let Some(cap) = caption.filter(|c| !c.trim().is_empty()) {
+                form = form.text("caption", cap.to_string());
+            }
+            let url = format!("{}/{}", self.base_url, method);
+            let resp = self
+                .http
+                .post(&url)
+                .multipart(form)
+                .timeout(Duration::from_secs(600))
+                .send()
+                .await;
+
+            match resp {
+                Ok(r) => {
+                    if r.status().is_success() {
+                        return Ok(());
+                    }
+                    let txt = r.text().await.unwrap_or_default();
+                    last_err = format!("Telegram {} error: {}", method, txt);
+                    if txt.contains("can't parse") || txt.contains("file is too big") || txt.contains("Bad Request") {
+                        return Err(last_err);
+                    }
+                }
+                Err(e) => {
+                    last_err = format!("Telegram {} network error (attempt {}): {}", method, attempt + 1, e);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1500 * (attempt as u64 + 1))).await;
         }
-        Ok(())
+
+        Err(last_err)
     }
 
     pub async fn send_media(

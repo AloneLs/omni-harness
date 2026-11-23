@@ -1601,7 +1601,36 @@ Complete all remaining items and mark each one as completed via task_board(actio
                             let elapsed_ms = started.elapsed().as_millis() as u64;
                             (idx, tc_id, tc_name, elapsed_ms, ok, out_str, err_opt, ws)
                         } else {
-                            let exec_result = td.dispatch_tool(&tc_name, &parsed_args, None, Some(&cid)).await;
+                            let tool_timeout_secs = match tc_name.as_str() {
+                                "wait" => {
+                                    let secs = parsed_args.get("seconds").and_then(|v| v.as_u64()).unwrap_or(60);
+                                    secs + 30
+                                }
+                                "agent" => 600,
+                                "generate_image" => 240,
+                                "tg_send_file" => 300,
+                                "code_intel" | "web_research" => 120,
+                                "computer_use" | "multi_actions" => 240,
+                                _ => 180,
+                            };
+                            let exec_result = match tokio::time::timeout(
+                                std::time::Duration::from_secs(tool_timeout_secs),
+                                td.dispatch_tool(&tc_name, &parsed_args, None, Some(&cid)),
+                            )
+                            .await
+                            {
+                                Ok(res) => res,
+                                Err(_) => crate::tools::ToolExecutionResult {
+                                    tool_name: tc_name.clone(),
+                                    success: false,
+                                    output: serde_json::json!({
+                                        "timed_out": true,
+                                        "error": format!("Tool '{}' timed out after {}s", tc_name, tool_timeout_secs)
+                                    }),
+                                    error: Some(format!("Tool '{}' timed out after {}s", tc_name, tool_timeout_secs)),
+                                    elapsed_ms: (tool_timeout_secs * 1000) as u128,
+                                },
+                            };
                             let elapsed_ms = started.elapsed().as_millis() as u64;
                             let raw_output = if exec_result.success {
                                 serde_json::to_string(&exec_result.output).unwrap_or_else(|_| "{}".to_string())
@@ -1969,6 +1998,18 @@ Complete all remaining items and mark each one as completed via task_board(actio
                 }
 
                 let tool_started = std::time::Instant::now();
+                let tool_timeout_secs = match tool_name.as_str() {
+                    "wait" => {
+                        let secs = parsed_args.get("seconds").and_then(|v| v.as_u64()).unwrap_or(60);
+                        secs + 30
+                    }
+                    "agent" => 600,
+                    "generate_image" => 240,
+                    "tg_send_file" => 300,
+                    "code_intel" | "web_research" => 120,
+                    "computer_use" | "multi_actions" => 240,
+                    _ => 180,
+                };
                 let exec_result = tokio::select! {
                     biased;
                     _ = session.cancelled() => {
@@ -1980,16 +2021,16 @@ Complete all remaining items and mark each one as completed via task_board(actio
                         return Err("User canceled execution".to_string());
                     }
                     timed = tokio::time::timeout(
-                        std::time::Duration::from_secs(if tool_name == "code_intel" || tool_name == "web_research" { 60 } else { 45 }),
+                        std::time::Duration::from_secs(tool_timeout_secs),
                         tools.dispatch_tool(tool_name, &parsed_args, conn, Some(chat_id)),
                     ) => match timed {
                     Ok(res) => res,
                     Err(_) => crate::tools::ToolExecutionResult {
                         tool_name: tool_name.clone(),
                         success: false,
-                        output: serde_json::json!({ "timed_out": true, "error": format!("Tool '{}' timed out", tool_name) }),
-                        error: Some(format!("Tool '{}' timed out", tool_name)),
-                        elapsed_ms: 45_000,
+                        output: serde_json::json!({ "timed_out": true, "error": format!("Tool '{}' timed out after {}s", tool_name, tool_timeout_secs) }),
+                        error: Some(format!("Tool '{}' timed out after {}s", tool_name, tool_timeout_secs)),
+                        elapsed_ms: (tool_timeout_secs * 1000) as u128,
                     },
                     }
                 };

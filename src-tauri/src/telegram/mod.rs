@@ -159,7 +159,13 @@ impl TelegramUploadManager {
                     }
                     Err(e) => {
                         g.info.status = "failed".to_string();
-                        g.info.error = Some(e);
+                        g.info.error = Some(e.clone());
+                        let display_name = std::path::Path::new(&path_owned)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(&path_owned);
+                        let warn = format!("⚠️ Не удалось отправить файл <code>{}</code>: {}", crate::telegram::formatting::escape_html(display_name), crate::telegram::formatting::escape_html(&e));
+                        let _ = client.send_html(tg_chat_id, &warn, None).await;
                     }
                 }
             }
