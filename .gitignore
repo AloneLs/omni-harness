@@ -61,6 +61,7 @@ providers_snapshot.json
 workspaces_snapshot.json
 telegram_config.json
 bootstrap.json
+bun.lock
 
 # --- Local Environment & Secrets ---
 .env
