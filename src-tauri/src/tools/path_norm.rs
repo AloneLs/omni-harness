@@ -276,15 +276,6 @@ pub fn validate_path_with_base(
     let base = working_dir.or_else(|| allowed_roots.first().map(|p| p.as_path()));
     let resolved = resolve_against_base(path_str, base)?;
     if allowed_roots.is_empty() {
-        if let Some(wd) = working_dir.filter(|p| !p.as_os_str().is_empty()) {
-            if is_within_root(&resolved, wd) {
-                return Ok(resolved);
-            }
-            return Err(format!(
-                "Access denied: path '{}' resolves outside working directory.",
-                path_str
-            ));
-        }
         return Ok(resolved);
     }
     for root in allowed_roots {
@@ -308,6 +299,9 @@ pub fn validate_read_path_with_base(
     }
     let base = working_dir.or_else(|| allowed_roots.first().map(|p| p.as_path()));
     let resolved = resolve_against_base(path_str, base)?;
+    if allowed_roots.is_empty() {
+        return Ok(resolved);
+    }
     for root in allowed_roots {
         let norm_root = canonicalize_best_effort(root).unwrap_or_else(|_| lexical_clean(root));
         if is_within_root(&norm_root, &resolved) && path_key(&resolved).len() > 3 {

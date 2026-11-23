@@ -320,20 +320,20 @@ impl ToolDispatcher {
 
         declarations.push(make_decl(
             "read_file",
-            "Read text file window (default 350 lines with L-numbers), image (base64 for vision), or PDF. Always prefer this over cat/head/tail in terminal_exec. Records file hash for edit safety.",
+            "Read text file window (default 350 lines with L-numbers), image (base64 for vision), or PDF. Always prefer this over cat/head/tail in terminal_exec. Records file hash for edit safety. Supports relative or absolute paths (full PC access).",
             &[
-                ("path", "string", "File path"),
+                ("path", "string", "File path (relative to workspace or absolute)"),
                 ("offset", "integer", "0-based starting line index"),
-                ("limit", "integer", "Max lines to return (default 350, max 400)"),
+                ("limit", "integer", "Max lines to return (default 350, max 2000)"),
             ],
             &["path"],
         ));
 
         declarations.push(make_decl(
             "edit_file",
-            "Exact search-and-replace edits [{old_text, new_text}] (never use sed/awk). Requires prior read_file; provide enough unique context in old_text so it matches unambiguously.",
+            "Exact search-and-replace edits [{old_text, new_text}] (never use sed/awk). Requires prior read_file; provide enough unique context in old_text so it matches unambiguously. Supports relative or absolute paths (full PC access).",
             &[
-                ("path", "string", "Target file path"),
+                ("path", "string", "Target file path (relative to workspace or absolute)"),
                 ("edits", "array", "Array of {old_text, new_text} objects"),
                 ("replace_all", "boolean", "Replace all occurrences of old_text"),
             ],
@@ -342,9 +342,9 @@ impl ToolDispatcher {
 
         declarations.push(make_decl(
             "write_file",
-            "Atomically create a new file (creating parent dirs) or overwrite an existing file (requires prior read_file).",
+            "Atomically create a new file (creating parent dirs) or overwrite an existing file (requires prior read_file). Supports relative or absolute paths (full PC access).",
             &[
-                ("path", "string", "Target file path"),
+                ("path", "string", "Target file path (relative to workspace or absolute)"),
                 ("content", "string", "Full file content"),
                 ("overwrite", "boolean", "Allow overwriting existing file (default true)"),
             ],
@@ -400,21 +400,21 @@ impl ToolDispatcher {
 
         declarations.push(make_decl(
             "fs_ops",
-            "Safe filesystem operations without shell: move, copy, mkdir, or delete (moves to OmniHarness AppData trash).",
+            "Safe filesystem operations without shell: move, copy, mkdir, or delete (moves to OmniHarness AppData trash). Supports relative or absolute paths.",
             &[
                 ("action", "string", "move | copy | mkdir | delete"),
-                ("path", "string", "Target path"),
-                ("dest", "string", "Destination path for move/copy"),
+                ("path", "string", "Target path (relative or absolute)"),
+                ("dest", "string", "Destination path for move/copy (relative or absolute)"),
             ],
             &["action", "path"],
         ));
 
         declarations.push(make_decl(
             "glob",
-            "Fast pattern file search (**/*.svelte, src/**/auth*) ignoring .git/node_modules/target, sorted by newest mtime first. Always prefer over find/ls in terminal_exec.",
+            "Fast pattern file search (**/*.svelte, src/**/auth*) ignoring .git/node_modules/target, sorted by newest mtime first. Always prefer over find/ls in terminal_exec. Supports relative or absolute root directory.",
             &[
                 ("pattern", "string", "Glob pattern"),
-                ("path", "string", "Root directory (optional)"),
+                ("path", "string", "Root directory (optional, relative or absolute)"),
                 ("limit", "integer", "Max results (default 100)"),
             ],
             &["pattern"],
@@ -422,10 +422,10 @@ impl ToolDispatcher {
 
         declarations.push(make_decl(
             "grep",
-            "Fast regex code search across workspace with +-2 context lines. Always prefer over grep/rg in terminal_exec.",
+            "Fast regex code search across workspace with +-2 context lines. Always prefer over grep/rg in terminal_exec. Supports relative or absolute root directory.",
             &[
                 ("pattern", "string", "Regex pattern"),
-                ("path", "string", "Root directory (optional)"),
+                ("path", "string", "Root directory (optional, relative or absolute)"),
                 ("file_type", "string", "Filter by extension e.g. rs, svelte, ts"),
                 ("context_lines", "integer", "Context lines around match (default 2)"),
             ],

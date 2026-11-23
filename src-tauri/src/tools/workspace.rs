@@ -978,7 +978,7 @@ pub fn read_file_smart(
     let all_lines: Vec<&str> = text.lines().collect();
     let total_lines = all_lines.len();
     let start = offset.unwrap_or(0);
-    let count = limit.unwrap_or(350).min(400);
+    let count = limit.unwrap_or(350).min(2000);
 
     if total_lines > 0 && start >= total_lines {
         return Ok(serde_json::json!({
@@ -994,7 +994,7 @@ pub fn read_file_smart(
     let mut selected: Vec<String> = Vec::new();
     let mut line_chars_truncated = false;
     let mut total_chars = 0usize;
-    let max_body_chars = 20_000usize;
+    let max_body_chars = 80_000usize;
     let max_line_chars = 8_000usize;
 
     for (i, line) in all_lines.into_iter().skip(start).take(count).enumerate() {
