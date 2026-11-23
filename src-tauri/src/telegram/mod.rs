@@ -2012,7 +2012,7 @@ async fn build_tg_user_msg(
                         Ok(bytes) => {
                             match ctx
                                 .speech_engine
-                                .transcribe_audio(&bytes, fallback_key.as_deref(), None)
+                                .transcribe_audio(&bytes, fallback_key.as_deref(), None, None)
                                 .await
                             {
                                 Ok(res) if !res.text.trim().is_empty() => notes.push(format!(

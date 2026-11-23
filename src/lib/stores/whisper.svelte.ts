@@ -37,6 +37,10 @@ class WhisperStore {
   statusError = $state<string | null>(null);
   justInstalledId = $state<string | null>(null);
 
+  get hasAnyInstalled(): boolean {
+    return this.models.some((m) => m.status === 'installed');
+  }
+
   private speedTracker: Record<string, { lastBytes: number; lastTs: number; speedMb: number }> = {};
   private listenersInitialized = false;
 
@@ -48,6 +52,10 @@ class WhisperStore {
   private initGlobalListeners() {
     if (this.listenersInitialized || typeof window === 'undefined') return;
     this.listenersInitialized = true;
+
+    window.addEventListener('focus', () => {
+      this.refresh();
+    });
 
     listen<{ modelId: string; downloaded: number; total: number; percent: number }>(
       'whisper-download-progress',
@@ -151,6 +159,7 @@ class WhisperStore {
             downloadSpeed: undefined
           };
         });
+        window.dispatchEvent(new CustomEvent('omni-whisper-updated'));
       }
     } catch (err: any) {
       this.statusError = String(err || 'Failed to read Whisper status');

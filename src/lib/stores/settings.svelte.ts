@@ -246,6 +246,7 @@ export interface AppSettings {
   streamReasoning: boolean;
   systemPrompt: string;
   whisperModel: string;
+  whisperLanguage: string;
   audioInputDevice: string;
   telegramBotToken: string;
   telegramPairingCode: string;
@@ -266,6 +267,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   streamReasoning: true,
   systemPrompt: 'You are OmniHarness, an autonomous engineering intelligence operating directly on Windows.',
   whisperModel: 'ggml-large-v3-turbo',
+  whisperLanguage: 'ru',
   audioInputDevice: 'default',
   telegramBotToken: '',
   telegramPairingCode: '',

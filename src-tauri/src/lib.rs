@@ -1205,13 +1205,14 @@ async fn transcribe_attachment_audio(
     mgr: &AppManagedState,
     att: &AttachmentInput,
     preferred_model: Option<&str>,
+    preferred_language: Option<&str>,
 ) -> Result<String, String> {
     let bytes = decode_attachment_audio_bytes(att)
         .ok_or_else(|| "Failed to decode audio attachment".to_string())?;
     let fallback_key = mgr.app_state.get_credential("openai_api_key").await.ok();
     let res = mgr
         .speech_engine
-        .transcribe_audio(&bytes, fallback_key.as_deref(), preferred_model)
+        .transcribe_audio(&bytes, fallback_key.as_deref(), preferred_model, preferred_language)
         .await?;
     Ok(res.text)
 }
@@ -1297,7 +1298,7 @@ async fn build_user_msg_with_attachments(
                     extra_notes.push(format!("[Voice message attachment could not be decoded: {}]", name));
                 }
             } else {
-                match transcribe_attachment_audio(mgr, &att, whisper_model).await {
+                match transcribe_attachment_audio(mgr, &att, whisper_model, None).await {
                     Ok(text) if !text.trim().is_empty() => {
                         extra_notes.push(format!("[Voice message from user, transcribed]: {}", text.trim()));
                     }
@@ -3013,6 +3014,7 @@ async fn transcribe_audio(
     audio_base64: Option<String>,
     audio_data: Option<Vec<u8>>,
     model: Option<String>,
+    language: Option<String>,
 ) -> Result<String, String> {
     use base64::Engine;
     let bytes = if let Some(b64) = audio_base64.filter(|s| !s.trim().is_empty()) {
@@ -3031,7 +3033,7 @@ async fn transcribe_audio(
     let fallback_key = state.app_state.get_credential("openai_api_key").await.ok();
     let res = state
         .speech_engine
-        .transcribe_audio(&bytes, fallback_key.as_deref(), model.as_deref())
+        .transcribe_audio(&bytes, fallback_key.as_deref(), model.as_deref(), language.as_deref())
         .await?;
     Ok(res.text)
 }

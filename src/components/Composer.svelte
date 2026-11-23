@@ -10,6 +10,7 @@ import { chatStore, type ChatAttachment } from '../lib/stores/chat.svelte';
 import { renderMarkdown } from '../lib/markdown';
 import { settingsStore, groupProviderModels, findModelGroup, resolveValidModelForProvider, getSupportedReasoningLevels, getDisplayModelId, REASONING_ORDER, type ReasoningLevel } from '../lib/stores/settings.svelte';
 import { workspaceStore } from '../lib/stores/workspace.svelte';
+import { whisperStore } from '../lib/stores/whisper.svelte';
 import { VoiceCapture } from '../lib/voiceCapture';
 import { SPRING_POPUP, SPRING_KEYCAP, SPRING_SLIDER, attachPressScale } from '../lib/motion';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
@@ -560,15 +561,10 @@ function handleWindowPointerDown(e: PointerEvent) {
 }
 
 let isVoiceActive = $state<boolean>(false);
-let hasWhisperModel = $state<boolean>(false);
+let hasWhisperModel = $derived(whisperStore.hasAnyInstalled || whisperStore.models.some((m) => m.status === 'installed'));
 
 async function refreshWhisperAvailability() {
-  try {
-    const res = await invoke<Array<{ isDownloaded?: boolean; is_downloaded?: boolean }>>('get_speech_status');
-    hasWhisperModel = Array.isArray(res) && res.some((m) => Boolean(m.isDownloaded ?? m.is_downloaded));
-  } catch {
-    hasWhisperModel = false;
-  }
+  whisperStore.refresh();
 }
 let voiceBands = $state<number[]>(new Array(28).fill(0.1));
 let voiceTimerStr = $state<string>('00:00');
@@ -916,7 +912,8 @@ async function stopAndTranscribe() {
     try {
       const transcribed = await invoke<string>('transcribe_audio', {
         audioBase64: result.base64,
-        model: settingsStore.data.whisperModel
+        model: settingsStore.data.whisperModel,
+        language: settingsStore.data.whisperLanguage || 'ru'
       });
       if (transcribed && transcribed.trim()) {
         inputText = (inputText ? `${inputText} ` : '') + transcribed.trim();
@@ -950,11 +947,12 @@ async function stopAndSendVoice() {
       });
       return;
     }
-    let textToSend = '[Voice Command]';
+    let textToSend = '[Голосовая команда]';
     try {
       const transcribed = await invoke<string>('transcribe_audio', {
         audioBase64: result.base64,
-        model: settingsStore.data.whisperModel
+        model: settingsStore.data.whisperModel,
+        language: settingsStore.data.whisperLanguage || 'ru'
       });
       if (transcribed && transcribed.trim()) {
         textToSend = transcribed.trim();

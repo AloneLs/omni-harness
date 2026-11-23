@@ -701,14 +701,36 @@ impl SpeechEngine {
         cleaned.trim().to_string()
     }
 
+    fn resolve_target_language(&self, preferred: Option<&str>) -> String {
+        if let Some(p) = preferred {
+            let trimmed = p.trim().to_ascii_lowercase();
+            if !trimmed.is_empty() {
+                return trimmed;
+            }
+        }
+        let settings_path = crate::state::AppState::resolve_data_dir().join("settings.json");
+        if let Ok(raw) = std::fs::read_to_string(&settings_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) {
+                if let Some(lang) = val.get("whisperLanguage").and_then(|v| v.as_str()) {
+                    let trimmed = lang.trim().to_ascii_lowercase();
+                    if !trimmed.is_empty() {
+                        return trimmed;
+                    }
+                }
+            }
+        }
+        "ru".to_string()
+    }
+
     pub async fn transcribe_file(
         &self,
         path: &Path,
         api_fallback_key: Option<&str>,
         preferred_model: Option<&str>,
+        preferred_language: Option<&str>,
     ) -> Result<TranscriptionResult, String> {
         let wav = convert::decode_to_wav_16k_mono(path)?;
-        self.transcribe_audio(&wav, api_fallback_key, preferred_model)
+        self.transcribe_audio(&wav, api_fallback_key, preferred_model, preferred_language)
             .await
     }
 
@@ -717,12 +739,14 @@ impl SpeechEngine {
         wav_bytes: &[u8],
         api_fallback_key: Option<&str>,
         preferred_model: Option<&str>,
+        preferred_language: Option<&str>,
     ) -> Result<TranscriptionResult, String> {
         let (pcm16k, duration_ms) = Self::normalize_to_16k(wav_bytes)?;
 
         let vad = VadProcessor::new(16000, 0.015);
         let speech_segments = vad.detect_segments(&pcm16k);
         let normalized_wav = Self::encode_wav_16k(&pcm16k);
+        let target_lang = self.resolve_target_language(preferred_language);
 
         let whisper_exe = self.models_dir.join("whisper.exe");
         if let Some(model_path) = self.resolve_model_path(preferred_model) {
@@ -739,7 +763,12 @@ impl SpeechEngine {
                 std_cmd.arg("-f").arg(&temp_wav);
                 std_cmd.arg("-oj");
                 std_cmd.arg("-of").arg(&base);
-                std_cmd.arg("-l").arg("auto");
+                std_cmd.arg("-l").arg(&target_lang);
+                std_cmd.arg("-bs").arg("1");
+                std_cmd.arg("-bo").arg("1");
+                if target_lang == "ru" {
+                    std_cmd.arg("--prompt").arg("Привет, это расшифровка русской речи.");
+                }
 
                 let accel = *self.acceleration.read().await;
                 if accel == AccelerationMode::Cpu {
@@ -772,7 +801,7 @@ impl SpeechEngine {
                     }
                     return Ok(TranscriptionResult {
                         text,
-                        language: "auto".to_string(),
+                        language: target_lang,
                         duration_ms,
                         segments,
                     });
@@ -783,7 +812,7 @@ impl SpeechEngine {
         if let Some(key) = api_fallback_key {
             let client = crate::build_http_client(None, None, None)
                 .unwrap_or_else(|_| reqwest::Client::new());
-            let form = reqwest::multipart::Form::new()
+            let mut form = reqwest::multipart::Form::new()
                 .text("model", "whisper-1")
                 .part(
                     "file",
@@ -792,6 +821,9 @@ impl SpeechEngine {
                         .mime_str("audio/wav")
                         .map_err(|e| format!("Mime error: {}", e))?,
                 );
+            if target_lang != "auto" {
+                form = form.text("language", target_lang.clone());
+            }
 
             let res = client
                 .post("https://api.openai.com/v1/audio/transcriptions")

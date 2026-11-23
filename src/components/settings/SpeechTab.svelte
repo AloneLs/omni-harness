@@ -7,6 +7,7 @@ import { VoiceCapture } from '../../lib/voiceCapture';
 import Icon from '../Icon.svelte';
 
 let selectedModelId = $state<string>(settingsStore.data.whisperModel?.replace(/^ggml-/, '') || 'large-v3-turbo');
+let selectedLanguage = $state<string>(settingsStore.data.whisperLanguage || 'ru');
 
 let isRecording = $state<boolean>(false);
 let recordingSeconds = $state<number>(0);
@@ -46,6 +47,12 @@ function cleanupRecording() {
 function selectModel(id: string) {
   selectedModelId = id;
   settingsStore.data.whisperModel = `ggml-${id}`;
+  settingsStore.saveSettings();
+}
+
+function updateLanguage(lang: string) {
+  selectedLanguage = lang;
+  settingsStore.data.whisperLanguage = lang;
   settingsStore.saveSettings();
 }
 
@@ -99,7 +106,8 @@ async function stopRecording() {
     const t0 = performance.now();
     const text = await invoke<string>('transcribe_audio', {
       audioBase64: res.base64,
-      model: `ggml-${selectedModelId}`
+      model: `ggml-${selectedModelId}`,
+      language: selectedLanguage
     });
     const dt = Math.round(performance.now() - t0);
 
@@ -128,6 +136,22 @@ function formatBytes(bytes?: number): string {
   <div>
     <h2 class="text-sm font-medium text-[#EDEDEF]">Локальные веса Whisper</h2>
     <p class="text-xs text-[#73737A] mt-0.5">Выберите модель для офлайн-распознавания голосовых сообщений и аудиоввода.</p>
+  </div>
+
+  <div class="flex items-center justify-between p-3.5 rounded-[8px] bg-[#1C1C1F] border border-white/[0.06]">
+    <div>
+      <div class="text-xs font-medium text-[#EDEDEF]">Язык распознавания речи</div>
+      <div class="text-[11px] text-[#73737A] mt-0.5">Принудительный русский отключает ложные переводы и галлюцинации на английский</div>
+    </div>
+    <select
+      value={selectedLanguage}
+      onchange={(e) => updateLanguage((e.target as HTMLSelectElement).value)}
+      class="bg-[#121214] border border-white/[0.1] rounded-[6px] px-3 py-1.5 text-xs text-[#EDEDEF] focus:outline-none focus:border-[#A855F7] cursor-pointer"
+    >
+      <option value="ru">Русский (ru) — фиксированный</option>
+      <option value="auto">Автоопределение (auto)</option>
+      <option value="en">English (en)</option>
+    </select>
   </div>
 
   {#if whisperStore.statusError}
