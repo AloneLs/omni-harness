@@ -1971,74 +1971,26 @@ async fn collect_tg_attachments(
 async fn build_tg_user_msg(
     ctx: &TelegramRuntimeContext,
     model_id: &str,
-    prompt: &str,
-    attachments: &[TgAttachment],
+    agent_prompt: &str,
+    audio_parts: Vec<crate::llm::request_compat::ContentPart>,
+    file_attachments: &[TgAttachment],
 ) -> Option<crate::llm::request_compat::ChatMessage> {
     use base64::Engine;
-    if attachments.is_empty() {
+    if agent_prompt.trim().is_empty() && audio_parts.is_empty() && file_attachments.is_empty() {
         return None;
     }
-    let native_audio = crate::llm::capabilities::model_supports_native_audio(model_id);
     let native_vision = ctx.caps_registry.get(model_id).supports_vision;
-    let fallback_key = ctx.app_state.get_credential("openai_api_key").await.ok();
-    let mut parts: Vec<crate::llm::request_compat::ContentPart> = vec![
-        crate::llm::request_compat::ContentPart::Text { text: prompt.to_string() },
-    ];
-    let mut notes: Vec<String> = Vec::new();
-    for att in attachments {
-        match att.kind.as_str() {
-            "voice" | "audio" => {
-                let path = std::path::Path::new(&att.path);
-                let label = if att.kind == "voice" { "Голосовое сообщение" } else { "Аудиофайл" };
-                if native_audio {
-                    match crate::speech::convert::decode_to_wav_16k_mono(path) {
-                        Ok(bytes) if !bytes.is_empty() => {
-                            parts.push(crate::llm::request_compat::ContentPart::InputAudio {
-                                input_audio: crate::llm::request_compat::InputAudioDetail {
-                                    data: base64::engine::general_purpose::STANDARD.encode(&bytes),
-                                    format: "wav".to_string(),
-                                },
-                            });
-                            notes.push(format!("[{} от пользователя (нативный аудиовход): {}]", label, att.name));
-                        }
-                        _ => notes.push(format!(
-                            "[{} от пользователя: {} — не удалось декодировать аудио]",
-                            label, att.name
-                        )),
-                    }
-                } else {
-                    let wav = crate::speech::convert::decode_to_wav_16k_mono(path);
-                    match wav {
-                        Ok(bytes) => {
-                            match ctx
-                                .speech_engine
-                                .transcribe_audio(&bytes, fallback_key.as_deref(), None, None)
-                                .await
-                            {
-                                Ok(res) if !res.text.trim().is_empty() => notes.push(format!(
-                                    "[{} от пользователя, транскрипт]: {}",
-                                    label,
-                                    res.text.trim()
-                                )),
-                                Ok(_) => notes.push(format!(
-                                    "[{} от пользователя: {} — пустой транскрипт]",
-                                    label, att.name
-                                )),
-                                Err(e) => notes.push(format!(
-                                    "[{} от пользователя: {} — ошибка транскрипции: {}]",
-                                    label, att.name, e
-                                )),
-                            }
-                        }
-                        Err(e) => notes.push(format!(
-                            "[{} от пользователя: {} — не удалось декодировать: {}]",
-                            label, att.name, e
-                        )),
-                    }
-                }
-            }
-            "image" if native_vision => match std::fs::read(&att.path) {
-                Ok(bytes) if !bytes.is_empty() => {
+    let mut parts: Vec<crate::llm::request_compat::ContentPart> = Vec::new();
+    if !agent_prompt.trim().is_empty() {
+        parts.push(crate::llm::request_compat::ContentPart::Text { text: agent_prompt.to_string() });
+    }
+    for ap in audio_parts {
+        parts.push(ap);
+    }
+    for att in file_attachments {
+        if att.kind == "image" && native_vision {
+            if let Ok(bytes) = std::fs::read(&att.path) {
+                if !bytes.is_empty() {
                     let low = att.path.to_ascii_lowercase();
                     let mime = if low.ends_with(".jpg") || low.ends_with(".jpeg") {
                         "image/jpeg"
@@ -2059,23 +2011,12 @@ async fn build_tg_user_msg(
                             detail: None,
                         },
                     });
-                    notes.push(format!("[Изображение от пользователя: {}]", att.name));
                 }
-                _ => notes.push(format!("[Изображение от пользователя: {} ({})]", att.name, att.path)),
-            },
-            _ => notes.push(format!(
-                "[Файл, отправленный пользователем: {} -> {}]",
-                att.name, att.path
-            )),
+            }
         }
     }
-    if let Some(crate::llm::request_compat::ContentPart::Text { text }) = parts.first_mut() {
-        if !notes.is_empty() {
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-            text.push_str(&notes.join("\n"));
-        }
+    if parts.is_empty() {
+        return None;
     }
     Some(crate::llm::request_compat::ChatMessage {
         role: "user".to_string(),
@@ -3352,35 +3293,100 @@ async fn run_telegram_agent_turn(
         }
     };
 
-    let mut full_prompt = if prompt_text.trim().is_empty() && !tg_attachments.is_empty() {
-        "Проанализируй приложенные файлы и выполни задачу полностью.".to_string()
-    } else {
-        prompt_text
-    };
-    if !tg_attachments.is_empty() {
-        full_prompt.push_str("\n\n[Attached files]\n");
-        for att in &tg_attachments {
-            full_prompt.push_str(&format!("- {} ({})\n", att.path, att.name));
+    let (voice_atts, file_atts): (Vec<TgAttachment>, Vec<TgAttachment>) = tg_attachments
+        .into_iter()
+        .partition(|a| a.kind == "voice" || a.kind == "audio");
+
+    use base64::Engine;
+    let native_audio = crate::llm::capabilities::model_supports_native_audio(&model.id);
+    let fallback_key = ctx.app_state.get_credential("openai_api_key").await.ok();
+    let mut voice_transcripts = Vec::new();
+    let mut audio_parts = Vec::new();
+
+    for att in &voice_atts {
+        let path = std::path::Path::new(&att.path);
+        let wav_res = crate::speech::convert::decode_to_wav_16k_mono(path);
+        match wav_res {
+            Ok(bytes) if !bytes.is_empty() => {
+                if native_audio {
+                    audio_parts.push(crate::llm::request_compat::ContentPart::InputAudio {
+                        input_audio: crate::llm::request_compat::InputAudioDetail {
+                            data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                            format: "wav".to_string(),
+                        },
+                    });
+                }
+                match ctx
+                    .speech_engine
+                    .transcribe_audio(&bytes, fallback_key.as_deref(), None, None)
+                    .await
+                {
+                    Ok(res) if !res.text.trim().is_empty() => {
+                        voice_transcripts.push(res.text.trim().to_string());
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        crate::logger::warn("Telegram", &format!("Voice transcription failed: {}", e));
+                    }
+                }
+            }
+            Err(e) => {
+                crate::logger::warn("Telegram", &format!("Failed to decode voice audio {}: {}", att.name, e));
+            }
+            Ok(_) => {}
         }
     }
-    let pending_user_msg = build_tg_user_msg(&ctx, &model.id, &full_prompt, &tg_attachments).await;
-    if let Some(crate::llm::request_compat::ChatMessage {
-        content: crate::llm::request_compat::MessageContent::Parts(ref parts),
-        ..
-    }) = pending_user_msg
-    {
-        if let Some(crate::llm::request_compat::ContentPart::Text { text }) = parts.first() {
-            full_prompt = text.clone();
+
+    let combined_voice_text = voice_transcripts.join("\n\n");
+    let mut user_display_text = prompt_text.trim().to_string();
+    if !combined_voice_text.is_empty() {
+        if user_display_text.is_empty() {
+            user_display_text = combined_voice_text;
+        } else {
+            user_display_text.push_str("\n\n");
+            user_display_text.push_str(&combined_voice_text);
+        }
+    } else if user_display_text.is_empty() {
+        if !voice_atts.is_empty() {
+            user_display_text = "[Голосовое сообщение]".to_string();
+        } else if !file_atts.is_empty() {
+            let names: Vec<String> = file_atts.iter().map(|f| f.name.clone()).collect();
+            let all_images = file_atts.iter().all(|f| f.kind == "image");
+            if all_images {
+                user_display_text = format!("[Прикреплено изображение: {}]", names.join(", "));
+            } else {
+                user_display_text = format!("[Прикреплён файл: {}]", names.join(", "));
+            }
         }
     }
-    if full_prompt.trim().is_empty() {
+
+    if user_display_text.trim().is_empty() && audio_parts.is_empty() && file_atts.is_empty() {
         return String::new();
     }
+
+    let mut agent_prompt = if user_display_text.is_empty() || user_display_text.starts_with('[') {
+        if !file_atts.is_empty() {
+            "Проанализируй приложенные файлы и выполни задачу полностью.".to_string()
+        } else {
+            user_display_text.clone()
+        }
+    } else {
+        user_display_text.clone()
+    };
+
+    if !file_atts.is_empty() {
+        agent_prompt.push_str("\n\n[Attached files]\n");
+        for att in &file_atts {
+            agent_prompt.push_str(&format!("- {} ({})\n", att.path, att.name));
+        }
+    }
+
+    let pending_user_msg = build_tg_user_msg(&ctx, &model.id, &agent_prompt, audio_parts, &file_atts).await;
 
     if ctx.stream_mgr.get_session(&chat_id).await.is_some() {
         match ctx
             .stream_mgr
-            .inject_intervention(&chat_id, full_prompt)
+            .inject_intervention(&chat_id, user_display_text)
             .await
         {
             Ok(()) => {
@@ -3413,7 +3419,7 @@ async fn run_telegram_agent_turn(
         id: uuid::Uuid::new_v4().to_string(),
         chat_id: chat_id.clone(),
         role: "user".to_string(),
-        content: full_prompt.clone(),
+        content: user_display_text.clone(),
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
@@ -3425,7 +3431,7 @@ async fn run_telegram_agent_turn(
     if let Some(ref app) = stream_app_handle {
         let _ = app.emit(
             "telegram-chat-stream",
-            json!({ "chatId": chat_id, "type": "start", "userText": full_prompt }),
+            json!({ "chatId": chat_id, "type": "start", "userText": user_display_text }),
         );
     }
 
@@ -3763,7 +3769,7 @@ async fn run_telegram_agent_turn(
         history.push(pu);
     }
 
-    let is_plan_req = full_prompt
+    let is_plan_req = agent_prompt
         .split_whitespace()
         .any(|t| t.eq_ignore_ascii_case("/plan"));
     let ws_tools = ctx
@@ -3771,7 +3777,7 @@ async fn run_telegram_agent_turn(
         .for_workspace_with_cwd(sandbox_root_opt.as_deref(), &workspace_path, &chat_id);
     ws_tools.set_plan_mode(is_plan_req);
 
-    let goal_cmd = crate::engine::goal_loop::parse_goal_command(&full_prompt);
+    let goal_cmd = crate::engine::goal_loop::parse_goal_command(&agent_prompt);
     let run_res = if let Some(crate::engine::goal_loop::GoalCommandAction::Clear) = goal_cmd {
         let _ = ctx.app_state.db.delete_goal_state(&chat_id);
         let _ = tx
@@ -3827,7 +3833,7 @@ async fn run_telegram_agent_turn(
                 g.condition
             )
         } else {
-            full_prompt.clone()
+            agent_prompt.clone()
         };
         loop {
             let hist_len_before = history.len();

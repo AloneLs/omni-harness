@@ -1293,17 +1293,25 @@ async fn build_user_msg_with_attachments(
                             format: "wav".to_string(),
                         },
                     });
-                    extra_notes.push(format!("[Voice message from user: {}]", name));
+                    if prompt.trim().is_empty() {
+                        extra_notes.push(format!("[Voice message from user: {}]", name));
+                    }
                 } else {
                     extra_notes.push(format!("[Voice message attachment could not be decoded: {}]", name));
                 }
             } else {
                 match transcribe_attachment_audio(mgr, &att, whisper_model, None).await {
                     Ok(text) if !text.trim().is_empty() => {
-                        extra_notes.push(format!("[Voice message from user, transcribed]: {}", text.trim()));
+                        if prompt.trim().is_empty() {
+                            if let Some(llm::request_compat::ContentPart::Text { text: t }) = parts.first_mut() {
+                                *t = text.trim().to_string();
+                            }
+                        }
                     }
                     Ok(_) => {
-                        extra_notes.push(format!("[Voice message from user: {} — transcription is empty]", name));
+                        if prompt.trim().is_empty() {
+                            extra_notes.push(format!("[Voice message from user: {} — transcription is empty]", name));
+                        }
                     }
                     Err(e) => {
                         extra_notes.push(format!("[Voice message from user: {} — transcription failed: {}]", name, e));
