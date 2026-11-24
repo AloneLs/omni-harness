@@ -2960,7 +2960,10 @@ async fn list_skills(
     state: State<'_, AppManagedState>,
 ) -> Result<Vec<skills::SkillPackage>, String> {
     let ws = state.app_state.get_workspace_dir().await;
-    Ok(skills::discover_all_skills(&ws.to_string_lossy()).into_iter().filter(|sk| !sk.metadata.name.starts_with("system:") && !sk.metadata.name.eq_ignore_ascii_case("skill-creator")).collect())
+    Ok(skills::discover_all_skills(&ws.to_string_lossy())
+        .into_iter()
+        .filter(|sk| !sk.metadata.name.starts_with("system:"))
+        .collect())
 }
 
 #[tauri::command]
@@ -2969,15 +2972,16 @@ async fn delete_skill(
     skill_path: String,
     skill_name: String,
 ) -> Result<(), String> {
-    if skill_name.trim().eq_ignore_ascii_case("skill-creator") || skill_name.trim().starts_with("system:") {
-        return Err("System skills cannot be deleted".to_string());
+    let _ = &state;
+    let s_name = skill_name.trim();
+    if s_name.eq_ignore_ascii_case("skill-creator") || s_name.starts_with("system:") {
+        return Err("Системный навык 'skill-creator' защищен от удаления".to_string());
     }
-    let ws = state.app_state.get_workspace_dir().await;
-    let ws_str = ws.to_string_lossy().to_string();
+    let skills_root = state::AppState::resolve_skills_dir();
     let mut target = if !skill_path.trim().is_empty() {
         PathBuf::from(skill_path.trim())
     } else {
-        ws.join(".omni").join("skills").join(skill_name.trim())
+        skills_root.join(s_name)
     };
     if target.is_file() && target.file_name().and_then(|n| n.to_str()) == Some("SKILL.md") {
         if let Some(parent) = target.parent() {
@@ -2986,19 +2990,23 @@ async fn delete_skill(
     }
     let canon_target = crate::tools::path_norm::canonicalize_best_effort(&target)
         .map_err(|e| format!("Skill path not found: {}", e))?;
-    let allowed_roots = skills::skill_search_roots(&ws_str);
-    let mut is_allowed = false;
-    for r in &allowed_roots {
-        if r.exists()
-            && crate::tools::path_norm::is_within_root(&canon_target, r)
-            && crate::tools::path_norm::path_key(&canon_target) != crate::tools::path_norm::path_key(r)
-        {
-            is_allowed = true;
-            break;
-        }
+    let canon_root = crate::tools::path_norm::canonicalize_best_effort(&skills_root)
+        .map_err(|e| format!("Skills root directory not found: {}", e))?;
+
+    if canon_target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.eq_ignore_ascii_case("skill-creator"))
+        .unwrap_or(false)
+    {
+        return Err("Системный навык 'skill-creator' защищен от удаления".to_string());
     }
-    if !is_allowed || !canon_target.join("SKILL.md").exists() {
-        return Err("Refusing to delete path outside registered skills directories".to_string());
+
+    if !crate::tools::path_norm::is_within_root(&canon_target, &canon_root)
+        || crate::tools::path_norm::path_key(&canon_target) == crate::tools::path_norm::path_key(&canon_root)
+        || !canon_target.join("SKILL.md").exists()
+    {
+        return Err("Refusing to delete path outside registered skills directory".to_string());
     }
     skills::remove_dir_all_force(&canon_target).map_err(|e| e.to_string())
 }
