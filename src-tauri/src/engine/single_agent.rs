@@ -1311,20 +1311,33 @@ impl SingleAgentRunner {
                                 | "perplexity_oauth"
                         );
                         let is_http_400 = lower.contains("http 400")
+                            || lower.contains("http error 400")
                             || lower.contains("status 400")
                             || lower.contains("400 bad request")
                             || lower.contains("(400)");
                         let is_http_404 = lower.contains("http 404")
+                            || lower.contains("http error 404")
                             || lower.contains("status 404")
                             || lower.contains("404 not found")
                             || lower.contains("model_not_found");
+                        let is_geo_block = lower.contains("location_not_eligible")
+                            || lower.contains("geographic restriction")
+                            || lower.contains("user location is not supported");
                         let is_auth_err = lower.contains("http 401")
+                            || lower.contains("http error 401")
                             || lower.contains("status 401")
                             || lower.contains("http 403")
+                            || lower.contains("http error 403")
                             || lower.contains("status 403")
                             || lower.contains("invalid api key");
                         let is_fatal = is_http_400
                             || is_http_404
+                            || is_geo_block
+                            || lower.contains("tos_violation")
+                            || lower.contains("violation of terms of service")
+                            || lower.contains("disabled in this account")
+                            || lower.contains("all antigravity accounts exhausted")
+                            || (api_protocol.unwrap_or("") == "antigravity" && is_auth_err)
                             || (is_auth_err && (!is_oauth_proto || attempt >= 2))
                             || lower.contains("no available api keys")
                             || lower.contains("no enabled ") && lower.contains("oauth account");
