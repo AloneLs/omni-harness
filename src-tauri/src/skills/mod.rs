@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -284,7 +284,47 @@ pub fn load_all_skills(skills_dir: &Path) -> Result<Vec<SkillPackage>, String> {
 }
 
 
-pub fn skill_search_roots(workspace_root: &str) -> Vec<std::path::PathBuf> {
+pub fn remove_dir_all_force(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_file() || path.is_symlink() {
+        if let Ok(meta) = path.symlink_metadata() {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+        return fs::remove_file(path);
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if let Ok(meta) = entry_path.symlink_metadata() {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(&entry_path, perms);
+            }
+        }
+        if entry_path.is_dir() {
+            remove_dir_all_force(&entry_path)?;
+        } else {
+            let _ = fs::remove_file(&entry_path);
+        }
+    }
+    if let Ok(meta) = path.symlink_metadata() {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+    fs::remove_dir(path)
+}
+
+pub fn skill_search_roots(workspace_root: &str) -> Vec<PathBuf> {
     let mut roots = Vec::new();
     roots.push(crate::state::AppState::resolve_skills_dir());
     let ws = Path::new(workspace_root);
@@ -293,11 +333,22 @@ pub fn skill_search_roots(workspace_root: &str) -> Vec<std::path::PathBuf> {
         roots.push(ws.join(".agents").join("skills"));
         roots.push(ws.join(".claude").join("skills"));
     }
+    let mut home_candidates = Vec::new();
+    if let Some(h) = dirs::home_dir() {
+        home_candidates.push(h);
+    }
     if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-        let h = Path::new(&home);
+        let h = PathBuf::from(home);
+        if !home_candidates.iter().any(|c| c == &h) {
+            home_candidates.push(h);
+        }
+    }
+    for h in home_candidates {
         roots.push(h.join(".omni").join("skills"));
         roots.push(h.join(".agents").join("skills"));
         roots.push(h.join(".claude").join("skills"));
+        roots.push(h.join(".gemini").join("skills"));
+        roots.push(h.join(".gemini").join("config").join("skills"));
     }
     roots
 }

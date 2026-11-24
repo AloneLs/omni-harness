@@ -1785,9 +1785,10 @@ class ChatStore {
 
     if (!session?.isDraft && !session?.isThemeStudio) {
       try {
-        const cachedJson = await invoke<string | null>('get_cached_chat_messages', { chatId: id });
-        if (cachedJson) {
-          const parsed = JSON.parse(cachedJson);
+        const cachedRes = await invoke<[string, string] | string | null>('get_cached_chat_messages', { chatId: id });
+        const rawJson = Array.isArray(cachedRes) ? cachedRes[1] : cachedRes;
+        if (typeof rawJson === 'string' && rawJson.trim()) {
+          const parsed = JSON.parse(rawJson);
           if (Array.isArray(parsed) && parsed.length > 0) {
             const hydrated: ChatMessage[] = parsed.map((m: any, idx: number) => ({
               id: m.id || `cached-${idx}-${Date.now()}`,

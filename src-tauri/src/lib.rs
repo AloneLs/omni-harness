@@ -2974,26 +2974,33 @@ async fn delete_skill(
     }
     let ws = state.app_state.get_workspace_dir().await;
     let ws_str = ws.to_string_lossy().to_string();
-    let target = if !skill_path.trim().is_empty() {
+    let mut target = if !skill_path.trim().is_empty() {
         PathBuf::from(skill_path.trim())
     } else {
         ws.join(".omni").join("skills").join(skill_name.trim())
     };
-    let canon_target = std::fs::canonicalize(&target).map_err(|e| format!("Skill path not found: {}", e))?;
+    if target.is_file() && target.file_name().and_then(|n| n.to_str()) == Some("SKILL.md") {
+        if let Some(parent) = target.parent() {
+            target = parent.to_path_buf();
+        }
+    }
+    let canon_target = crate::tools::path_norm::canonicalize_best_effort(&target)
+        .map_err(|e| format!("Skill path not found: {}", e))?;
     let allowed_roots = skills::skill_search_roots(&ws_str);
     let mut is_allowed = false;
-    for r in allowed_roots {
-        if let Ok(canon_root) = std::fs::canonicalize(&r) {
-            if canon_target.starts_with(&canon_root) && canon_target != canon_root {
-                is_allowed = true;
-                break;
-            }
+    for r in &allowed_roots {
+        if r.exists()
+            && crate::tools::path_norm::is_within_root(&canon_target, r)
+            && crate::tools::path_norm::path_key(&canon_target) != crate::tools::path_norm::path_key(r)
+        {
+            is_allowed = true;
+            break;
         }
     }
     if !is_allowed || !canon_target.join("SKILL.md").exists() {
         return Err("Refusing to delete path outside registered skills directories".to_string());
     }
-    std::fs::remove_dir_all(&canon_target).map_err(|e| e.to_string())
+    skills::remove_dir_all_force(&canon_target).map_err(|e| e.to_string())
 }
 
 #[tauri::command]

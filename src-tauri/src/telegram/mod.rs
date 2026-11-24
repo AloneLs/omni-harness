@@ -1616,12 +1616,26 @@ async fn render_chat_history(
     } else {
         let (u_opt, a_opt) = &turns[safe_page];
         if let Some(u) = u_opt {
-            parts.push(format!("👤 <b>Запрос:</b>
-{}", escape_html(&compact_text(u, 1400))));
+            let u_clean = compact_text(u, 1400);
+            let u_html = markdown_to_telegram_html(&u_clean);
+            parts.push(format!("👤 <b>Запрос:</b>\n{}", if u_html.trim().is_empty() { escape_html(&u_clean) } else { u_html }));
         }
         if let Some(a) = a_opt {
-            parts.push(format!("🤖 <b>Ответ:</b>
-{}", escape_html(&compact_text(a, 1900))));
+            let media_list = extract_media_attachments(a);
+            let clean_a = if media_list.is_empty() {
+                a.clone()
+            } else {
+                regex::Regex::new(r"!\[[^\]]*\]\([^)]+\)")
+                    .map(|re| re.replace_all(a, "").trim().to_string())
+                    .unwrap_or_else(|_| a.clone())
+            };
+            let mut compacted = compact_text(&clean_a, 2400);
+            let fence_count = compacted.matches("```").count();
+            if fence_count % 2 != 0 {
+                compacted.push_str("\n```");
+            }
+            let a_html = markdown_to_telegram_html(&compacted);
+            parts.push(format!("🤖 <b>Ответ:</b>\n{}", if a_html.trim().is_empty() { escape_html(&compacted) } else { a_html }));
         }
     }
     let rm = serde_json::to_value(TelegramMenuBuilder::history_menu(safe_page, turns.len())).ok();
@@ -3984,6 +3998,22 @@ async fn run_telegram_agent_turn(
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         let _ = ctx.app_state.db.create_message(&asst_msg);
+        if let Ok(all_db_msgs) = ctx.app_state.db.list_messages(&chat_id) {
+            let chat_title = ctx.app_state.db.get_chat(&chat_id).map(|c| c.title).unwrap_or_else(|_| "Telegram Chat".to_string());
+            let json_msgs: Vec<_> = all_db_msgs.into_iter().map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "chatId": m.chat_id,
+                    "role": m.role,
+                    "content": m.content,
+                    "reasoningContent": m.reasoning_content,
+                    "createdAt": m.created_at,
+                })
+            }).collect();
+            if let Ok(j) = serde_json::to_string(&json_msgs) {
+                let _ = ctx.app_state.db.sync_chat_context(&chat_id, &chat_title, &j);
+            }
+        }
         if let Some(ref app) = stream_app_handle {
             let _ = app.emit(
                 "telegram-chat-stream",
@@ -4070,6 +4100,22 @@ async fn run_telegram_agent_turn(
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         let _ = ctx.app_state.db.create_message(&asst_msg);
+        if let Ok(all_db_msgs) = ctx.app_state.db.list_messages(&chat_id) {
+            let chat_title = ctx.app_state.db.get_chat(&chat_id).map(|c| c.title).unwrap_or_else(|_| "Telegram Chat".to_string());
+            let json_msgs: Vec<_> = all_db_msgs.into_iter().map(|m| {
+                serde_json::json!({
+                    "id": m.id,
+                    "chatId": m.chat_id,
+                    "role": m.role,
+                    "content": m.content,
+                    "reasoningContent": m.reasoning_content,
+                    "createdAt": m.created_at,
+                })
+            }).collect();
+            if let Ok(j) = serde_json::to_string(&json_msgs) {
+                let _ = ctx.app_state.db.sync_chat_context(&chat_id, &chat_title, &j);
+            }
+        }
         if let Some(ref app) = stream_app_handle {
             let _ = app.emit(
                 "telegram-chat-stream",
