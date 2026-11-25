@@ -722,17 +722,19 @@ impl ToolDispatcher {
     ) -> ToolExecutionResult {
         let start = std::time::Instant::now();
         if let Some((ref app, ref tid)) = self.theme_studio {
-            let (output, error, success) = match theme_tools::execute_theme_tool(app, tid, name, args).await {
-                Ok(msg) => (json!({ "result": msg }), None, true),
-                Err(e) => (Value::Null, Some(e), false),
-            };
-            return ToolExecutionResult {
-                tool_name: name.to_string(),
-                success,
-                output,
-                error,
-                elapsed_ms: start.elapsed().as_millis(),
-            };
+            if name != "generate_image" {
+                let (output, error, success) = match theme_tools::execute_theme_tool(app, tid, name, args).await {
+                    Ok(msg) => (json!({ "result": msg }), None, true),
+                    Err(e) => (Value::Null, Some(e), false),
+                };
+                return ToolExecutionResult {
+                    tool_name: name.to_string(),
+                    success,
+                    output,
+                    error,
+                    elapsed_ms: start.elapsed().as_millis(),
+                };
+            }
         }
         if let Err(verr) = self.validate_tool_args(name, args) {
             return ToolExecutionResult {
@@ -1364,6 +1366,10 @@ impl ToolDispatcher {
                                 resp.text().await.map_err(|e| e.to_string())?
                             }
                             _ => {
+                                let parsed_url = url::Url::parse(target).map_err(|e| format!("Invalid URL: {}", e))?;
+                                if !matches!(parsed_url.scheme(), "http" | "https") {
+                                    return Err("Only http/https URLs are allowed".to_string());
+                                }
                                 let target_owned = target.to_string();
                                 let ua_owned = ua.to_string();
                                 tokio::task::spawn_blocking(move || -> Result<String, String> {
@@ -1374,6 +1380,7 @@ impl ToolDispatcher {
                                         "-A", &ua_owned,
                                         "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                                         "-H", "Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                                        "--",
                                         &target_owned,
                                     ]);
                                     #[cfg(target_os = "windows")]
@@ -1552,11 +1559,15 @@ impl ToolDispatcher {
                     }
                     "list_workspace" => {
                         let target_id = args.get("chat_id").and_then(|v| v.as_str()).ok_or("Missing chat_id")?;
+                        if target_id.is_empty() || !target_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                            return Err("Invalid chat_id".to_string());
+                        }
                         let rel = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                        let chat_root = path_norm::canonicalize_best_effort(&base_ws.join(target_id))?;
                         let target_dir = if rel.is_empty() {
-                            base_ws.join(target_id)
+                            chat_root.clone()
                         } else {
-                            base_ws.join(target_id).join(rel)
+                            path_norm::validate_path_with_base(rel, Some(&chat_root), std::slice::from_ref(&chat_root))?
                         };
                         if !target_dir.exists() {
                             return Err(format!("Workspace '{}' does not exist", target_dir.to_string_lossy()));
@@ -1564,7 +1575,7 @@ impl ToolDispatcher {
                         let mut files = Vec::new();
                         for entry in ignore::WalkBuilder::new(&target_dir).max_depth(Some(3)).build().flatten() {
                             let p = entry.path();
-                            if p != target_dir {
+                            if p != target_dir && safety::SecretShield::check_path(p).is_ok() {
                                 if let Ok(r) = p.strip_prefix(&target_dir) {
                                     files.push(json!({
                                         "path": r.to_string_lossy().replace('\\', "/"),
@@ -1580,8 +1591,13 @@ impl ToolDispatcher {
                     }
                     "read_workspace_file" => {
                         let target_id = args.get("chat_id").and_then(|v| v.as_str()).ok_or("Missing chat_id")?;
+                        if target_id.is_empty() || !target_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                            return Err("Invalid chat_id".to_string());
+                        }
                         let rel = args.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
-                        let target_file = base_ws.join(target_id).join(rel);
+                        let chat_root = path_norm::canonicalize_best_effort(&base_ws.join(target_id))?;
+                        let target_file = path_norm::validate_path_with_base(rel, Some(&chat_root), std::slice::from_ref(&chat_root))?;
+                        safety::SecretShield::check_path(&target_file)?;
                         let content = std::fs::read_to_string(&target_file).map_err(|e| e.to_string())?;
                         let bounded = crate::engine::context_engine::safe_slice_head(&content, 24000);
                         Ok(json!({ "chat_id": target_id, "path": rel, "content": bounded }))
@@ -1946,14 +1962,18 @@ fn execute_computer_use_blocking(
         }
         "web_open" => {
             let url = args.get("url").and_then(|v| v.as_str()).ok_or("Missing url")?;
+            let parsed = url::Url::parse(url).map_err(|e| format!("Invalid url: {}", e))?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err("web_open only supports http/https URLs".to_string());
+            }
             let targets = match web_browser::CdpController::new(9222).list_targets() {
                 Ok(t) if !t.is_empty() => t,
                 _ => {
                     #[cfg(target_os = "windows")]
                     {
                         use std::os::windows::process::CommandExt;
-                        let _ = std::process::Command::new("cmd")
-                            .args(["/C", "start", "", "msedge", "--remote-debugging-port=9222", url])
+                        let _ = std::process::Command::new("msedge.exe")
+                            .args(["--remote-debugging-port=9222", parsed.as_str()])
                             .creation_flags(0x08000000)
                             .spawn();
                         std::thread::sleep(std::time::Duration::from_millis(1600));

@@ -282,6 +282,7 @@ async fn stream_openai_responses_inner(
             key_pool.mark_success(provider_name, base_url, &api_key).await;
 
             let mut byte_stream = response.bytes_stream();
+            let mut raw_buf: Vec<u8> = Vec::new();
             let mut line_buffer = String::new();
             let mut current_event_type = String::new();
             let mut tool_calls_map: HashMap<usize, (String, String, String)> = HashMap::new();
@@ -294,23 +295,27 @@ async fn stream_openai_responses_inner(
                     Err(e) => return Err(LlmError::Network(e)),
                 };
 
-                let text = String::from_utf8_lossy(&chunk);
-                line_buffer.push_str(&text);
+                raw_buf.extend_from_slice(&chunk);
+                crate::llm::drain_valid_utf8(&mut raw_buf, &mut line_buffer);
 
                 while let Some(pos) = line_buffer.find('\n') {
                     let line = line_buffer[..pos].trim_end_matches('\r').to_string();
                     line_buffer.drain(..=pos);
 
-                    if line.is_empty() || line.starts_with(':') {
+                    if line.is_empty() {
+                        current_event_type.clear();
+                        continue;
+                    }
+                    if line.starts_with(':') {
                         continue;
                     }
 
-                    if let Some(ev) = line.strip_prefix("event: ") {
+                    if let Some(ev) = line.strip_prefix("event:") {
                         current_event_type = ev.trim().to_string();
                         continue;
                     }
 
-                    if let Some(stripped) = line.strip_prefix("data: ") {
+                    if let Some(stripped) = line.strip_prefix("data:") {
                         let data_str = stripped.trim();
                         if data_str == "[DONE]" {
                             break 'resp_loop;
@@ -421,14 +426,21 @@ async fn stream_openai_responses_inner(
                                             let args = item
                                                 .get("arguments")
                                                 .and_then(|v| v.as_str())
-                                                .unwrap_or("");
+                                                .filter(|s| !s.is_empty())
+                                                .map(|s| s.to_string())
+                                                .unwrap_or_else(|| {
+                                                    tool_calls_map
+                                                        .get(&out_idx)
+                                                        .map(|e| e.2.clone())
+                                                        .unwrap_or_default()
+                                                });
 
                                             let _ = sender
                                                 .send(StreamEvent::ToolCallComplete {
                                                     index: out_idx,
                                                     id: call_id.to_string(),
                                                     name: fn_name.to_string(),
-                                                    arguments: args.to_string(),
+                                                    arguments: args,
                                                 })
                                                 .await;
                                             tool_calls_map.remove(&out_idx);

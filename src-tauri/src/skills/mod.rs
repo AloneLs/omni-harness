@@ -723,7 +723,7 @@ pub fn import_skill_zip(zip_bytes: &[u8], skills_root: &Path) -> Result<String, 
         let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
         let name = entry.name().to_string();
 
-        if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {
+        if name.contains("..") || name.starts_with('/') || name.starts_with('\\') || name.contains(':') {
             return Err(format!("Unsafe path detected in zip archive: {}", name));
         }
 
@@ -754,13 +754,20 @@ pub fn import_skill_zip(zip_bytes: &[u8], skills_root: &Path) -> Result<String, 
         return Err(validation.error_message.unwrap_or_else(|| "Invalid skill format in zip".to_string()));
     }
 
-    let target_name = skill_folder_name.as_ref().cloned().unwrap_or_else(|| metadata.name.clone());
+    let raw_folder = skill_folder_name.as_ref().cloned().unwrap_or_else(|| metadata.name.clone());
+    let target_name: String = raw_folder
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    if target_name.is_empty() {
+        return Err("Invalid skill folder name".to_string());
+    }
     let dest_dir = skills_root.join(&target_name);
     fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
 
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        let raw_name = entry.name().to_string();
+        let entry = archive.by_index(i).map_err(|e| e.to_string())?;
+        let raw_name = entry.name().replace('\\', "/");
         let stripped = if let Some(prefix) = &skill_folder_name {
             raw_name.strip_prefix(prefix).unwrap_or(&raw_name).trim_start_matches('/')
         } else {
@@ -787,7 +794,12 @@ pub fn import_skill_zip(zip_bytes: &[u8], skills_root: &Path) -> Result<String, 
                 }
             }
             let mut outfile = File::create(&out_path).map_err(|e| e.to_string())?;
-            std::io::copy(&mut entry, &mut outfile).map_err(|e| e.to_string())?;
+            let mut limited = entry.take(MAX_SKILL_FILE_BYTES + 1);
+            let copied = std::io::copy(&mut limited, &mut outfile).map_err(|e| e.to_string())?;
+            if copied > MAX_SKILL_FILE_BYTES {
+                let _ = fs::remove_file(&out_path);
+                return Err(format!("Decompressed file exceeds limit: {}", raw_name));
+            }
         }
     }
 

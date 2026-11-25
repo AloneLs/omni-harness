@@ -155,7 +155,7 @@ function sendMock() {
 </script>
 
 {#if scopedCss}
-  {@html `<style>${scopedCss}</style>`}
+  {@html `<style>${scopedCss.replace(/<\/style/gi, '<\\/style')}</style>`}
 {/if}
 
 <div

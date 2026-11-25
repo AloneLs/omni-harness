@@ -43,19 +43,34 @@ class WhisperStore {
 
   private speedTracker: Record<string, { lastBytes: number; lastTs: number; speedMb: number }> = {};
   private listenersInitialized = false;
+  private unlistenFns: Array<() => void> = [];
+  private focusHandler: (() => void) | null = null;
+  private refreshReqId = 0;
 
   constructor() {
     this.initGlobalListeners();
     this.refresh();
   }
 
+  public destroy() {
+    if (this.focusHandler && typeof window !== 'undefined') {
+      window.removeEventListener('focus', this.focusHandler);
+      this.focusHandler = null;
+    }
+    for (const unlisten of this.unlistenFns.splice(0)) {
+      unlisten();
+    }
+    this.listenersInitialized = false;
+  }
+
   private initGlobalListeners() {
     if (this.listenersInitialized || typeof window === 'undefined') return;
     this.listenersInitialized = true;
 
-    window.addEventListener('focus', () => {
-      this.refresh();
-    });
+    this.focusHandler = () => {
+      void this.refresh();
+    };
+    window.addEventListener('focus', this.focusHandler);
 
     listen<{ modelId: string; downloaded: number; total: number; percent: number }>(
       'whisper-download-progress',
@@ -85,7 +100,9 @@ class WhisperStore {
             : m
         );
       }
-    ).catch(() => {});
+    )
+      .then((fn) => this.unlistenFns.push(fn))
+      .catch(() => {});
 
     listen<{ modelId: string; status: string; error?: string }>(
       'whisper-download-finished',
@@ -116,12 +133,16 @@ class WhisperStore {
         }
         this.refresh();
       }
-    ).catch(() => {});
+    )
+      .then((fn) => this.unlistenFns.push(fn))
+      .catch(() => {});
   }
 
   async refresh() {
+    const reqId = ++this.refreshReqId;
     try {
       const res = await invoke<BackendWhisperModel[]>('get_speech_status');
+      if (reqId !== this.refreshReqId) return;
       if (Array.isArray(res)) {
         const statusMap = new Map<string, BackendWhisperModel>();
         for (const item of res) {

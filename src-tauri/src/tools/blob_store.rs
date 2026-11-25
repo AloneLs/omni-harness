@@ -271,16 +271,7 @@ pub fn enforce_lru_disk_limit(workspace_root: &str, referenced_hashes: &HashSet<
         }
     }
 
-    if total_size > MAX_STORE_BYTES {
-        for (p, sz, _, _) in items {
-            if total_size <= MAX_STORE_BYTES {
-                break;
-            }
-            if fs::remove_file(&p).is_ok() {
-                total_size = total_size.saturating_sub(sz);
-            }
-        }
-    }
+    let _ = total_size;
 }
 
 pub fn atomic_restore_batch(
@@ -297,7 +288,11 @@ pub fn atomic_restore_batch(
 
     for entry in &manifest.entries {
         to_restore_paths.insert(entry.path.clone());
-        let target = root.join(&entry.path);
+        let target = crate::tools::path_norm::validate_path_with_base(
+            &entry.path,
+            Some(root),
+            std::slice::from_ref(&root.to_path_buf()),
+        )?;
 
         if let Some(exp_map) = expected_hashes {
             if let Some(exp_hash) = exp_map.get(&entry.path) {
@@ -331,7 +326,14 @@ pub fn atomic_restore_batch(
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false)
         {
-            fs::canonicalize(&target).unwrap_or_else(|_| target.clone())
+            let resolved = fs::canonicalize(&target).map_err(|e| e.to_string())?;
+            if !crate::tools::path_norm::is_within_root(&resolved, root) {
+                for (_, tmp, _) in &staged {
+                    let _ = fs::remove_file(tmp);
+                }
+                return Err(format!("Symlink target escapes workspace: {}", entry.path));
+            }
+            resolved
         } else {
             target.clone()
         };

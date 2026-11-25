@@ -70,15 +70,24 @@ impl RolePermissionEngine {
         ]
     }
 
-    pub fn is_tool_allowed(_role: &AgentRole, _tool_name: &str) -> bool {
-        true
+    pub fn is_tool_allowed(role: &AgentRole, tool_name: &str) -> bool {
+        match role {
+            AgentRole::Main => true,
+            AgentRole::Researcher | AgentRole::Verifier | AgentRole::Critic | AgentRole::Advisor => {
+                !matches!(tool_name, "write_file" | "edit_file" | "fs_ops" | "multi_actions" | "generate_image")
+            }
+            AgentRole::Supervisor => !matches!(tool_name, "write_file" | "edit_file" | "fs_ops"),
+        }
     }
 
     pub fn validate_execution(
-        _role: &AgentRole,
-        _tool_name: &str,
+        role: &AgentRole,
+        tool_name: &str,
         _tool_args: &serde_json::Value,
     ) -> Result<(), String> {
+        if !Self::is_tool_allowed(role, tool_name) {
+            return Err(format!("Role '{}' is not permitted to invoke '{}'", role.as_str(), tool_name));
+        }
         Ok(())
     }
 }

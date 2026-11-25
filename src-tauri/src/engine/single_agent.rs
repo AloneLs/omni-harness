@@ -12,7 +12,7 @@ use crate::engine::task_contract::{
 use crate::llm::capabilities::{CapabilityRegistry, ModelFamily};
 use crate::llm::key_pool::KeyPool;
 use crate::llm::request_compat::{ChatMessage, ChatRequest, ContentPart, FunctionSpec, ImageUrlDetail, MessageContent, ToolCall, ToolDefinition};
-use crate::llm::{dispatch_stream, StreamEvent, TokenCountRouter, TokenUsage};
+use crate::llm::{dispatch_stream_with_protocol, StreamEvent, TokenCountRouter, TokenUsage};
 use crate::tools::ToolDispatcher;
 use serde_json::Value;
 use std::sync::Arc;
@@ -384,6 +384,7 @@ impl SingleAgentRunner {
         client: &reqwest::Client,
         provider_name: &str,
         base_url: &str,
+        api_protocol: Option<&str>,
         key_pool: &KeyPool,
         caps_registry: &CapabilityRegistry,
         model_name: &str,
@@ -422,12 +423,13 @@ impl SingleAgentRunner {
         let (tx, mut rx) = mpsc::channel(64);
         let p = provider_name.to_string();
         let b = base_url.to_string();
+        let ap = api_protocol.map(|s| s.to_string());
         let kp = key_pool.clone();
         let cr = caps_registry.clone();
         let c = client.clone();
 
         let join = tokio::spawn(async move {
-            dispatch_stream(&c, &p, &b, &kp, &cr, req, tx).await
+            dispatch_stream_with_protocol(&c, &p, &b, ap.as_deref(), &kp, &cr, req, tx).await
         });
 
         let mut summary = String::new();
@@ -625,7 +627,6 @@ impl SingleAgentRunner {
         if trimmed_prompt.starts_with("/compact") {
             let custom_instr = trimmed_prompt.strip_prefix("/compact").map(|s| s.trim());
             let before_tokens = count_context_tokens(model_name, caps.family, history, &available_tools, db);
-            let client = reqwest::Client::new();
             let (proj, _) = ContextBuilder::build_projection(
                 history,
                 workspace_root,
@@ -637,9 +638,10 @@ impl SingleAgentRunner {
                 false,
             );
             let summary = Self::run_cache_safe_compaction(
-                &client,
+                http_client,
                 provider_name,
                 base_url,
+                api_protocol,
                 key_pool,
                 caps_registry,
                 model_name,
@@ -898,6 +900,7 @@ impl SingleAgentRunner {
                         http_client,
                         provider_name,
                         base_url,
+                        api_protocol,
                         key_pool,
                         caps_registry,
                         model_name,
@@ -1173,7 +1176,11 @@ impl SingleAgentRunner {
 
                     if policy_retries < MAX_POLICY_RETRIES {
                         policy_retries += 1;
-                        if let Some(last_user) = history.iter_mut().rev().find(|m| m.role == "user") {
+                        if let Some(last_user) = history
+                            .iter_mut()
+                            .rev()
+                            .find(|m| m.role == "user" && matches!(m.content, MessageContent::Text(_)))
+                        {
                             let raw_txt = last_user.content.as_text_lossy();
                             if !raw_txt.trim_start().starts_with("artifact://sha256:") && !raw_txt.trim().is_empty() {
                                 if let Ok(art) = crate::engine::policy_guard::ArtifactStore::save_text_artifact(&raw_txt) {
@@ -1254,6 +1261,7 @@ impl SingleAgentRunner {
                                 http_client,
                                 provider_name,
                                 base_url,
+                                api_protocol,
                                 key_pool,
                                 caps_registry,
                                 model_name,
@@ -1541,6 +1549,17 @@ Complete all remaining items and mark each one as completed via task_board(actio
                         results.push(item);
                     }
                 }
+                for (idx, tc) in active_tool_calls.iter().enumerate() {
+                    if !results.iter().any(|r| r.0 == idx) {
+                        results.push((
+                            idx,
+                            tc.id.clone(),
+                            tc.function.name.clone(),
+                            0,
+                            Err("Subagent task panicked".to_string()),
+                        ));
+                    }
+                }
                 results.sort_by_key(|r| r.0);
 
                 for (_idx, tc_id, tc_name, elapsed_ms, sub_res) in results {
@@ -1672,6 +1691,31 @@ Complete all remaining items and mark each one as completed via task_board(actio
                             })
                             .await;
                         batch_res.push(item);
+                    }
+                }
+                for (idx, tc) in active_tool_calls.iter().enumerate() {
+                    if !batch_res.iter().any(|r| r.0 == idx) {
+                        let err_msg = "Tool task panicked".to_string();
+                        let out_str = serde_json::json!({ "error": err_msg }).to_string();
+                        let _ = event_sender
+                            .send(StreamEvent::ToolExecEnd {
+                                id: tc.id.clone(),
+                                success: false,
+                                output: out_str.clone(),
+                                error: Some(err_msg.clone()),
+                                elapsed_ms: 0,
+                            })
+                            .await;
+                        batch_res.push((
+                            idx,
+                            tc.id.clone(),
+                            tc.function.name.clone(),
+                            0,
+                            false,
+                            out_str,
+                            Some(err_msg),
+                            workspace_root.to_string(),
+                        ));
                     }
                 }
                 batch_res.sort_by_key(|r| r.0);
@@ -2372,7 +2416,17 @@ Complete all remaining items and mark each one as completed via task_board(actio
             let _ = state.transition(TaskStateEnum::Executing);
         }
 
-        if let Some(c) = contract.as_mut() {
+        if !session.is_active() {
+            let _ = tools.pty_manager.kill_all_for_chat(chat_id);
+            crate::tools::phantom_session::restore_all_staged_windows(true);
+            Self::save_checkpoint(db, chat_id, history);
+            let _ = event_sender
+                .send(StreamEvent::Error {
+                    error: "User canceled execution".to_string(),
+                })
+                .await;
+            return Err("User canceled execution".to_string());
+        } else if let Some(c) = contract.as_mut() {
             let _ = state.transition(TaskStateEnum::Verifying);
             let all_pass = c.is_all_criteria_passed();
 
@@ -2402,16 +2456,6 @@ Complete all remaining items and mark each one as completed via task_board(actio
                 c.set_verdict(verdict);
                 let _ = state.transition(TaskStateEnum::Executing);
             }
-        } else if !session.is_active() {
-            let _ = tools.pty_manager.kill_all_for_chat(chat_id);
-            crate::tools::phantom_session::restore_all_staged_windows(true);
-            Self::save_checkpoint(db, chat_id, history);
-            let _ = event_sender
-                .send(StreamEvent::Error {
-                    error: "User canceled execution".to_string(),
-                })
-                .await;
-            return Err("User canceled execution".to_string());
         } else {
             let _ = state.transition(TaskStateEnum::Completed);
         }

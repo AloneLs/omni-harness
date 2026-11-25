@@ -9,7 +9,7 @@ on:
       tag_name:
         description: 'Release tag name (e.g. v1.0.0)'
         required: false
-        default: 'v1.0.0'
+        default: 'v1.0.6'
       draft:
         description: 'Create draft release'
         required: false
@@ -121,8 +121,8 @@ jobs:
           Write-Output "Archive created: $zipFile"
           Get-Content "checksums.txt"
 
-          echo "RELEASE_VERSION=$ver" >> $env:GITHUB_ENV
-          echo "ZIP_PATH=$zipFile" >> $env:GITHUB_ENV
+          "RELEASE_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "ZIP_PATH=$zipFile" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Upload Build Artifacts (Actions Storage)
         uses: actions/upload-artifact@v4

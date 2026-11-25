@@ -843,6 +843,7 @@ async fn parse_antigravity_sse(
     sender: tokio::sync::mpsc::Sender<StreamEvent>,
 ) -> Result<(), LlmError> {
     let mut byte_stream = response.bytes_stream();
+    let mut raw_buf: Vec<u8> = Vec::new();
     let mut line_buffer = String::new();
     let mut token_usage: Option<TokenUsage> = None;
     let mut finish_reason: Option<String> = None;
@@ -854,8 +855,8 @@ async fn parse_antigravity_sse(
             Ok(c) => c,
             Err(e) => return Err(LlmError::Network(e)),
         };
-        let text = String::from_utf8_lossy(&chunk);
-        line_buffer.push_str(&text);
+        raw_buf.extend_from_slice(&chunk);
+        crate::llm::drain_valid_utf8(&mut raw_buf, &mut line_buffer);
 
         while let Some(pos) = line_buffer.find('\n') {
             let line = line_buffer[..pos].trim_end_matches('\r').to_string();
@@ -1071,7 +1072,8 @@ pub async fn generate_antigravity_image(
 
     let status = resp.status().as_u16();
     let body_text = resp.text().await.map_err(|e| crate::error::format_reqwest_error(&e))?;
-    crate::logger::record_http("AntigravityImage", "POST", url, status, &body_text[..body_text.len().min(300)]);
+    let body_preview: String = body_text.chars().take(300).collect();
+    crate::logger::record_http("AntigravityImage", "POST", url, status, &body_preview);
     if !(200..300).contains(&status) {
         crate::logger::error_with_trace("AntigravityImage", &format!("Image gen failed ({}): {}", status, body_text));
         return Err(format!("Antigravity image generation failed ({}): {}", status, body_text));

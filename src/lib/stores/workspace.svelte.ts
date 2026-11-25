@@ -111,7 +111,7 @@ class WorkspaceStore {
     if (this.recentWorkspaces.some((p) => p.replace(/[\\/]+$/, '').toLowerCase() === norm)) {
       return;
     }
-    const list = [...this.recentWorkspaces, path].slice(0, 30);
+    const list = [path, ...this.recentWorkspaces].slice(0, 30);
     this.recentWorkspaces = list;
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem('omni_recent_workspaces', JSON.stringify(list));

@@ -47,7 +47,6 @@ const inPreviewContext = getContext<boolean>('omni-preview-only') || false;
 let isPreview = $derived(previewOnly || inPreviewContext);
 let override = $derived(themeStore.resolveIconOverride(name, isPreview));
 let isRawSvg = $derived(Boolean(override && override.trim().startsWith('<svg')));
-let isHtmlTag = $derived(Boolean(override && /^<[a-z]+/i.test(override.trim()) && !isRawSvg));
 let isImageUrl = $derived(
   Boolean(
     override &&
@@ -55,14 +54,13 @@ let isImageUrl = $derived(
         override.startsWith('http://') ||
         override.startsWith('https://') ||
         override.startsWith('blob:') ||
-        override.startsWith('asset://') ||
-        /\.(png|jpg|jpeg|webp|gif|svg|ico)$/i.test(override))
+        override.startsWith('asset://'))
   )
 );
 </script>
 
-{#if isRawSvg || isHtmlTag}
-  <span class="inline-flex items-center justify-center shrink-0 {className}" data-omni-icon={name}>{@html override}</span>
+{#if isRawSvg && override}
+  <img src={`data:image/svg+xml;utf8,${encodeURIComponent(override)}`} alt={name} class="inline-block object-contain shrink-0 {className}" data-omni-icon={name} />
 {:else if isImageUrl && override}
   <img src={override} alt={name} class="inline-block object-contain shrink-0 {className}" data-omni-icon={name} />
 {:else}

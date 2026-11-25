@@ -165,9 +165,6 @@ const SETTINGS_TABS: { id: typeof activeSettingsTab; label: string; icon: string
 ];
 
 onMount(() => {
-  try {
-    themeStore.syncCustomRuntime();
-  } catch (_) {}
   invoke('window_show').catch(() => {});
   launchSpring.target = { opacity: 1, scale: 1, y: 0 };
   const updateTimer = setTimeout(() => {
@@ -508,7 +505,7 @@ $effect(() => {
             </button>
           </div>
           <div class="flex-1 overflow-y-auto">
-            <TodoContractPanel onRollback={(path: string) => chatStore.rollbackSnapshot(path)} />
+            <TodoContractPanel />
           </div>
         </div>
       {/if}

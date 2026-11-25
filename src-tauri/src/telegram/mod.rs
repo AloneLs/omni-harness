@@ -669,12 +669,9 @@ impl TelegramBotManager {
     }
 
     pub async fn generate_pairing_code(&self) -> String {
-        use std::time::SystemTime;
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(123456);
-        let code = format!("{:06}", (nanos % 900000) + 100000);
+        use rand::Rng;
+        let num: u32 = rand::thread_rng().gen_range(100_000..1_000_000);
+        let code = format!("{:06}", num);
         let mut lock = self.pairing_code.write().await;
         *lock = Some(code.clone());
         code
@@ -825,7 +822,16 @@ impl TelegramBotManager {
                                         .trim()
                                         .to_string();
 
-                                    let authorized = allowed_chats.read().await.contains(&chat_id);
+                                    let chat_type = msg["chat"]["type"].as_str().unwrap_or("");
+                                    let sender_id = msg["from"]["id"].as_i64().unwrap_or(0);
+                                    let authorized = {
+                                        let allowed = allowed_chats.read().await;
+                                        if chat_type == "private" {
+                                            allowed.contains(&chat_id)
+                                        } else {
+                                            allowed.contains(&chat_id) && allowed.contains(&sender_id)
+                                        }
+                                    };
                                     if !authorized {
                                         let ctx_opt_unauth = runtime_ctx_arc.read().await.clone();
                                         handle_unauthorized_message(
@@ -877,7 +883,16 @@ impl TelegramBotManager {
                                     let msg_id = cb["message"]["message_id"].as_i64().unwrap_or(0);
                                     let chat_id = cb["message"]["chat"]["id"].as_i64().unwrap_or(0);
 
-                                    let authorized = allowed_chats.read().await.contains(&chat_id);
+                                    let chat_type = cb["message"]["chat"]["type"].as_str().unwrap_or("");
+                                    let sender_id = cb["from"]["id"].as_i64().unwrap_or(0);
+                                    let authorized = {
+                                        let allowed = allowed_chats.read().await;
+                                        if chat_type == "private" {
+                                            allowed.contains(&chat_id)
+                                        } else {
+                                            allowed.contains(&chat_id) && allowed.contains(&sender_id)
+                                        }
+                                    };
                                     if !authorized || chat_id == 0 || msg_id == 0 {
                                         tg_client
                                             .answer_callback(cb_id, Some("Доступ запрещён"))

@@ -129,11 +129,13 @@ pub struct SecretShield;
 impl SecretShield {
     pub fn check_path(path: &Path) -> Result<(), String> {
         let lower = path.to_string_lossy().to_lowercase().replace('\\', "/");
-        let file_name = path
+        let raw_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_lowercase();
+        let base_name = raw_name.split(':').next().unwrap_or(&raw_name);
+        let file_name = base_name.trim_end_matches(['.', ' ']);
 
         if file_name == ".env"
             || file_name.starts_with(".env.")
@@ -175,7 +177,6 @@ impl ShellPolicyGuard {
             ":(){ :|:& };:",
             "env | curl",
             "printenv | curl",
-            "curl.*id_rsa",
             "powershell -enc",
         ];
         for pat in red_patterns {
@@ -183,8 +184,14 @@ impl ShellPolicyGuard {
                 return Err(format!("Policy Guard (RED): blocked dangerous command pattern '{}'", pat));
             }
         }
+        if lower.contains("curl") && lower.contains("id_rsa") {
+            return Err("Policy Guard (RED): blocked dangerous command pattern 'curl + id_rsa'".to_string());
+        }
 
         if plan_mode {
+            if lower.contains("$(") || lower.contains('`') || lower.contains('>') || lower.contains(">>") {
+                return Err("Plan Mode Guard: command substitution or redirection is blocked in read-only Plan mode.".to_string());
+            }
             let segments: Vec<&str> = lower
                 .split(['|', ';', '\n'])
                 .flat_map(|s| s.split("&&"))
@@ -198,7 +205,10 @@ impl ShellPolicyGuard {
                 "cargo check", "cargo test", "npm test", "pwd", "echo", "tree",
             ];
             for seg in segments {
-                if !allowed_ro.iter().any(|p| seg.starts_with(p)) {
+                let ok = allowed_ro.iter().any(|p| {
+                    seg == *p || seg.strip_prefix(p).map(|r| r.starts_with(char::is_whitespace)).unwrap_or(false)
+                });
+                if !ok {
                     return Err(format!(
                         "Plan Mode Guard: command '{}' is blocked in read-only Plan mode.",
                         seg

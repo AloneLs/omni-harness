@@ -281,10 +281,22 @@ impl Database {
     }
 
     pub fn delete_chat(&self, id: &str) -> Result<(), AppError> {
-        let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
-        conn.execute("DELETE FROM chats WHERE id = ?1", [id])?;
-        let _ = conn.execute("DELETE FROM agent_checkpoints WHERE chat_id = ?1", [id]);
-        let _ = conn.execute("DELETE FROM chat_context_cache WHERE chat_id = ?1", [id]);
+        let mut conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        let tx = conn.transaction()?;
+        for tbl in [
+            "agent_checkpoints",
+            "chat_context_cache",
+            "goal_states",
+            "plan_states",
+            "session_memory",
+            "session_artifacts",
+            "compaction_events",
+            "checkpoints",
+        ] {
+            tx.execute(&format!("DELETE FROM {} WHERE chat_id = ?1", tbl), [id])?;
+        }
+        tx.execute("DELETE FROM chats WHERE id = ?1", [id])?;
+        tx.commit()?;
         Ok(())
     }
 

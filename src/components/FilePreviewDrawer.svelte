@@ -95,20 +95,27 @@ $effect(() => {
   if (!req) {
     fileContent = '';
     errorMsg = null;
+    loading = false;
     return;
   }
+  let cancelled = false;
   loading = true;
   errorMsg = null;
   invoke<string>('read_file_full', { path: req.path })
     .then((res) => {
+      if (cancelled) return;
       fileContent = res;
       loading = false;
     })
     .catch((err) => {
+      if (cancelled) return;
       errorMsg = err instanceof Error ? err.message : String(err);
       fileContent = '';
       loading = false;
     });
+  return () => {
+    cancelled = true;
+  };
 });
 </script>
 

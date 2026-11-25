@@ -27,8 +27,8 @@ export function highlightCode(code: string, _lang: string): string {
   };
 
   let out = escaped
-    .replace(/(\/\/[^\n]*|#[^\n]*)/g, (m) => hold(`<span class="text-[#6B7280] italic">${m}</span>`))
-    .replace(/(&quot;[^&\n]*?&quot;|&#39;[^&\n]*?&#39;)/g, (m) => hold(`<span class="text-[#A5D6FF]">${m}</span>`));
+    .replace(/(&quot;(?:(?!&quot;)[^\n])*?&quot;|&#39;(?:(?!&#39;)[^\n])*?&#39;)/g, (m) => hold(`<span class="text-[#A5D6FF]">${m}</span>`))
+    .replace(/(\/\/[^\n]*|(?:^|\s)#[^\n]*)/g, (m) => hold(`<span class="text-[#6B7280] italic">${m}</span>`));
 
   out = out
     .replace(/\b(const|let|var|function|return|if|else|for|while|loop|import|from|export|default|class|interface|type|extends|implements|new|this|async|await|try|catch|finally|throw|fn|pub|struct|enum|impl|match|mut|use|crate|mod|def|self|None|True|False|package|func|select|switch|case|break|continue|where|unsafe|extern)\b/g, '<span class="text-[#FF7B72] font-medium">$1</span>')
@@ -132,9 +132,12 @@ export function renderMarkdown(content: string): string {
     return `\u0000SLOT_${idx}\u0000`;
   };
 
-  let text = content.replace(/\r\n/g, '\n');
+  let text = content.replace(/\r\n/g, '\n').replace(/\u0000/g, '');
 
-  text = text.replace(/<div class="interactive-viz-mount[^>]*><\/div>/g, (m) => hold(m));
+  text = text.replace(
+    /<div class="interactive-viz-mount my-4" data-viz-id="(viz-[\w-]+)" data-viz-title="([^"]*)"><\/div>/g,
+    (_, id, title) => hold(`<div class="interactive-viz-mount my-4" data-viz-id="${escapeHtml(id)}" data-viz-title="${escapeHtml(title)}"></div>`)
+  );
 
   const renderCodeBlockHtml = (rawLang: string, code: string): string => {
     const lang = (rawLang || '').trim().toLowerCase() || 'text';

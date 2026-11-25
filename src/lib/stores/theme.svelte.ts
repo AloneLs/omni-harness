@@ -179,9 +179,14 @@ export function compileThemeCss(theme: OmniTheme | null, scopeSelector: string):
   const { atRules, remaining } = extractGlobalAtRules(css);
 
   let scopedBody = remaining
+    .replace(/<\/style/gi, '')
     .replace(/:root(?![\w-])/gi, ':scope')
     .replace(/(^|[\s,>+~])(html|body)(?![\w-])/gi, '$1:scope')
     .replace(/(^|[\s,>+~])\[data-omni-app\]/gi, '$1:scope');
+
+  const opens = (scopedBody.match(/\{/g) || []).length;
+  const closes = (scopedBody.match(/\}/g) || []).length;
+  if (opens !== closes) return '';
 
   return `${atRules.join('\n')}\n@scope (${scopeSelector}) to ([data-omni-studio-ui], [data-omni-preview-bar], [data-omni-window-bar]) {\n${scopedBody}\n}`;
 }
@@ -320,6 +325,7 @@ class ThemeStore {
     if (this.activeThemeId === id) {
       this.activeThemeId = null;
       await invoke('set_active_theme_id', { id: null }).catch(() => {});
+      this.syncCustomRuntime();
     }
     if (this.editingTheme?.id === id) {
       this.editingTheme = this.themes[0] || null;

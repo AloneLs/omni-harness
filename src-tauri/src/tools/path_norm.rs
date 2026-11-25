@@ -101,7 +101,7 @@ pub fn lexical_clean(path: &Path) -> PathBuf {
             }
             Component::CurDir => {}
             Component::ParentDir => {
-                if !parts.is_empty() {
+                if parts.last().map(|p| p != "..").unwrap_or(false) {
                     parts.pop();
                 } else if !has_root && prefix.is_none() {
                     parts.push(OsString::from(".."));
@@ -294,31 +294,5 @@ pub fn validate_read_path_with_base(
     working_dir: Option<&Path>,
     allowed_roots: &[PathBuf],
 ) -> Result<PathBuf, String> {
-    if let Ok(ok) = validate_path_with_base(path_str, working_dir, allowed_roots) {
-        return Ok(ok);
-    }
-    let base = working_dir.or_else(|| allowed_roots.first().map(|p| p.as_path()));
-    let resolved = resolve_against_base(path_str, base)?;
-    if allowed_roots.is_empty() {
-        return Ok(resolved);
-    }
-    for root in allowed_roots {
-        let norm_root = canonicalize_best_effort(root).unwrap_or_else(|_| lexical_clean(root));
-        if is_within_root(&norm_root, &resolved) && path_key(&resolved).len() > 3 {
-            return Ok(resolved);
-        }
-        let mut cur = norm_root.as_path();
-        for _ in 0..3 {
-            if let Some(par) = cur.parent() {
-                if path_key(par).len() > 3 && is_within_root(&resolved, par) {
-                    return Ok(resolved);
-                }
-                cur = par;
-            }
-        }
-    }
-    Err(format!(
-        "Access denied: path '{}' resolves outside allowed workspace root.",
-        path_str
-    ))
+    validate_path_with_base(path_str, working_dir, allowed_roots)
 }

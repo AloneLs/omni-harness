@@ -1001,7 +1001,8 @@ fn draw_element_hover_box(
 
     // Element badge if label exists
     if !hover.label.is_empty() {
-        let badge_x = (x1 + 4).clamp(4, w - 80) as f32;
+        let max_x = (w - 80).max(4);
+        let badge_x = (x1 + 4).clamp(4, max_x) as f32;
         let badge_y = (y1 - 18).max(4) as f32;
         draw_status_badge(buf, w, h, badge_x, badge_y, &hover.label, alpha * 0.9);
     }

@@ -129,8 +129,10 @@ async fn parse_http_or_sse_response(resp: reqwest::Response) -> Result<Value, St
                     continue;
                 }
                 if let Ok(parsed) = serde_json::from_str::<JsonRpcResponse>(trimmed) {
-                    found = Some(parsed);
-                    break;
+                    if parsed.id.is_some() {
+                        found = Some(parsed);
+                        break;
+                    }
                 }
             }
         }
@@ -459,6 +461,16 @@ impl McpServerCatalog {
             Ok(())
         } else {
             Err(format!("Server '{}' not connected", name))
+        }
+    }
+
+    pub async fn disconnect_all(&self) {
+        let mut map = self.servers.write().await;
+        for (_, srv) in map.drain() {
+            if let McpTransportConnection::Stdio(conn) = &srv.connection {
+                let mut child = conn.child.lock().await;
+                let _ = child.kill().await;
+            }
         }
     }
 
