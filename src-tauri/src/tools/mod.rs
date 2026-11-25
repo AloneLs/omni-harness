@@ -28,6 +28,81 @@ pub struct ToolParameterProperty {
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub items: Option<Box<ToolParameterProperty>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<BTreeMap<String, ToolParameterProperty>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<Vec<String>>,
+}
+
+fn simple_prop(prop_type: &str, description: &str) -> ToolParameterProperty {
+    ToolParameterProperty {
+        prop_type: prop_type.to_string(),
+        description: description.to_string(),
+        items: None,
+        properties: None,
+        required: None,
+    }
+}
+
+fn array_items_for(tool_name: &str, prop_name: &str) -> Option<Box<ToolParameterProperty>> {
+    match (tool_name, prop_name) {
+        ("edit_file", "edits") => {
+            let mut props = BTreeMap::new();
+            props.insert("old_text".to_string(), simple_prop("string", "Exact text to find and replace"));
+            props.insert("new_text".to_string(), simple_prop("string", "Replacement text"));
+            Some(Box::new(ToolParameterProperty {
+                prop_type: "object".to_string(),
+                description: "Edit operation {old_text, new_text}".to_string(),
+                items: None,
+                properties: Some(props),
+                required: Some(vec!["old_text".to_string(), "new_text".to_string()]),
+            }))
+        }
+        ("task_board", "items") => {
+            let mut props = BTreeMap::new();
+            props.insert("id".to_string(), simple_prop("string", "Unique step ID"));
+            props.insert("text".to_string(), simple_prop("string", "Step description"));
+            props.insert("status".to_string(), simple_prop("string", "pending | in_progress | completed | failed"));
+            Some(Box::new(ToolParameterProperty {
+                prop_type: "object".to_string(),
+                description: "Task step {id, text, status}".to_string(),
+                items: None,
+                properties: Some(props),
+                required: Some(vec!["id".to_string(), "text".to_string(), "status".to_string()]),
+            }))
+        }
+        ("subagent_builder", "tools") | ("subagent_builder", "disallowed_tools") => {
+            Some(Box::new(simple_prop("string", "Tool name")))
+        }
+        ("computer_use", "args") => {
+            Some(Box::new(simple_prop("string", "CLI argument string")))
+        }
+        ("computer_use", "region") => {
+            Some(Box::new(simple_prop("integer", "Coordinate or dimension in 0..1000")))
+        }
+        ("computer_use", "actions") | ("multi_actions", "actions") => {
+            let mut props = BTreeMap::new();
+            props.insert("action".to_string(), simple_prop("string", "click | double_click | right_click | middle_click | move | drag | scroll | type | hotkey | wait"));
+            props.insert("x".to_string(), simple_prop("integer", "Window-relative X"));
+            props.insert("y".to_string(), simple_prop("integer", "Window-relative Y"));
+            props.insert("to_x".to_string(), simple_prop("integer", "Target X for drag"));
+            props.insert("to_y".to_string(), simple_prop("integer", "Target Y for drag"));
+            props.insert("text".to_string(), simple_prop("string", "Text for type"));
+            props.insert("keys".to_string(), simple_prop("string", "Hotkey combo"));
+            props.insert("delta".to_string(), simple_prop("integer", "Scroll wheel delta"));
+            props.insert("wait_ms".to_string(), simple_prop("integer", "Wait duration in ms"));
+            props.insert("clear_first".to_string(), simple_prop("boolean", "Clear input before typing"));
+            props.insert("submit_enter".to_string(), simple_prop("boolean", "Press Enter after typing"));
+            Some(Box::new(ToolParameterProperty {
+                prop_type: "object".to_string(),
+                description: "Sequential UI action object".to_string(),
+                items: None,
+                properties: Some(props),
+                required: Some(vec!["action".to_string()]),
+            }))
+        }
+        _ => Some(Box::new(simple_prop("string", "Item value"))),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,14 +317,12 @@ impl ToolDispatcher {
                         prop_type: p_type.to_string(),
                         description: p_desc.to_string(),
                         items: if *p_type == "array" {
-                            Some(Box::new(ToolParameterProperty {
-                                prop_type: "object".to_string(),
-                                description: "Edit operation {old_text, new_text}".to_string(),
-                                items: None,
-                            }))
+                            array_items_for(name, p_name)
                         } else {
                             None
                         },
+                        properties: None,
+                        required: None,
                     },
                 );
             }
@@ -320,20 +393,21 @@ impl ToolDispatcher {
 
         declarations.push(make_decl(
             "read_file",
-            "Read text file window (default 350 lines with L-numbers), image (base64 for vision), or PDF. Always prefer this over cat/head/tail in terminal_exec. Records file hash for edit safety. Supports relative or absolute paths (full PC access).",
+            "Read text file window (default 350 lines with L-numbers), image (base64 for vision), audio/video, or PDF. Always prefer this over cat/head/tail in terminal_exec. Records file hash for edit safety. Reads workspace, nearby project paths, and AppData (or full PC when no project sandbox is active).",
             &[
                 ("path", "string", "File path (relative to workspace or absolute)"),
                 ("offset", "integer", "0-based starting line index"),
-                ("limit", "integer", "Max lines to return (default 350, max 2000)"),
+                ("limit", "integer", "Max lines to return (default 350, max 2000), or max chars when char_offset is set"),
+                ("char_offset", "integer", "Optional 0-based character offset for paging single-line/minified files or spill logs"),
             ],
             &["path"],
         ));
 
         declarations.push(make_decl(
             "edit_file",
-            "Exact search-and-replace edits [{old_text, new_text}] (never use sed/awk). Requires prior read_file; provide enough unique context in old_text so it matches unambiguously. Supports relative or absolute paths (full PC access).",
+            "Exact search-and-replace edits [{old_text, new_text}] (never use sed/awk). Requires prior read_file; provide enough unique context in old_text so it matches unambiguously. Scoped to workspace and allowed project/AppData roots.",
             &[
-                ("path", "string", "Target file path (relative to workspace or absolute)"),
+                ("path", "string", "Target file path (relative to workspace or allowed absolute path)"),
                 ("edits", "array", "Array of {old_text, new_text} objects"),
                 ("replace_all", "boolean", "Replace all occurrences of old_text"),
             ],
@@ -342,9 +416,9 @@ impl ToolDispatcher {
 
         declarations.push(make_decl(
             "write_file",
-            "Atomically create a new file (creating parent dirs) or overwrite an existing file (requires prior read_file). Supports relative or absolute paths (full PC access).",
+            "Atomically create a new file (creating parent dirs) or overwrite an existing file (requires prior read_file). Scoped to workspace and allowed project/AppData roots.",
             &[
-                ("path", "string", "Target file path (relative to workspace or absolute)"),
+                ("path", "string", "Target file path (relative to workspace or allowed absolute path)"),
                 ("content", "string", "Full file content"),
                 ("overwrite", "boolean", "Allow overwriting existing file (default true)"),
             ],
@@ -411,10 +485,10 @@ impl ToolDispatcher {
 
         declarations.push(make_decl(
             "glob",
-            "Fast pattern file search (**/*.svelte, src/**/auth*) ignoring .git/node_modules/target, sorted by newest mtime first. Always prefer over find/ls in terminal_exec. Supports relative or absolute root directory.",
+            "Fast pattern file search (**/*.svelte, src/**/auth*) ignoring .git/node_modules/target, sorted by newest mtime first. Always prefer over find/ls in terminal_exec. Accepts workspace or readable project/AppData subdirectory (bare drive roots are blocked).",
             &[
                 ("pattern", "string", "Glob pattern"),
-                ("path", "string", "Root directory (optional, relative or absolute)"),
+                ("path", "string", "Root directory (optional, relative or readable absolute subdirectory)"),
                 ("limit", "integer", "Max results (default 100)"),
             ],
             &["pattern"],
@@ -422,12 +496,16 @@ impl ToolDispatcher {
 
         declarations.push(make_decl(
             "grep",
-            "Fast regex code search across workspace with +-2 context lines. Always prefer over grep/rg in terminal_exec. Supports relative or absolute root directory.",
+            "Fast regex code search across workspace with context lines, mode (content | files_with_matches | count), and pagination. Always prefer over grep/rg in terminal_exec.",
             &[
                 ("pattern", "string", "Regex pattern"),
-                ("path", "string", "Root directory (optional, relative or absolute)"),
+                ("path", "string", "Root directory or file path (optional, relative or readable absolute)"),
                 ("file_type", "string", "Filter by extension e.g. rs, svelte, ts"),
-                ("context_lines", "integer", "Context lines around match (default 2)"),
+                ("context_lines", "integer", "Context lines around match for content mode (default 2)"),
+                ("mode", "string", "content | files_with_matches | count (default content)"),
+                ("limit", "integer", "Max matches/files to return (default 120, max 500)"),
+                ("offset", "integer", "0-based result offset for pagination (default 0)"),
+                ("case_insensitive", "boolean", "Case-insensitive regex search (default false)"),
             ],
             &["pattern"],
         ));
@@ -788,10 +866,11 @@ impl ToolDispatcher {
                 let resolved_path = self.resolve_read_path(raw_path)?.to_string_lossy().to_string();
                 let offset = args.get("offset").and_then(|v| v.as_u64()).map(|u| u as usize);
                 let limit = args.get("limit").and_then(|v| v.as_u64()).map(|u| u as usize);
+                let char_offset = args.get("char_offset").and_then(|v| v.as_u64()).map(|u| u as usize);
                 let roots = self.allowed_roots.clone();
                 let guard = self.read_guard.clone();
                 let mut res = tokio::task::spawn_blocking(move || {
-                    workspace::read_file_smart(&resolved_path, offset, limit, &roots, &guard)
+                    workspace::read_file_smart_with_char_offset(&resolved_path, offset, limit, char_offset, &roots, &guard)
                 })
                 .await
                 .map_err(|e| e.to_string())??;
@@ -1088,13 +1167,27 @@ impl ToolDispatcher {
                 };
                 let file_type = args.get("file_type").and_then(|v| v.as_str()).map(|s| s.to_string());
                 let ctx = args.get("context_lines").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+                let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("content").to_string();
+                let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(120) as usize;
+                let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let case_insensitive = args.get("case_insensitive").and_then(|v| v.as_bool()).unwrap_or(false);
                 let roots = self.allowed_roots.clone();
                 let res = tokio::task::spawn_blocking(move || {
-                    workspace::grep_with_context(&pattern, Some(&resolved_root), file_type.as_deref(), ctx, &roots)
+                    workspace::grep_with_options(
+                        &pattern,
+                        Some(&resolved_root),
+                        file_type.as_deref(),
+                        ctx,
+                        &mode,
+                        limit,
+                        offset,
+                        case_insensitive,
+                        &roots,
+                    )
                 })
                 .await
                 .map_err(|e| e.to_string())??;
-                Ok(json!({ "matches": res }))
+                Ok(res)
             }
             "code_intel" => {
                 let mode = args.get("mode").and_then(|v| v.as_str()).ok_or("Missing mode")?;
@@ -1118,26 +1211,66 @@ impl ToolDispatcher {
                         tokio::task::spawn_blocking(move || {
                             let p = std::path::Path::new(&path_owned);
                             let dir = if p.is_file() { p.parent().unwrap_or(p) } else { p };
-                            let (cmd, cmd_args): (&str, Vec<&str>) = if dir.join("Cargo.toml").exists() || dir.join("src-tauri/Cargo.toml").exists() {
-                                let manifest = if dir.join("src-tauri/Cargo.toml").exists() { "src-tauri/Cargo.toml" } else { "Cargo.toml" };
-                                ("cargo", vec!["check", "--manifest-path", manifest, "--message-format=short", "--color=never"])
-                            } else if dir.join("tsconfig.json").exists() {
-                                ("npx.cmd", vec!["tsc", "--noEmit", "--pretty", "false"])
-                            } else {
-                                return Ok(json!({ "status": "no_recognized_project_manifest" }));
-                            };
-                            let mut c = std::process::Command::new(cmd);
-                            c.args(&cmd_args).current_dir(dir);
-                            #[cfg(target_os = "windows")]
-                            {
-                                use std::os::windows::process::CommandExt;
-                                c.creation_flags(0x08000000);
+                            let mut commands: Vec<(&str, &str, Vec<&str>)> = Vec::new();
+                            if dir.join("src-tauri/Cargo.toml").exists() {
+                                commands.push(("cargo", "cargo", vec!["check", "--manifest-path", "src-tauri/Cargo.toml", "--message-format=short", "--color=never"]));
+                            } else if dir.join("Cargo.toml").exists() {
+                                commands.push(("cargo", "cargo", vec!["check", "--manifest-path", "Cargo.toml", "--message-format=short", "--color=never"]));
                             }
-                            let out = c.output().map_err(|e| e.to_string())?;
+                            let has_svelte = dir.join("svelte.config.js").exists()
+                                || dir.join("svelte.config.ts").exists()
+                                || std::fs::read_to_string(dir.join("package.json"))
+                                    .map(|s| s.contains("svelte-check"))
+                                    .unwrap_or(false);
+                            if has_svelte {
+                                let npx_bin = if cfg!(target_os = "windows") { "npx.cmd" } else { "npx" };
+                                commands.push(("svelte-check", npx_bin, vec!["svelte-check", "--tsconfig", "./tsconfig.json"]));
+                            } else if dir.join("tsconfig.json").exists() {
+                                let npx_bin = if cfg!(target_os = "windows") { "npx.cmd" } else { "npx" };
+                                commands.push(("tsc", npx_bin, vec!["tsc", "--noEmit", "--pretty", "false"]));
+                            }
+                            if commands.is_empty() {
+                                return Ok(json!({ "status": "no_recognized_project_manifest" }));
+                            }
+
+                            let mut checks = Vec::new();
+                            let mut combined_out = String::new();
+                            let mut combined_err = String::new();
+                            let mut overall_code = 0i32;
+
+                            for (label, cmd, cmd_args) in commands {
+                                let mut c = std::process::Command::new(cmd);
+                                c.args(&cmd_args).current_dir(dir);
+                                #[cfg(target_os = "windows")]
+                                {
+                                    use std::os::windows::process::CommandExt;
+                                    c.creation_flags(0x08000000);
+                                }
+                                let out = c.output().map_err(|e| e.to_string())?;
+                                let code = out.status.code().unwrap_or(-1);
+                                if code != 0 {
+                                    overall_code = code;
+                                }
+                                let stdout_s = process_pty::strip_ansi(&String::from_utf8_lossy(&out.stdout));
+                                let stderr_s = process_pty::strip_ansi(&String::from_utf8_lossy(&out.stderr));
+                                if !stdout_s.trim().is_empty() {
+                                    combined_out.push_str(&format!("[{}]\n{}\n", label, stdout_s.trim()));
+                                }
+                                if !stderr_s.trim().is_empty() {
+                                    combined_err.push_str(&format!("[{}]\n{}\n", label, stderr_s.trim()));
+                                }
+                                checks.push(json!({
+                                    "tool": label,
+                                    "exitCode": code,
+                                    "stdout": stdout_s,
+                                    "stderr": stderr_s,
+                                }));
+                            }
                             Ok(json!({
-                                "exitCode": out.status.code(),
-                                "stdout": process_pty::strip_ansi(&String::from_utf8_lossy(&out.stdout)),
-                                "stderr": process_pty::strip_ansi(&String::from_utf8_lossy(&out.stderr)),
+                                "exitCode": overall_code,
+                                "checks": checks,
+                                "stdout": combined_out.trim(),
+                                "stderr": combined_err.trim(),
                             }))
                         })
                         .await
@@ -1165,7 +1298,7 @@ impl ToolDispatcher {
                 } else if let Some(ms) = args.get("wait_ms_before_async").and_then(|v| v.as_u64()) {
                     ms.clamp(200, 30_000)
                 } else if let Some(secs) = args.get("timeout_secs").and_then(|v| v.as_u64()) {
-                    (secs.saturating_mul(1000)).clamp(500, 10_000)
+                    (secs.saturating_mul(1000)).clamp(500, 30_000)
                 } else {
                     8_000
                 };
@@ -1314,7 +1447,61 @@ impl ToolDispatcher {
                 let status = resp.status().as_u16();
                 let body = resp.text().await.unwrap_or_default();
                 let preview = crate::engine::context_engine::safe_slice_head(&body, 4000);
-                Ok(json!({ "url": url, "action": action, "httpStatus": status, "htmlPreview": preview }))
+
+                let url_owned = url.to_string();
+                let want_shot = action.eq_ignore_ascii_case("screenshot");
+                let cdp_res = tokio::task::spawn_blocking(move || -> Option<Value> {
+                    let ctrl = web_browser::CdpController::new(9222);
+                    let mut targets = ctrl.list_targets().ok().unwrap_or_default();
+                    let mut matched_ws = targets
+                        .iter()
+                        .find(|t| t.url.contains(&url_owned) || url_owned.contains(&t.url))
+                        .and_then(|t| t.web_socket_debugger_url.clone());
+
+                    if matched_ws.is_none() && want_shot {
+                        if targets.is_empty() {
+                            #[cfg(target_os = "windows")]
+                            {
+                                use std::os::windows::process::CommandExt;
+                                let _ = std::process::Command::new("cmd")
+                                    .args(["/C", "start", "", "msedge", "--headless=new", "--remote-debugging-port=9222", &url_owned])
+                                    .creation_flags(0x08000000)
+                                    .spawn();
+                                std::thread::sleep(std::time::Duration::from_millis(1600));
+                                targets = ctrl.list_targets().ok().unwrap_or_default();
+                                matched_ws = targets
+                                    .first()
+                                    .and_then(|t| t.web_socket_debugger_url.clone());
+                            }
+                        } else if let Some(first_ws) = targets.first().and_then(|t| t.web_socket_debugger_url.clone()) {
+                            let _ = ctrl.navigate(&first_ws, &url_owned);
+                            std::thread::sleep(std::time::Duration::from_millis(800));
+                            matched_ws = Some(first_ws);
+                        }
+                    }
+
+                    matched_ws.and_then(|ws| ctrl.collect_preview_diagnostics(&ws, want_shot).ok())
+                })
+                .await
+                .ok()
+                .flatten();
+
+                let mut out = json!({
+                    "url": url,
+                    "action": action,
+                    "httpStatus": status,
+                    "htmlPreview": preview,
+                });
+                if let (Some(dst), Some(cdp_val)) = (out.as_object_mut(), cdp_res) {
+                    if let Some(cdp_obj) = cdp_val.as_object() {
+                        for (k, v) in cdp_obj {
+                            dst.insert(k.clone(), v.clone());
+                        }
+                    } else {
+                        dst.insert("cdp".to_string(), cdp_val);
+                    }
+                }
+                Ok(out)
             }
             "web_research" => {
                 let target = args
@@ -1327,6 +1514,11 @@ impl ToolDispatcher {
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                     .ok_or("Missing query_or_url")?;
+                let focus_prompt = args
+                    .get("focus_prompt")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
                 let mode = args
                     .get("mode")
                     .and_then(|v| v.as_str())
@@ -1334,19 +1526,20 @@ impl ToolDispatcher {
                 match mode {
                     "search" => {
                         let q = target.to_string();
-                        let res = tokio::task::spawn_blocking(move || web_browser::duckduckgo_search(&q, 8))
+                        let res = tokio::task::spawn_blocking(move || web_browser::duckduckgo_search(&q, 10))
                             .await
                             .map_err(|e| e.to_string())??;
-                        Ok(json!(res))
+                        Ok(json!({ "query": target, "count": res.len(), "results": res }))
                     }
                     "fetch" => {
                         let ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+                        let sys_proxy = crate::resolve_windows_system_proxy();
                         let mut b = reqwest::Client::builder()
                             .timeout(std::time::Duration::from_secs(20))
                             .user_agent(ua)
                             .redirect(reqwest::redirect::Policy::limited(10));
-                        if let Some(sys_proxy) = crate::resolve_windows_system_proxy() {
-                            if let Ok(proxy) = reqwest::Proxy::all(&sys_proxy) {
+                        if let Some(ref sp) = sys_proxy {
+                            if let Ok(proxy) = reqwest::Proxy::all(sp) {
                                 b = b.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1,*.local,*.internal")));
                             }
                         }
@@ -1366,16 +1559,26 @@ impl ToolDispatcher {
                             _ => {
                                 let target_owned = target.to_string();
                                 let ua_owned = ua.to_string();
+                                let proxy_owned = sys_proxy.clone();
                                 tokio::task::spawn_blocking(move || -> Result<String, String> {
                                     let mut cmd = std::process::Command::new(if cfg!(target_os = "windows") { "curl.exe" } else { "curl" });
-                                    cmd.args([
-                                        "-sSL",
-                                        "--max-time", "20",
-                                        "-A", &ua_owned,
-                                        "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                                        "-H", "Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                                        &target_owned,
-                                    ]);
+                                    let mut curl_args: Vec<String> = vec![
+                                        "-sSL".to_string(),
+                                        "--max-time".to_string(),
+                                        "20".to_string(),
+                                        "-A".to_string(),
+                                        ua_owned,
+                                        "-H".to_string(),
+                                        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8".to_string(),
+                                        "-H".to_string(),
+                                        "Accept-Language: ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7".to_string(),
+                                    ];
+                                    if let Some(ref sp) = proxy_owned {
+                                        curl_args.push("-x".to_string());
+                                        curl_args.push(sp.clone());
+                                    }
+                                    curl_args.push(target_owned.clone());
+                                    cmd.args(&curl_args);
                                     #[cfg(target_os = "windows")]
                                     {
                                         use std::os::windows::process::CommandExt;
@@ -1392,8 +1595,13 @@ impl ToolDispatcher {
                             }
                         };
 
-                        let md = web_browser::html_to_markdown(&html);
-                        Ok(json!({ "url": target, "markdown": md }))
+                        let md_full = web_browser::html_to_markdown(&html);
+                        let md = if let Some(ref fp) = focus_prompt {
+                            web_browser::focus_extract_markdown(&md_full, fp, 24_000)
+                        } else {
+                            md_full
+                        };
+                        Ok(json!({ "url": target, "focused": focus_prompt.is_some(), "markdown": md }))
                     }
                     other => Err(format!("Unsupported web_research mode: {}", other)),
                 }
@@ -1496,6 +1704,13 @@ impl ToolDispatcher {
                         } else {
                             Err(format!("Skill '{}' not found", target))
                         }
+                    }
+                    "list_mcp" => {
+                        let db_opt = self.db.read().ok().and_then(|g| g.clone());
+                        let servers = db_opt
+                            .and_then(|d| d.list_mcp_servers().ok())
+                            .unwrap_or_default();
+                        Ok(json!({ "action": "list_mcp", "count": servers.len(), "servers": servers }))
                     }
                     _ => Ok(json!({ "action": action, "available": [] })),
                 }

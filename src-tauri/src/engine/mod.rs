@@ -1,3 +1,4 @@
+pub mod btw_context;
 pub mod commands;
 pub mod compaction;
 pub mod context_engine;
@@ -12,6 +13,7 @@ pub mod stream_manager;
 pub mod subagents;
 pub mod task_contract;
 
+pub use btw_context::*;
 pub use commands::*;
 pub use compaction::*;
 pub use context_engine::*;

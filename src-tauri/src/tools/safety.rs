@@ -185,6 +185,21 @@ impl ShellPolicyGuard {
         }
 
         if plan_mode {
+            // Block file-mutating shell redirections or PowerShell write cmdlets even if prefixed with read-only command
+            let forbidden_in_plan = [
+                ">", ">>", "out-file", "set-content", "add-content", "new-item",
+                "remove-item", "move-item", "copy-item", "rename-item",
+                "-outfile", "-exec", "-delete", "tee ",
+            ];
+            for pat in forbidden_in_plan {
+                if lower.contains(pat) {
+                    return Err(format!(
+                        "Plan Mode Guard: write/redirect pattern '{}' is blocked in read-only Plan mode.",
+                        pat.trim()
+                    ));
+                }
+            }
+
             let segments: Vec<&str> = lower
                 .split(['|', ';', '\n'])
                 .flat_map(|s| s.split("&&"))
@@ -196,6 +211,10 @@ impl ShellPolicyGuard {
                 "dir", "ls", "cat", "type", "head", "tail", "find", "where", "which",
                 "grep", "rg", "git status", "git log", "git diff", "git branch",
                 "cargo check", "cargo test", "npm test", "pwd", "echo", "tree",
+                "get-content", "get-childitem", "select-string",
+                "get-item", "get-itemproperty", "test-path", "measure-object",
+                "resolve-path", "split-path", "join-path",
+                "select-object", "where-object", "sort-object", "format-table", "format-list",
             ];
             for seg in segments {
                 if !allowed_ro.iter().any(|p| seg.starts_with(p)) {

@@ -296,6 +296,106 @@ fn token_sequence_similarity(a: &[String], b: &[String]) -> f64 {
     (2.0 * lcs as f64) / ((a.len() + b.len()) as f64)
 }
 
+fn byte_offset_to_line(text: &str, byte_offset: usize) -> usize {
+    let clamped = byte_offset.min(text.len());
+    text.as_bytes()[..clamped]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
+}
+
+fn find_substring_lines(haystack: &str, needle: &str) -> Vec<usize> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut pos = 0usize;
+    while let Some(rel) = haystack[pos..].find(needle) {
+        let abs = pos + rel;
+        lines.push(byte_offset_to_line(haystack, abs));
+        if lines.len() >= 10 {
+            break;
+        }
+        pos = abs + needle.len().max(1);
+    }
+    lines
+}
+
+fn ambiguous_error(count: usize, lines: &[usize]) -> String {
+    if lines.is_empty() {
+        format!(
+            "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
+            count
+        )
+    } else {
+        let list: Vec<String> = lines.iter().take(10).map(|l| l.to_string()).collect();
+        let suffix = if count > list.len() { ", ..." } else { "" };
+        format!(
+            "Ambiguous edit: old_text matches {} locations in file (lines: {}{}). Provide more unique context or set replace_all=true.",
+            count,
+            list.join(", "),
+            suffix
+        )
+    }
+}
+
+fn char_trigram_similarity(a: &str, b: &str) -> f64 {
+    let ca: Vec<char> = a.trim().chars().collect();
+    let cb: Vec<char> = b.trim().chars().collect();
+    if ca.is_empty() || cb.is_empty() {
+        return 0.0;
+    }
+    if ca.len() < 3 || cb.len() < 3 {
+        let sa: String = ca.iter().collect();
+        let sb: String = cb.iter().collect();
+        return if sa == sb { 1.0 } else { 0.0 };
+    }
+    let mut map = std::collections::HashMap::<[char; 3], usize>::new();
+    for w in ca.windows(3) {
+        *map.entry([w[0], w[1], w[2]]).or_insert(0) += 1;
+    }
+    let mut overlap = 0usize;
+    for w in cb.windows(3) {
+        if let Some(c) = map.get_mut(&[w[0], w[1], w[2]]) {
+            if *c > 0 {
+                *c -= 1;
+                overlap += 1;
+            }
+        }
+    }
+    (2.0 * overlap as f64) / ((ca.len() - 2 + cb.len() - 2) as f64)
+}
+
+fn suggest_closest_lines(src_lines: &[String], target: &str) -> Vec<(usize, String)> {
+    let t_norm = normalize_unicode_ws(target).trim().to_string();
+    if t_norm.is_empty() {
+        return Vec::new();
+    }
+    let t_toks: Vec<String> = tokenize_with_spans(&t_norm).into_iter().map(|t| t.text).collect();
+    let mut scored: Vec<(f64, usize, String)> = Vec::new();
+    for (idx, line) in src_lines.iter().enumerate() {
+        let l_norm = normalize_unicode_ws(line).trim().to_string();
+        if l_norm.is_empty() {
+            continue;
+        }
+        let tri = char_trigram_similarity(&t_norm, &l_norm);
+        let tok = if t_toks.len() >= 2 {
+            let l_toks: Vec<String> = tokenize_with_spans(&l_norm).into_iter().map(|t| t.text).collect();
+            token_sequence_similarity(&t_toks, &l_toks)
+        } else {
+            tri
+        };
+        let score = tri.max(tok);
+        if score >= 0.35 {
+            let preview: String = line.chars().take(120).collect();
+            scored.push((score, idx + 1, preview));
+        }
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(3).map(|(_, ln, txt)| (ln, txt)).collect()
+}
+
 pub fn apply_single_edit_cascade(
     source: &str,
     old_text: &str,
@@ -309,10 +409,8 @@ pub fn apply_single_edit_cascade(
     if source.contains(old_text) {
         let match_count = source.matches(old_text).count();
         if !replace_all && match_count > 1 {
-            return Err(format!(
-                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
-                match_count
-            ));
+            let lines = find_substring_lines(source, old_text);
+            return Err(ambiguous_error(match_count, &lines));
         }
         let out = if replace_all {
             source.replace(old_text, new_text)
@@ -330,10 +428,8 @@ pub fn apply_single_edit_cascade(
     if norm_src.contains(&raw_norm_old) {
         let match_count = norm_src.matches(&raw_norm_old).count();
         if !replace_all && match_count > 1 {
-            return Err(format!(
-                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
-                match_count
-            ));
+            let lines = find_substring_lines(&norm_src, &raw_norm_old);
+            return Err(ambiguous_error(match_count, &lines));
         }
         let out = if replace_all {
             norm_src.replace(&raw_norm_old, &raw_norm_new)
@@ -358,10 +454,8 @@ pub fn apply_single_edit_cascade(
     if !clean_o.is_empty() && clean_s.contains(&clean_o) {
         let match_count = clean_s.matches(&clean_o).count();
         if !replace_all && match_count > 1 {
-            return Err(format!(
-                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
-                match_count
-            ));
+            let lines = find_substring_lines(&clean_s, &clean_o);
+            return Err(ambiguous_error(match_count, &lines));
         }
         let out = if replace_all {
             clean_s.replace(&clean_o, &clean_n)
@@ -376,10 +470,8 @@ pub fn apply_single_edit_cascade(
     if esc_o != raw_norm_old && norm_src.contains(&esc_o) {
         let match_count = norm_src.matches(&esc_o).count();
         if !replace_all && match_count > 1 {
-            return Err(format!(
-                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
-                match_count
-            ));
+            let lines = find_substring_lines(&norm_src, &esc_o);
+            return Err(ambiguous_error(match_count, &lines));
         }
         let esc_n = raw_norm_new.replace('\n', "\\n");
         let out = if replace_all {
@@ -409,10 +501,8 @@ pub fn apply_single_edit_cascade(
             }
         }
         if hits.len() > 1 && !replace_all {
-            return Err(format!(
-                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
-                hits.len()
-            ));
+            let lines: Vec<usize> = hits.iter().take(10).map(|i| i + 1).collect();
+            return Err(ambiguous_error(hits.len(), &lines));
         }
         if !hits.is_empty() {
             let targets: &[usize] = if replace_all { &hits } else { &hits[..1] };
@@ -440,10 +530,8 @@ pub fn apply_single_edit_cascade(
             }
         }
         if hits.len() > 1 && !replace_all {
-            return Err(format!(
-                "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
-                hits.len()
-            ));
+            let lines: Vec<usize> = hits.iter().take(10).map(|i| i + 1).collect();
+            return Err(ambiguous_error(hits.len(), &lines));
         }
         if !hits.is_empty() {
             let targets: &[usize] = if replace_all { &hits } else { &hits[..1] };
@@ -489,10 +577,8 @@ pub fn apply_single_edit_cascade(
                 }
             }
             if span_hits.len() > 1 && !replace_all {
-                return Err(format!(
-                    "Ambiguous edit: old_text matches {} locations in file. Provide more unique context or set replace_all=true.",
-                    span_hits.len()
-                ));
+                let lines: Vec<usize> = span_hits.iter().take(10).map(|(s, _)| s + 1).collect();
+                return Err(ambiguous_error(span_hits.len(), &lines));
             }
             if !span_hits.is_empty() {
                 let targets: &[(usize, usize)] = if replace_all { &span_hits } else { &span_hits[..1] };
@@ -526,10 +612,12 @@ pub fn apply_single_edit_cascade(
                 }
             }
             if tok_hits.len() > 1 && !replace_all {
-                return Err(format!(
-                    "Ambiguous edit: old_text matches {} token locations in file. Provide more unique context or set replace_all=true.",
-                    tok_hits.len()
-                ));
+                let lines: Vec<usize> = tok_hits
+                    .iter()
+                    .take(10)
+                    .map(|(bs, _)| byte_offset_to_line(&clean_s, *bs))
+                    .collect();
+                return Err(ambiguous_error(tok_hits.len(), &lines));
             }
             if !tok_hits.is_empty() {
                 let targets: &[(usize, usize)] = if replace_all { &tok_hits } else { &tok_hits[..1] };
@@ -626,8 +714,62 @@ pub fn apply_single_edit_cascade(
         }
     }
 
-    Err(format!(
-        "old_text not found in file (even after whitespace/indent/anchor cascade): '{}'. Call read_file around the target lines and pass the exact substring.",
-        old_text.lines().next().unwrap_or("")
-    ))
+    if !replace_all && old_nonempty.len() == 1 && !src_lines.is_empty() {
+        let target_line = &old_nonempty[0];
+        let target_toks: Vec<String> = tokenize_with_spans(target_line).into_iter().map(|t| t.text).collect();
+        let mut best_idx: Option<usize> = None;
+        let mut best_score = 0.0f64;
+        let mut second_score = 0.0f64;
+        for (idx, line) in src_lines.iter().enumerate() {
+            let norm_l = normalize_unicode_ws(line);
+            let trimmed = norm_l.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let tri = char_trigram_similarity(target_line, trimmed);
+            let score = if target_toks.len() >= 4 {
+                let l_toks: Vec<String> = tokenize_with_spans(trimmed).into_iter().map(|t| t.text).collect();
+                token_sequence_similarity(&target_toks, &l_toks).max(tri * 0.95)
+            } else {
+                tri
+            };
+            if score > best_score {
+                second_score = best_score;
+                best_score = score;
+                best_idx = Some(idx);
+            } else if score > second_score {
+                second_score = score;
+            }
+        }
+        if let Some(idx) = best_idx {
+            if best_score >= 0.88 && (best_score - second_score) >= 0.12 {
+                let replacement = reindent_replacement(&src_lines[idx..idx + 1], &old_lines, &new_lines);
+                src_lines.splice(idx..idx + 1, replacement);
+                return Ok((join_preserve_lines(&src_lines, is_crlf, has_trailing_nl), 1));
+            }
+        }
+    }
+
+    let first_line = old_lines
+        .iter()
+        .find(|l| !l.trim().is_empty())
+        .map(|s| s.as_str())
+        .unwrap_or_else(|| old_text.lines().next().unwrap_or(""));
+    let suggestions = suggest_closest_lines(&src_lines, first_line);
+    if suggestions.is_empty() {
+        Err(format!(
+            "old_text not found in file (even after whitespace/indent/anchor cascade): '{}'. Call read_file around the target lines and pass the exact substring.",
+            old_text.lines().next().unwrap_or("")
+        ))
+    } else {
+        let hints: Vec<String> = suggestions
+            .into_iter()
+            .map(|(ln, txt)| format!("L{}: {}", ln, txt.trim()))
+            .collect();
+        Err(format!(
+            "old_text not found in file (even after whitespace/indent/anchor cascade): '{}'. Closest lines in file:\n{}\nCall read_file around these lines and pass the exact substring.",
+            old_text.lines().next().unwrap_or(""),
+            hints.join("\n")
+        ))
+    }
 }

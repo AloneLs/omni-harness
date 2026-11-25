@@ -5,6 +5,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Spring } from 'svelte/motion';
 import Icon from './components/Icon.svelte';
 import FilePreviewDrawer from './components/FilePreviewDrawer.svelte';
+import ImageLightbox from './components/ImageLightbox.svelte';
 import DotGridCanvas from './components/DotGridCanvas.svelte';
 import Sidebar from './components/Sidebar.svelte';
 import ChatView from './components/ChatView.svelte';
@@ -793,3 +794,5 @@ $effect(() => {
     {hoverTip.text}
   </div>
 {/if}
+
+<ImageLightbox />

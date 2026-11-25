@@ -14,6 +14,22 @@ pub enum SessionStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LiveToolCallState {
+    pub id: String,
+    pub name: String,
+    pub arguments: String,
+    pub started_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LiveContextSnapshot {
+    pub history: Vec<crate::llm::request_compat::ChatMessage>,
+    pub streaming_text: String,
+    pub streaming_reasoning: String,
+    pub running_tools: Vec<LiveToolCallState>,
+}
+
 #[derive(Clone)]
 pub struct SessionHandle {
     pub chat_id: String,
@@ -24,6 +40,7 @@ pub struct SessionHandle {
     pub status: Arc<RwLock<SessionStatus>>,
     pub intervention_tx: mpsc::Sender<String>,
     pub intervention_rx: Arc<Mutex<mpsc::Receiver<String>>>,
+    pub live_context: Arc<std::sync::RwLock<LiveContextSnapshot>>,
 }
 
 impl SessionHandle {
@@ -39,7 +56,65 @@ impl SessionHandle {
             status: Arc::new(RwLock::new(SessionStatus::Running)),
             intervention_tx: tx,
             intervention_rx: Arc::new(Mutex::new(rx)),
+            live_context: Arc::new(std::sync::RwLock::new(LiveContextSnapshot::default())),
         }
+    }
+
+    pub fn set_live_history(&self, history: Vec<crate::llm::request_compat::ChatMessage>) {
+        if let Ok(mut guard) = self.live_context.write() {
+            guard.history = history;
+        }
+    }
+
+    pub fn set_streaming_buffers(&self, text: &str, reasoning: &str) {
+        if let Ok(mut guard) = self.live_context.write() {
+            guard.streaming_text = text.to_string();
+            guard.streaming_reasoning = reasoning.to_string();
+        }
+    }
+
+    pub fn clear_streaming_buffers(&self) {
+        if let Ok(mut guard) = self.live_context.write() {
+            guard.streaming_text.clear();
+            guard.streaming_reasoning.clear();
+        }
+    }
+
+    pub fn set_running_tools(&self, tools: Vec<LiveToolCallState>) {
+        if let Ok(mut guard) = self.live_context.write() {
+            guard.running_tools = tools;
+        }
+    }
+
+    pub fn add_running_tool(&self, id: String, name: String, arguments: String) {
+        if let Ok(mut guard) = self.live_context.write() {
+            guard.running_tools.retain(|t| t.id != id);
+            guard.running_tools.push(LiveToolCallState {
+                id,
+                name,
+                arguments,
+                started_at_ms: chrono::Utc::now().timestamp_millis(),
+            });
+        }
+    }
+
+    pub fn remove_running_tool(&self, id: &str) {
+        if let Ok(mut guard) = self.live_context.write() {
+            guard.running_tools.retain(|t| t.id != id);
+        }
+    }
+
+    pub fn clear_running_tools(&self) {
+        if let Ok(mut guard) = self.live_context.write() {
+            guard.running_tools.clear();
+        }
+    }
+
+    pub fn snapshot_live_context(&self) -> LiveContextSnapshot {
+        self.live_context
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     pub fn cancel(&self) {

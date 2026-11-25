@@ -47,10 +47,18 @@ $effect(() => {
     : { opacity: 0, y: 8, scale: 0.9 };
 });
 
+let userTurnCount = $derived.by(() => {
+  let c = 0;
+  for (const m of chatStore.messages) {
+    if (m.role === 'user') c++;
+  }
+  return c;
+});
+
 $effect(() => {
   const root = scrollContainerEl;
   const _chatId = chatStore.activeChatId;
-  const _count = chatStore.messages.length;
+  const _count = userTurnCount;
   if (!root || _count === 0 || typeof IntersectionObserver === 'undefined') return;
 
   let observer: IntersectionObserver | null = null;
@@ -103,6 +111,21 @@ let lastObservedChatId: string | null = null;
 let wasStreaming = false;
 let programmaticScroll = false;
 let scrollCheckRaf: number | null = null;
+let lastAutoScrollAt = 0;
+let autoScrollTimer: ReturnType<typeof setTimeout> | null = null;
+const initialMsgIdsByChat = new Set<string>();
+let trackedChatForInitial: string | null = null;
+
+$effect(() => {
+  const cid = chatStore.activeChatId;
+  if (cid !== trackedChatForInitial) {
+    trackedChatForInitial = cid;
+    initialMsgIdsByChat.clear();
+    for (const m of chatStore.messages) {
+      initialMsgIdsByChat.add(m.id);
+    }
+  }
+});
 
 function handleUserWheel(e: WheelEvent) {
   if (e.deltaY < 0) {
@@ -206,11 +229,29 @@ $effect(() => {
   }
   wasStreaming = streamingNow;
 
-  if (!userHasScrolledUp && _msgCount > 0 && scrollRafId === null) {
-    scrollRafId = requestAnimationFrame(() => {
-      scrollRafId = null;
-      scrollToBottom(false);
-    });
+  if (!userHasScrolledUp && _msgCount > 0) {
+    const now = Date.now();
+    const elapsed = now - lastAutoScrollAt;
+    if (elapsed >= 60) {
+      if (scrollRafId === null) {
+        scrollRafId = requestAnimationFrame(() => {
+          scrollRafId = null;
+          lastAutoScrollAt = Date.now();
+          scrollToBottom(false);
+        });
+      }
+    } else if (!autoScrollTimer) {
+      autoScrollTimer = setTimeout(() => {
+        autoScrollTimer = null;
+        if (!userHasScrolledUp && scrollRafId === null) {
+          scrollRafId = requestAnimationFrame(() => {
+            scrollRafId = null;
+            lastAutoScrollAt = Date.now();
+            scrollToBottom(false);
+          });
+        }
+      }, 60 - elapsed);
+    }
   }
 });
 </script>
@@ -235,11 +276,13 @@ $effect(() => {
         >
           {#each chatStore.messages as message, idx (message.id)}
             <div
+              class="chat-message-item"
               data-user-turn-id={message.role === 'user' ? message.id : undefined}
               data-assistant-turn-id={message.role === 'assistant' ? message.id : undefined}
             >
             <MessageItem
               {message}
+              animateEntrance={!initialMsgIdsByChat.has(message.id)}
               isLatestAssistant={message.id === lastAssistantMsgId}
               isLastUserUnanswered={idx === chatStore.messages.length - 1 && message.role === 'user' && !chatStore.isStreaming}
               onEditUser={(id: string, newText: string, rollback: boolean) => chatStore.editUserMessage(id, newText, rollback)}
@@ -280,3 +323,11 @@ $effect(() => {
     <div class="shrink-0 pointer-events-none" style="height: {emptyDockSpring.current * 36}vh;"></div>
   {/if}
 </div>
+
+<style>
+  .chat-message-item {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 120px;
+    contain: layout style;
+  }
+</style>

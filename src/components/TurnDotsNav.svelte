@@ -96,15 +96,17 @@ $effect(() => {
     : { opacity: 0, scale: 0.96, x: -6 };
 });
 
+const turnDateFormatter = new Intl.DateTimeFormat('ru-RU', {
+  day: 'numeric',
+  month: 'long',
+  year: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit'
+});
+
 function formatTurnDate(ts: number): string {
   try {
-    return new Intl.DateTimeFormat('ru-RU', {
-      day: 'numeric',
-      month: 'long',
-      year: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    }).format(new Date(ts));
+    return turnDateFormatter.format(ts);
   } catch {
     return '';
   }

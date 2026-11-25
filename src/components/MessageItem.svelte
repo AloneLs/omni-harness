@@ -13,6 +13,7 @@ let {
   message,
   isLatestAssistant = true,
   isLastUserUnanswered = false,
+  animateEntrance = true,
   onEditUser = () => {},
   onRegenerate = () => {},
   onContinue = () => {}
@@ -20,6 +21,7 @@ let {
   message: ChatMessage;
   isLatestAssistant?: boolean;
   isLastUserUnanswered?: boolean;
+  animateEntrance?: boolean;
   onEditUser?: (messageId: string, newText: string, rollbackFiles: boolean) => void;
   onRegenerate?: (messageId: string) => void;
   onContinue?: (messageId: string) => void;
@@ -36,8 +38,17 @@ let diffSummaryExpanded = $state<boolean>(false);
 let confirmRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
 let hasHeavyHistory = $derived(
-  (message.toolCalls && message.toolCalls.filter((tc) => !isInternalArtifactTool(tc.toolName, tc.rawArgs || tc.args)).length > 0) ||
-  (message.steps && message.steps.filter((s) => (s.kind === 'tool' && !isInternalArtifactTool(s.record.toolName, s.record.rawArgs || s.record.args)) || s.kind === 'thought').length > 1) ||
+  (message.toolCalls && message.toolCalls.some((tc) => !isInternalArtifactTool(tc.toolName, tc.rawArgs || tc.args))) ||
+  (() => {
+    if (!message.steps) return false;
+    let cnt = 0;
+    for (const s of message.steps) {
+      if ((s.kind === 'tool' && !isInternalArtifactTool(s.record.toolName, s.record.rawArgs || s.record.args)) || s.kind === 'thought') {
+        if (++cnt > 1) return true;
+      }
+    }
+    return false;
+  })() ||
   Boolean(message.reasoningContent && message.reasoningContent.length > 200)
 );
 
@@ -130,11 +141,47 @@ let turnDiffSummary = $derived.by(() => {
   return { files, snapshotIds, totalAdded, totalRemoved };
 });
 
+let throttledContent = $state('');
+let throttleTimer: ReturnType<typeof setTimeout> | null = null;
+let lastRenderAt = 0;
+
+$effect(() => {
+  const raw = splitPipeline.finalContent;
+  const streaming = Boolean(message.streaming);
+  if (!streaming || raw.length < 1200) {
+    if (throttleTimer) {
+      clearTimeout(throttleTimer);
+      throttleTimer = null;
+    }
+    throttledContent = raw;
+    lastRenderAt = Date.now();
+    return;
+  }
+  const now = Date.now();
+  const elapsed = now - lastRenderAt;
+  if (elapsed >= 65) {
+    throttledContent = raw;
+    lastRenderAt = now;
+  } else if (!throttleTimer) {
+    throttleTimer = setTimeout(() => {
+      throttleTimer = null;
+      throttledContent = splitPipeline.finalContent;
+      lastRenderAt = Date.now();
+    }, 65 - elapsed);
+  }
+});
+
+$effect(() => {
+  return () => {
+    if (throttleTimer) clearTimeout(throttleTimer);
+  };
+});
+
 let parsedMarkdown = $derived.by(() => {
-  if (message.role !== 'assistant' || !splitPipeline.finalContent) {
+  if (message.role !== 'assistant' || !throttledContent) {
     return { html: '', vizBlocks: [] };
   }
-  const { cleanContent, vizBlocks } = extractVizBlocks(splitPipeline.finalContent);
+  const { cleanContent, vizBlocks } = extractVizBlocks(throttledContent);
   const html = renderMarkdown(cleanContent);
   return { html, vizBlocks };
 });
@@ -339,7 +386,7 @@ function handleContainerClick(event: MouseEvent) {
 </script>
 
 <div
-  in:fly={{ y: 10, duration: 200 }}
+  in:fly={{ y: animateEntrance ? 10 : 0, duration: animateEntrance ? 200 : 0 }}
   class="w-full py-2.5 group"
   onclick={handleContainerClick}
   role="presentation"
@@ -523,7 +570,21 @@ function handleContainerClick(event: MouseEvent) {
       {/if}
 
       {#if splitPipeline.finalContent}
-        <div data-omni-message-prose="" class="markdown-prose font-sans text-[15px] text-[#EDEDEF] leading-relaxed select-text">
+        <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+        <div
+          data-omni-message-prose=""
+          class="markdown-prose font-sans text-[15px] text-[#EDEDEF] leading-relaxed select-text"
+          onclick={(e) => {
+            const target = e.target as HTMLElement | null;
+            if (target && target.tagName === 'IMG') {
+              const img = target as HTMLImageElement;
+              if (img.src) {
+                e.stopPropagation();
+                chatStore.openImagePreview(img.src, img.alt || undefined);
+              }
+            }
+          }}
+        >
           {@html parsedMarkdown.html}
         </div>
       {/if}
@@ -637,7 +698,7 @@ function handleContainerClick(event: MouseEvent) {
               </svg>
             </button>
             {#if message.modelId}
-              <span class="ml-1.5 font-mono text-[10.5px] text-[#66666D] select-none">{message.modelId}</span>
+              <span class="ml-1.5 font-mono text-[10.5px] text-[#73737A] select-none" title="Model: {message.modelId}">{message.modelId}</span>
             {/if}
           </div>
           {#if confirmRetry}

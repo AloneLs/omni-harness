@@ -119,11 +119,28 @@ pub fn spill_tool_output_with_path(
     call_id: &str,
     raw_output: &str,
 ) -> (String, Option<String>) {
-    let lines: Vec<&str> = raw_output.lines().collect();
-    let total_lines = lines.len();
-    if total_lines <= 300 && raw_output.len() <= 24_000 {
+    let raw_lines_count = raw_output.lines().count();
+    if raw_lines_count <= 300 && raw_output.len() <= 24_000 {
         return (raw_output.to_string(), None);
     }
+
+    // If a large output is compact single-line JSON (like grep/code_intel output),
+    // pretty-print it before writing to the spill log so read_file(offset, limit) can inspect it line-by-line!
+    let formatted_owned: Option<String> = if raw_lines_count <= 10 && raw_output.len() > 24_000 {
+        let t = raw_output.trim();
+        if (t.starts_with('{') && t.ends_with('}')) || (t.starts_with('[') && t.ends_with(']')) {
+            serde_json::from_str::<serde_json::Value>(t)
+                .ok()
+                .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let effective_output: &str = formatted_owned.as_deref().unwrap_or(raw_output);
+    let lines: Vec<&str> = effective_output.lines().collect();
+    let total_lines = lines.len();
 
     let safe_id: String = call_id
         .chars()
@@ -138,15 +155,15 @@ pub fn spill_tool_output_with_path(
     let tmp_dir = resolve_spill_tmp_dir(workspace_root);
     let _ = std::fs::create_dir_all(&tmp_dir);
     let log_path = tmp_dir.join(&file_name);
-    let _ = std::fs::write(&log_path, raw_output);
+    let _ = std::fs::write(&log_path, effective_output);
     let rel_display = log_path.to_string_lossy().to_string();
 
-    if total_lines <= 10 && raw_output.len() > 24_000 {
-        let head = safe_slice_head(raw_output, 2_000);
-        let tail = safe_slice_tail(raw_output, 2_000);
+    if total_lines <= 10 && effective_output.len() > 24_000 {
+        let head = safe_slice_head(effective_output, 2_000);
+        let tail = safe_slice_tail(effective_output, 2_000);
         let msg = format!(
-            "{}\n\n... [Single-line output truncated ({} bytes). Full output saved to {} — use read_file(path=\"{}\") or grep(path=\"{}\") to inspect] ...\n\n{}",
-            head, raw_output.len(), rel_display, rel_display, rel_display, tail
+            "{}\n\n... [Single-line output truncated ({} bytes). Full output saved to {} — use read_file(path=\"{}\", char_offset=0, limit=16000) or grep(path=\"{}\") to inspect] ...\n\n{}",
+            head, effective_output.len(), rel_display, rel_display, rel_display, tail
         );
         return (msg, Some(rel_display));
     }
@@ -166,7 +183,7 @@ pub fn spill_tool_output_with_path(
 
     let msg = format!(
         "{}\n\n... [Output truncated ({} lines, {} bytes). Full output saved to {} — use read_file(path=\"{}\", offset, limit) or grep(path=\"{}\") to inspect] ...\n\n{}",
-        head, total_lines, raw_output.len(), rel_display, rel_display, rel_display, tail
+        head, total_lines, effective_output.len(), rel_display, rel_display, rel_display, tail
     );
     (msg, Some(rel_display))
 }

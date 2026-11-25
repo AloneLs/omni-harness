@@ -1316,12 +1316,16 @@ async fn ensure_active_chat(
         if let Some(sess) = map.get(&tg_chat_id) {
             if let Some(cid) = &sess.active_chat_id {
                 if let Ok(c) = ctx.app_state.db.get_chat(cid) {
-                    if (c.title == "Telegram Chat" || c.title == "Новая сессия") && initial_title.is_some() {
+                    if (c.title == "Telegram Chat" || c.title == "Нова�� сессия") && initial_title.is_some() {
                         let short = compact_text(initial_title.unwrap(), 42);
                         if !short.is_empty() {
                             let _ = ctx.app_state.db.update_chat_title(cid, &short);
                             emit_chat_updated(ctx, cid).await;
                         }
+                    }
+                    if !model_id.trim().is_empty() && c.model_id != model_id {
+                        let _ = ctx.app_state.db.update_chat_model(cid, model_id);
+                        emit_chat_updated(ctx, cid).await;
                     }
                     return Ok(cid.clone());
                 }
@@ -3119,6 +3123,12 @@ async fn handle_callback_query(
                                 (e.and_then(|s| s.provider_id.clone()), e.and_then(|s| s.model_id.clone()))
                             };
                             let ac = sessions.read().await.get(&tg_chat_id).and_then(|s| s.active_chat_id.clone());
+                            if let (Some(cid), Some(mid)) = (ac.as_deref(), sel_mid.as_deref()) {
+                                if !mid.is_empty() {
+                                    let _ = ctx.app_state.db.update_chat_model(cid, mid);
+                                    emit_chat_updated(ctx, cid).await;
+                                }
+                            }
                             emit_settings_updated(ctx, providers_snap, sel_pid.as_deref(), sel_mid.as_deref(), None, ac.as_deref()).await;
                             persist_session_snapshot(config_arc, config_path_arc, sessions, None).await;
                             render_models_page(
@@ -3159,6 +3169,12 @@ async fn handle_callback_query(
                                 }
                             };
                             let ac = sessions.read().await.get(&tg_chat_id).and_then(|s| s.active_chat_id.clone());
+                            if let Some(cid) = ac.as_deref() {
+                                if !mid.is_empty() {
+                                    let _ = ctx.app_state.db.update_chat_model(cid, &mid);
+                                    emit_chat_updated(ctx, cid).await;
+                                }
+                            }
                             emit_settings_updated(
                                 ctx,
                                 providers_snap,
@@ -3434,6 +3450,7 @@ async fn run_telegram_agent_turn(
         chat_id: chat_id.clone(),
         role: "user".to_string(),
         content: user_display_text.clone(),
+        model_id: None,
         reasoning_content: None,
         tool_calls: None,
         tool_call_id: None,
@@ -3445,7 +3462,13 @@ async fn run_telegram_agent_turn(
     if let Some(ref app) = stream_app_handle {
         let _ = app.emit(
             "telegram-chat-stream",
-            json!({ "chatId": chat_id, "type": "start", "userText": user_display_text }),
+            json!({
+                "chatId": chat_id,
+                "type": "start",
+                "userText": user_display_text,
+                "modelId": model.id,
+                "providerId": provider.id,
+            }),
         );
     }
 
@@ -3987,6 +4010,7 @@ async fn run_telegram_agent_turn(
             chat_id: chat_id.clone(),
             role: "assistant".to_string(),
             content: final_text.clone(),
+            model_id: Some(model.id.clone()),
             reasoning_content: if reasoning_text.is_empty() {
                 None
             } else {
@@ -4006,6 +4030,7 @@ async fn run_telegram_agent_turn(
                     "chatId": m.chat_id,
                     "role": m.role,
                     "content": m.content,
+                    "modelId": m.model_id,
                     "reasoningContent": m.reasoning_content,
                     "createdAt": m.created_at,
                 })
@@ -4017,7 +4042,12 @@ async fn run_telegram_agent_turn(
         if let Some(ref app) = stream_app_handle {
             let _ = app.emit(
                 "telegram-chat-stream",
-                json!({ "chatId": chat_id, "type": "done" }),
+                json!({
+                    "chatId": chat_id,
+                    "type": "done",
+                    "modelId": model.id,
+                    "providerId": provider.id,
+                }),
             );
         }
         emit_chat_updated(&ctx, &chat_id).await;
@@ -4093,6 +4123,7 @@ async fn run_telegram_agent_turn(
             chat_id: chat_id.clone(),
             role: "assistant".to_string(),
             content: format!("[Telegram] {}", err_msg),
+            model_id: Some(model.id.clone()),
             reasoning_content: None,
             tool_calls: None,
             tool_call_id: None,
@@ -4108,6 +4139,7 @@ async fn run_telegram_agent_turn(
                     "chatId": m.chat_id,
                     "role": m.role,
                     "content": m.content,
+                    "modelId": m.model_id,
                     "reasoningContent": m.reasoning_content,
                     "createdAt": m.created_at,
                 })
@@ -4119,7 +4151,12 @@ async fn run_telegram_agent_turn(
         if let Some(ref app) = stream_app_handle {
             let _ = app.emit(
                 "telegram-chat-stream",
-                json!({ "chatId": chat_id, "type": "done" }),
+                json!({
+                    "chatId": chat_id,
+                    "type": "done",
+                    "modelId": model.id,
+                    "providerId": provider.id,
+                }),
             );
         }
         emit_chat_updated(&ctx, &chat_id).await;
@@ -4239,41 +4276,45 @@ async fn run_telegram_btw(
         .get(&tg_chat_id)
         .and_then(|s| s.active_chat_id.clone());
 
-    let mut msgs: Vec<crate::llm::request_compat::ChatMessage> = Vec::new();
-    msgs.push(crate::llm::request_compat::ChatMessage::system(
-        "Answer the user side question (/btw) concisely and accurately using context. Do not invoke tools.".to_string(),
-    ));
-    if let Some(ref cid) = active_cid {
-        let tg_ctx_key = format!("tg_ctx:{}", cid);
-        if let Some(raw) = ctx.app_state.db.load_checkpoint(&tg_ctx_key).ok().flatten() {
-            if let Ok(hist) = serde_json::from_str::<Vec<crate::llm::request_compat::ChatMessage>>(&raw) {
-                for m in hist.into_iter().filter(|m| m.role == "user" || m.role == "assistant").rev().take(12).collect::<Vec<_>>().into_iter().rev() {
-                    msgs.push(crate::llm::request_compat::ChatMessage {
-                        role: m.role,
-                        content: m.content,
-                        name: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        reasoning_content: None,
-                    });
-                }
-            }
-        }
-    }
-    msgs.push(crate::llm::request_compat::ChatMessage::user(question));
+    let caps_reg = (*ctx.caps_registry).clone();
+    caps_reg.update_model_caps(
+        &model.id,
+        Some(model.context_window),
+        Some(model.max_output_tokens),
+        Some(model.supports_reasoning),
+    );
+
+    let msgs = if let Some(ref cid) = active_cid {
+        crate::engine::btw_context::build_btw_messages(
+            &ctx.app_state.db,
+            &ctx.stream_mgr,
+            cid,
+            &model.id,
+            &caps_reg,
+            None,
+            &question,
+        )
+        .await
+    } else {
+        vec![
+            crate::llm::request_compat::ChatMessage::system(
+                "You are answering a quick ephemeral side question (/btw). No active chat session is selected. Answer concisely using any information in the question itself or state clearly that no active session context is selected.".to_string(),
+            ),
+            crate::llm::request_compat::ChatMessage::user(question),
+        ]
+    };
 
     let key_pool = (*ctx.key_pool).clone();
     if !provider.api_key.trim().is_empty() {
         key_pool.set_keys(&provider.name, vec![provider.api_key.trim().to_string()]);
     }
-    let caps_reg = (*ctx.caps_registry).clone();
     let req = crate::llm::request_compat::ChatRequest {
         model: model.id.clone(),
         messages: msgs,
         temperature: Some(0.3),
         top_p: None,
-        max_tokens: Some(1500),
-        max_completion_tokens: Some(1500),
+        max_tokens: Some(4096),
+        max_completion_tokens: Some(4096),
         reasoning_effort: None,
         thinking_budget: None,
         tools: None,
@@ -4303,6 +4344,7 @@ async fn run_telegram_btw(
     });
 
     let mut answer = String::new();
+    let mut err_msg: Option<String> = None;
     while let Some(ev) = rx.recv().await {
         match ev {
             crate::llm::StreamEvent::ContentDelta { delta } => {
@@ -4316,11 +4358,17 @@ async fn run_telegram_btw(
                     answer.truncate(answer.len() - text.len());
                 }
             }
+            crate::llm::StreamEvent::Error { error } => {
+                err_msg = Some(error);
+            }
             _ => {}
         }
     }
     if answer.trim().is_empty() {
-        answer = "Не удалось получить ответ на /btw.".to_string();
+        answer = match err_msg {
+            Some(e) if !e.trim().is_empty() => format!("Ошибка /btw: {}", format_user_error(&e)),
+            _ => "Не удалось получить ответ на /btw.".to_string(),
+        };
     }
 
     let kb = json!({

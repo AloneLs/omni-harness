@@ -17,8 +17,19 @@ export function escapeHtml(str: string): string {
     .replace(/'/g, '&#39;');
 }
 
+const HL_COMMENTS_RE = /(\/\/[^\n]*|#[^\n]*)/g;
+const HL_STRINGS_RE = /(&quot;[^&\n]*?&quot;|&#39;[^&\n]*?&#39;)/g;
+const HL_KEYWORDS_RE =
+  /\b(const|let|var|function|return|if|else|for|while|loop|import|from|export|default|class|interface|type|extends|implements|new|this|async|await|try|catch|finally|throw|fn|pub|struct|enum|impl|match|mut|use|crate|mod|def|self|None|True|False|package|func|select|switch|case|break|continue|where|unsafe|extern)\b/g;
+const HL_LITERALS_RE = /\b(true|false|null|undefined|nil|Some|Ok|Err)\b/g;
+const HL_NUMBERS_RE = /\b(0x[0-9a-fA-F]+|\d+(?:\.\d+)?)\b/g;
+const HL_RESTORE_RE = /@@HL_(\d+)@@/g;
+
 export function highlightCode(code: string, _lang: string): string {
   const escaped = escapeHtml(code);
+  if (escaped.length > 28000) {
+    return escaped;
+  }
   const tokens: string[] = [];
   const hold = (html: string) => {
     const idx = tokens.length;
@@ -27,15 +38,15 @@ export function highlightCode(code: string, _lang: string): string {
   };
 
   let out = escaped
-    .replace(/(\/\/[^\n]*|#[^\n]*)/g, (m) => hold(`<span class="text-[#6B7280] italic">${m}</span>`))
-    .replace(/(&quot;[^&\n]*?&quot;|&#39;[^&\n]*?&#39;)/g, (m) => hold(`<span class="text-[#A5D6FF]">${m}</span>`));
+    .replace(HL_COMMENTS_RE, (m) => hold(`<span class="text-[#6B7280] italic">${m}</span>`))
+    .replace(HL_STRINGS_RE, (m) => hold(`<span class="text-[#A5D6FF]">${m}</span>`));
 
   out = out
-    .replace(/\b(const|let|var|function|return|if|else|for|while|loop|import|from|export|default|class|interface|type|extends|implements|new|this|async|await|try|catch|finally|throw|fn|pub|struct|enum|impl|match|mut|use|crate|mod|def|self|None|True|False|package|func|select|switch|case|break|continue|where|unsafe|extern)\b/g, '<span class="text-[#FF7B72] font-medium">$1</span>')
-    .replace(/\b(true|false|null|undefined|nil|Some|Ok|Err)\b/g, '<span class="text-[#79C0FF]">$1</span>')
-    .replace(/\b(0x[0-9a-fA-F]+|\d+(?:\.\d+)?)\b/g, '<span class="text-[#FFA657]">$1</span>');
+    .replace(HL_KEYWORDS_RE, '<span class="text-[#FF7B72] font-medium">$1</span>')
+    .replace(HL_LITERALS_RE, '<span class="text-[#79C0FF]">$1</span>')
+    .replace(HL_NUMBERS_RE, '<span class="text-[#FFA657]">$1</span>');
 
-  return out.replace(/@@HL_(\d+)@@/g, (_, i) => tokens[Number(i)] || '');
+  return out.replace(HL_RESTORE_RE, (_, i) => tokens[Number(i)] || '');
 }
 
 export function extractVizBlocks(content: string): { cleanContent: string; vizBlocks: VizBlockData[] } {
@@ -104,7 +115,7 @@ function buildVideoHtml(src: string): string {
 
 function buildImageHtml(src: string, alt: string): string {
   const resolved = resolveMediaSrc(src);
-  return `<img src="${escapeHtml(resolved)}" alt="${escapeHtml(alt)}" loading="lazy" class="my-2 max-w-[320px] max-h-[320px] rounded-[12px] object-cover block" />`;
+  return `<img src="${escapeHtml(resolved)}" alt="${escapeHtml(alt)}" loading="lazy" class="my-2 max-w-[320px] max-h-[320px] rounded-[12px] object-cover block cursor-zoom-in hover:opacity-95 transition-opacity" />`;
 }
 
 function markHighlightClass(color: string): string {
@@ -122,8 +133,31 @@ function markHighlightClass(color: string): string {
   }
 }
 
+const MARKDOWN_LRU_MAX = 256;
+const markdownCache = new Map<string, string>();
+
+function fastHash32(str: string): string {
+  let h = 0x811c9dc5;
+  const len = str.length;
+  for (let i = 0; i < len; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
 export function renderMarkdown(content: string): string {
   if (!content) return '';
+
+  const cached = markdownCache.get(content);
+  if (cached !== undefined) {
+    markdownCache.delete(content);
+    markdownCache.set(content, cached);
+    return cached;
+  }
+
+  const contentHash = fastHash32(content);
+  let codeBlockSeq = 0;
 
   const slots: string[] = [];
   const hold = (html: string): string => {
@@ -139,12 +173,13 @@ export function renderMarkdown(content: string): string {
   const renderCodeBlockHtml = (rawLang: string, code: string): string => {
     const lang = (rawLang || '').trim().toLowerCase() || 'text';
     const trimmedCode = code.replace(/\n$/, '');
-    const codeId = `code-${Math.random().toString(36).substring(2, 9)}`;
+    const codeId = `code-${contentHash}-${codeBlockSeq++}`;
     const lineCount = trimmedCode.split('\n').length;
-    const lineNumbers = Array.from(
-      { length: lineCount },
-      (_, i) => `<span class="select-none text-[#55555C] text-right pr-3 block text-[11px] leading-5">${i + 1}</span>`
-    ).join('');
+    const lineNumbersArr: string[] = new Array(lineCount);
+    for (let i = 0; i < lineCount; i++) {
+      lineNumbersArr[i] = `<span class="select-none text-[#55555C] text-right pr-3 block text-[11px] leading-5">${i + 1}</span>`;
+    }
+    const lineNumbers = lineNumbersArr.join('');
     const highlighted = highlightCode(trimmedCode, lang);
 
     return hold(`
@@ -339,6 +374,14 @@ export function renderMarkdown(content: string): string {
   let html = paragraphs.filter(Boolean).join('\n');
   for (let pass = 0; pass < 6 && /\u0000SLOT_\d+\u0000/.test(html); pass++) {
     html = html.replace(/\u0000SLOT_(\d+)\u0000/g, (_, i) => slots[Number(i)] || '');
+  }
+
+  if (content.length <= 200000) {
+    if (markdownCache.size >= MARKDOWN_LRU_MAX) {
+      const oldestKey = markdownCache.keys().next().value;
+      if (oldestKey !== undefined) markdownCache.delete(oldestKey);
+    }
+    markdownCache.set(content, html);
   }
   return html;
 }

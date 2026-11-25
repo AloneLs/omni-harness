@@ -30,6 +30,14 @@ let localSearch = $state(chatStore.filterSearchQuery);
 let searchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 let visibleStandaloneLimit = $state(24);
 let visibleProjectLimits = $state<Record<string, number>>({});
+let ageNow = $state(Date.now());
+
+$effect(() => {
+  const id = setInterval(() => {
+    ageNow = Date.now();
+  }, 30000);
+  return () => clearInterval(id);
+});
 
 const searchBoxSpring = new Spring(0, SPRING_POPUP);
 
@@ -146,8 +154,8 @@ function handleCancelRename() {
   editingChatId = null;
 }
 
-function formatRelativeAge(timestamp: number): string {
-  const diffMs = Math.max(0, Date.now() - timestamp);
+function formatRelativeAge(timestamp: number, now: number): string {
+  const diffMs = Math.max(0, now - timestamp);
   const mins = Math.floor(diffMs / 60000);
   if (mins < 60) return `${Math.max(1, mins)}m`;
   const hours = Math.floor(mins / 60);
@@ -236,7 +244,7 @@ function formatRelativeAge(timestamp: number): string {
     </div>
   {/if}
 
-  <div data-omni-chat-list="" class="flex-1 overflow-y-auto px-2.5 pb-3 space-y-2">
+  <div data-omni-chat-list="" class="flex-1 overflow-y-auto px-2.5 pb-3 space-y-2" style="contain: layout style;">
     {#if !chatStore.showArchived && chatStore.pinnedSessions.length > 0}
       <div class="pb-2 border-b border-white/[0.06] space-y-0.5">
         {#each chatStore.pinnedSessions as chat (chat.id)}
@@ -274,7 +282,7 @@ function formatRelativeAge(timestamp: number): string {
 
             <div class="shrink-0 relative flex items-center justify-end min-w-[68px]">
               <span class="font-mono text-[11px] text-[#606068] opacity-100 group-hover:opacity-0 transition-opacity duration-150 pointer-events-none">
-                {formatRelativeAge(chat.updatedAt)}
+                {formatRelativeAge(chat.updatedAt, ageNow)}
               </span>
               <div class="absolute right-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none group-hover:pointer-events-auto">
                 <button
@@ -422,7 +430,7 @@ function formatRelativeAge(timestamp: number): string {
                     </div>
                     <div class="shrink-0 relative flex items-center justify-end min-w-[28px]">
                       <span class="font-sans text-[12px] text-[#7A7A82] tabular-nums opacity-100 group-hover:opacity-0 transition-opacity duration-150 pointer-events-none">
-                        {formatRelativeAge(chat.updatedAt)}
+                        {formatRelativeAge(chat.updatedAt, ageNow)}
                       </span>
                       <div class="absolute right-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none group-hover:pointer-events-auto bg-[#171719]/90 rounded-[4px] pl-1">
                         <button
@@ -519,7 +527,7 @@ function formatRelativeAge(timestamp: number): string {
 
             <div class="shrink-0 relative flex items-center justify-end min-w-[68px]">
               <span class="font-mono text-[11px] text-[#606068] opacity-100 group-hover:opacity-0 transition-opacity duration-150 pointer-events-none">
-                {formatRelativeAge(chat.updatedAt)}
+                {formatRelativeAge(chat.updatedAt, ageNow)}
               </span>
               <div class="absolute right-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none group-hover:pointer-events-auto">
                 {#if !chat.archived}

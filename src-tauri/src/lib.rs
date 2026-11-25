@@ -1016,11 +1016,16 @@ async fn sync_chat_context(
     }
 
     if let Ok(parsed) = serde_json::from_str::<Vec<serde_json::Value>>(&messages_json) {
-        let clean_pairs: Vec<(String, String)> = parsed
+        let clean_pairs: Vec<(String, String, Option<String>)> = parsed
             .iter()
             .filter_map(|item| {
                 let role = item.get("role").and_then(|v| v.as_str()).unwrap_or("user").trim().to_string();
                 let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let msg_model = item
+                    .get("modelId")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
                 let has_work = item
                     .get("steps")
                     .and_then(|v| v.as_array())
@@ -1035,7 +1040,7 @@ async fn sync_chat_context(
                 if content.trim().is_empty() && !has_work {
                     None
                 } else {
-                    Some((role, content))
+                    Some((role, content, msg_model))
                 }
             })
             .collect();
@@ -1044,18 +1049,19 @@ async fn sync_chat_context(
             && existing
                 .iter()
                 .zip(clean_pairs.iter())
-                .all(|(ex, (r, c))| ex.role == *r && ex.content.trim() == c.trim());
+                .all(|(ex, (r, c, _))| ex.role == *r && ex.content.trim() == c.trim());
 
         if prefix_matches {
             if clean_pairs.len() > existing.len() {
                 let mut seq = existing.last().map(|m| m.sequence_num).unwrap_or(0);
-                for (role, content) in clean_pairs.into_iter().skip(existing.len()) {
+                for (role, content, msg_model) in clean_pairs.into_iter().skip(existing.len()) {
                     seq += 1;
                     let msg = db::chats::Message {
                         id: uuid::Uuid::new_v4().to_string(),
                         chat_id: chat_id.clone(),
                         role,
                         content,
+                        model_id: msg_model,
                         reasoning_content: None,
                         tool_calls: None,
                         tool_call_id: None,
@@ -1068,6 +1074,7 @@ async fn sync_chat_context(
         } else {
             let _ = db.replace_chat_messages(&chat_id, &clean_pairs);
             let _ = db.delete_checkpoint(&format!("tg_ctx:{}", chat_id));
+            let _ = db.delete_checkpoint(&format!("full_ctx:{}", chat_id));
         }
     }
     Ok(())
@@ -1555,6 +1562,7 @@ async fn start_chat_stream(
                         chat_id: cid_img.clone(),
                         role: "assistant".to_string(),
                         content: md,
+                        model_id: None,
                         reasoning_content: None,
                         tool_calls: None,
                         tool_call_id: None,
@@ -2155,63 +2163,29 @@ async fn ask_side_question(
         }
     }
 
-    let mut msgs: Vec<llm::request_compat::ChatMessage> = vec![
-        llm::request_compat::ChatMessage::system(
-            "You are answering a quick ephemeral side question (/btw) about the current session. You have NO tools available (cannot read files, run commands, or search the web). Answer concisely using ONLY the conversation context provided below. If the answer is not in the context, say so directly.".to_string()
-        )
-    ];
+let fallback_history: Vec<engine::btw_context::BtwFallbackMessage> = history
+    .unwrap_or_default()
+    .into_iter()
+    .map(|h| engine::btw_context::BtwFallbackMessage {
+        role: h.role,
+        content: h.content,
+    })
+    .collect();
 
-    let checkpoint_msgs: Vec<llm::request_compat::ChatMessage> = state
-        .app_state
-        .db
-        .load_checkpoint(&chat_id)
-        .ok()
-        .flatten()
-        .and_then(|j| serde_json::from_str(&j).ok())
-        .unwrap_or_default();
-
-    let mut context_added = false;
-    if !checkpoint_msgs.is_empty() {
-        for m in checkpoint_msgs {
-            if m.role == "system" {
-                continue;
-            }
-            let text = m.content.as_text_lossy().trim().to_string();
-            if m.role == "tool" {
-                if !text.is_empty() {
-                    let short: String = text.chars().take(1200).collect();
-                    msgs.push(llm::request_compat::ChatMessage::assistant(format!("[Tool output]
-{}", short)));
-                    context_added = true;
-                }
-            } else if m.role == "assistant" {
-                if !text.is_empty() {
-                    msgs.push(llm::request_compat::ChatMessage::assistant(text));
-                    context_added = true;
-                }
-            } else if m.role == "user" && !text.is_empty() {
-                msgs.push(llm::request_compat::ChatMessage::user(text));
-                context_added = true;
-            }
-        }
-    }
-
-    if !context_added {
-        if let Some(hist) = history {
-            for h in hist {
-                if h.content.trim().is_empty() {
-                    continue;
-                }
-                if h.role == "assistant" {
-                    msgs.push(llm::request_compat::ChatMessage::assistant(h.content));
-                } else if h.role == "user" {
-                    msgs.push(llm::request_compat::ChatMessage::user(h.content));
-                }
-            }
-        }
-    }
-
-    msgs.push(llm::request_compat::ChatMessage::user(question));
+let msgs = engine::btw_context::build_btw_messages(
+    &state.app_state.db,
+    &state.stream_mgr,
+    &chat_id,
+    &model_id,
+    &caps_reg,
+    if fallback_history.is_empty() {
+        None
+    } else {
+        Some(&fallback_history)
+    },
+    &question,
+)
+.await;
 
     let req = llm::request_compat::ChatRequest {
         model: model_id,

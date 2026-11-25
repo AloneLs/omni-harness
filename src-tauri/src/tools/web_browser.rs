@@ -59,10 +59,94 @@ impl Clone for CdpController {
     }
 }
 
+fn decode_html_entities(input: &str) -> String {
+    let mut s = input
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&apos;", "'")
+        .replace("&mdash;", "—")
+        .replace("&ndash;", "–")
+        .replace("&hellip;", "...");
+    if s.contains("&#") {
+        let num_re = Regex::new(r"&#(?:x([0-9a-fA-F]+)|([0-9]+));").unwrap();
+        s = num_re
+            .replace_all(&s, |caps: &regex::Captures| {
+                let code = if let Some(hex) = caps.get(1) {
+                    u32::from_str_radix(hex.as_str(), 16).ok()
+                } else if let Some(dec) = caps.get(2) {
+                    dec.as_str().parse::<u32>().ok()
+                } else {
+                    None
+                };
+                code.and_then(char::from_u32)
+                    .map(|c| c.to_string())
+                    .unwrap_or_default()
+            })
+            .into_owned();
+    }
+    s
+}
+
+pub fn focus_extract_markdown(md: &str, focus_prompt: &str, max_chars: usize) -> String {
+    let trimmed = md.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let keywords: Vec<String> = focus_prompt
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .map(|w| w.trim().to_lowercase())
+        .filter(|w| w.chars().count() >= 3)
+        .collect();
+    if keywords.is_empty() || trimmed.chars().count() <= max_chars {
+        return crate::engine::context_engine::safe_slice_head(trimmed, max_chars).to_string();
+    }
+    let blocks: Vec<&str> = trimmed.split("\n\n").collect();
+    let mut scored: Vec<(usize, usize, &str)> = blocks
+        .iter()
+        .enumerate()
+        .map(|(idx, blk)| {
+            let low = blk.to_lowercase();
+            let hits = keywords.iter().filter(|kw| low.contains(kw.as_str())).count();
+            (hits, idx, *blk)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut selected_indices: Vec<usize> = Vec::new();
+    let mut used = 0usize;
+    for (hits, idx, blk) in &scored {
+        if *hits == 0 && !selected_indices.is_empty() {
+            break;
+        }
+        let blen = blk.chars().count() + 2;
+        if used + blen > max_chars && !selected_indices.is_empty() {
+            continue;
+        }
+        selected_indices.push(*idx);
+        used += blen;
+        if used >= max_chars {
+            break;
+        }
+    }
+    if selected_indices.is_empty() {
+        return crate::engine::context_engine::safe_slice_head(trimmed, max_chars).to_string();
+    }
+    selected_indices.sort_unstable();
+    selected_indices
+        .into_iter()
+        .map(|i| blocks[i])
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 pub fn duckduckgo_search(query: &str, max_results: usize) -> Result<Vec<SearchResult>, String> {
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(12))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36");
     if let Some(sys_proxy) = crate::resolve_windows_system_proxy() {
         if let Ok(proxy) = reqwest::Proxy::all(&sys_proxy) {
             builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1,*.local,*.internal")));
@@ -70,63 +154,96 @@ pub fn duckduckgo_search(query: &str, max_results: usize) -> Result<Vec<SearchRe
     }
     let client = builder.build().map_err(|e| e.to_string())?;
 
+    let tag_cleaner = Regex::new(r"<[^>]*>").unwrap();
+    let clean_tags = |s: &str| -> String {
+        decode_html_entities(&tag_cleaner.replace_all(s, "")).trim().to_string()
+    };
+
     let url = format!(
         "https://html.duckduckgo.com/html/?q={}",
         urlencoding::encode(query)
     );
 
-    let resp = client
+    let mut results = Vec::new();
+    if let Ok(resp) = client
         .get(&url)
         .header("Accept-Language", "en-US,en;q=0.9")
         .send()
-        .map_err(|e| format!("DuckDuckGo request failed: {}", e))?;
+    {
+        if let Ok(html) = resp.text() {
+            let block_title_re = Regex::new(r#"(?is)<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#).unwrap();
+            let snippet_re = Regex::new(r#"(?is)<(?:a|div)[^>]*class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>"#).unwrap();
 
-    let html = resp.text().map_err(|e| e.to_string())?;
-    let mut results = Vec::new();
+            let result_blocks: Vec<&str> = html.split("result__body").skip(1).collect();
+            for block in result_blocks {
+                let mut final_url = String::new();
+                let mut final_title = String::new();
+                let mut final_snippet = String::new();
 
-    let _link_re = Regex::new(r#"<a class="result__url"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap();
-    let _title_re = Regex::new(r#"<a class="result__snippet[^"]*"[^>]*href="[^"]*"[^>]*>([\s\S]*?)</a>"#).unwrap();
-    let _body_re = Regex::new(r#"<a class="result__snippet[^"]*"[^>]*>([\s\S]*?)</a>"#).unwrap();
+                if let Some(caps) = block_title_re.captures(block) {
+                    let raw_url = decode_html_entities(&caps[1]);
+                    final_title = clean_tags(&caps[2]);
+                    if let Some(pos) = raw_url.find("uddg=") {
+                        let sub = &raw_url[pos + 5..];
+                        let enc_url = sub.split('&').next().unwrap_or(sub);
+                        final_url = urlencoding::decode(enc_url).unwrap_or(enc_url.into()).to_string();
+                    } else {
+                        final_url = raw_url;
+                    }
+                }
+                if let Some(caps) = snippet_re.captures(block) {
+                    final_snippet = clean_tags(&caps[1]);
+                }
 
-    let clean_tags = |s: &str| -> String {
-        let tag_cleaner = Regex::new(r"<[^>]*>").unwrap();
-        tag_cleaner.replace_all(s, "").trim().to_string()
-    };
-
-    let result_blocks: Vec<&str> = html.split(r#"<div class="result results_links results_links_deep"#).skip(1).collect();
-
-    for block in result_blocks {
-        let mut final_url = String::new();
-        let mut final_title = String::new();
-        let mut final_snippet = String::new();
-
-        let block_title_re = Regex::new(r#"<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)</a>"#).unwrap();
-        if let Some(caps) = block_title_re.captures(block) {
-            let raw_url = &caps[1];
-            final_title = clean_tags(&caps[2]);
-
-            if let Some(pos) = raw_url.find("uddg=") {
-                let sub = &raw_url[pos + 5..];
-                let enc_url = sub.split('&').next().unwrap_or(sub);
-                final_url = urlencoding::decode(enc_url).unwrap_or(enc_url.into()).to_string();
-            } else {
-                final_url = raw_url.to_string();
+                if !final_url.is_empty() && !final_title.is_empty() && final_url.starts_with("http") {
+                    results.push(SearchResult {
+                        title: final_title,
+                        url: final_url,
+                        snippet: final_snippet,
+                    });
+                    if results.len() >= max_results {
+                        return Ok(results);
+                    }
+                }
             }
         }
+    }
 
-        let snippet_re = Regex::new(r#"<a[^>]*class="result__snippet"[^>]*>([\s\S]*?)</a>"#).unwrap();
-        if let Some(caps) = snippet_re.captures(block) {
-            final_snippet = clean_tags(&caps[1]);
-        }
-
-        if !final_url.is_empty() && !final_title.is_empty() {
-            results.push(SearchResult {
-                title: final_title,
-                url: final_url,
-                snippet: final_snippet,
-            });
-            if results.len() >= max_results {
-                break;
+    // Fallback: DuckDuckGo Lite HTML endpoint
+    if results.is_empty() {
+        let lite_url = format!(
+            "https://lite.duckduckgo.com/lite/?q={}",
+            urlencoding::encode(query)
+        );
+        if let Ok(resp) = client.get(&lite_url).send() {
+            if let Ok(html) = resp.text() {
+                let lite_link_re = Regex::new(r#"(?is)<a[^>]*class="[^"]*result-link[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#).unwrap();
+                let lite_snip_re = Regex::new(r#"(?is)<td[^>]*class="[^"]*result-snippet[^"]*"[^>]*>(.*?)</td>"#).unwrap();
+                let snippets: Vec<String> = lite_snip_re
+                    .captures_iter(&html)
+                    .map(|c| clean_tags(&c[1]))
+                    .collect();
+                for (idx, caps) in lite_link_re.captures_iter(&html).enumerate() {
+                    let raw_url = decode_html_entities(&caps[1]);
+                    let final_url = if let Some(pos) = raw_url.find("uddg=") {
+                        let sub = &raw_url[pos + 5..];
+                        let enc_url = sub.split('&').next().unwrap_or(sub);
+                        urlencoding::decode(enc_url).unwrap_or(enc_url.into()).to_string()
+                    } else {
+                        raw_url
+                    };
+                    let title = clean_tags(&caps[2]);
+                    if !final_url.is_empty() && !title.is_empty() && final_url.starts_with("http") {
+                        results.push(SearchResult {
+                            title,
+                            url: final_url,
+                            snippet: snippets.get(idx).cloned().unwrap_or_default(),
+                        });
+                        if results.len() >= max_results {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -220,6 +337,22 @@ pub fn html_to_markdown(raw_html: &str) -> String {
     let li_re = Regex::new(r"(?is)<li[^>]*>(.*?)</li>").unwrap();
     let text = li_re.replace_all(&text, "\n- $1");
 
+    let tr_re = Regex::new(r"(?is)<tr[^>]*>(.*?)</tr>").unwrap();
+    let cell_re = Regex::new(r"(?is)<t[hd][^>]*>(.*?)</t[hd]>").unwrap();
+    let tag_in_cell_re = Regex::new(r"(?is)<[^>]+>").unwrap();
+    let text = tr_re.replace_all(&text, |caps: &regex::Captures| {
+        let row_html = &caps[1];
+        let cols: Vec<String> = cell_re
+            .captures_iter(row_html)
+            .map(|c| tag_in_cell_re.replace_all(&c[1], "").trim().replace('|', "\\|"))
+            .collect();
+        if cols.is_empty() {
+            String::new()
+        } else {
+            format!("\n| {} |", cols.join(" | "))
+        }
+    });
+
     let a_re = Regex::new(r#"(?is)<a[^>]*href="([^"]*)"[^>]*>(.*?)</a>"#).unwrap();
     let text = a_re.replace_all(&text, "[$2]($1)");
 
@@ -229,13 +362,7 @@ pub fn html_to_markdown(raw_html: &str) -> String {
     let any_tag_re = Regex::new(r"(?is)<[^>]+>").unwrap();
     let text = any_tag_re.replace_all(&text, "");
 
-    let decode_entities = text
-        .replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'");
+    let decode_entities = decode_html_entities(&text);
 
     let multiple_newlines = Regex::new(r"\n{3,}").unwrap();
     let cleaned_lines = multiple_newlines.replace_all(&decode_entities, "\n\n");
@@ -619,6 +746,34 @@ impl CdpController {
                 return Ok(false);
             }
             std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    pub fn collect_preview_diagnostics(&self, ws_url: &str, do_screenshot: bool) -> Result<serde_json::Value, String> {
+        let diag_js = r#"(() => {
+            const errs = [];
+            if (Array.isArray(window.__omniConsoleErrors)) {
+                for (const e of window.__omniConsoleErrors.slice(-20)) errs.push(String(e));
+            }
+            const perf = performance.getEntriesByType ? performance.getEntriesByType('resource').filter(r => r.responseStatus >= 400).slice(0, 15).map(r => `${r.responseStatus} ${r.name}`) : [];
+            return {
+                url: location.href,
+                title: document.title,
+                readyState: document.readyState,
+                textLength: (document.body?.innerText || '').trim().length,
+                consoleErrors: errs,
+                failedResources: perf,
+            };
+        })()"#;
+        let dom_info = self.evaluate_script(ws_url, diag_js)?;
+        if do_screenshot {
+            let b64 = self.capture_screenshot(ws_url, Some("png"))?;
+            Ok(json!({
+                "dom": dom_info,
+                "dataUrl": format!("data:image/png;base64,{}", b64),
+            }))
+        } else {
+            Ok(dom_info)
         }
     }
 }

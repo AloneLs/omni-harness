@@ -769,38 +769,205 @@ pub struct EditOp {
     pub new_text: String,
 }
 
-fn check_bracket_balance(content: &str) -> Option<String> {
+fn check_bracket_balance(content: &str, ext: &str) -> Option<String> {
+    let bytes = content.as_bytes();
+    let n = bytes.len();
+    let mut i = 0usize;
     let mut parens = 0i32;
     let mut braces = 0i32;
     let mut brackets = 0i32;
-    let mut in_str: Option<char> = None;
-    let mut escaped = false;
-    for ch in content.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' && in_str.is_some() {
-            escaped = true;
-            continue;
-        }
-        if let Some(q) = in_str {
-            if ch == q {
-                in_str = None;
+    let is_rust = ext.eq_ignore_ascii_case("rs");
+    let is_hash_comment = matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "py" | "sh" | "bash" | "toml" | "yaml" | "yml"
+    );
+    let mut template_expr_braces: Vec<i32> = Vec::new();
+
+    while i < n {
+        let b = bytes[i];
+
+        // Skip # line comments for Python/Shell/TOML/YAML
+        if is_hash_comment && b == b'#' {
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
             }
             continue;
         }
-        match ch {
-            '"' | '\'' => in_str = Some(ch),
-            '(' => parens += 1,
-            ')' => parens -= 1,
-            '{' => braces += 1,
-            '}' => braces -= 1,
-            '[' => brackets += 1,
-            ']' => brackets -= 1,
+
+        // Skip // line comments and /* ... */ block comments
+        if !is_hash_comment && b == b'/' && i + 1 < n {
+            if bytes[i + 1] == b'/' {
+                i += 2;
+                while i < n && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(n);
+                continue;
+            }
+        }
+
+        // Rust raw strings: r"..." / r#"..."# / br#"..."# / cr#"..."#
+        if is_rust && (b == b'r' || ((b == b'b' || b == b'c') && i + 1 < n && bytes[i + 1] == b'r')) {
+            let r_pos = if b == b'r' { i } else { i + 1 };
+            let prev_is_ident = i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
+            if !prev_is_ident {
+                let mut k = r_pos + 1;
+                let mut hashes = 0usize;
+                while k < n && bytes[k] == b'#' {
+                    hashes += 1;
+                    k += 1;
+                }
+                if k < n && bytes[k] == b'"' {
+                    i = k + 1;
+                    while i < n {
+                        if bytes[i] == b'"' {
+                            let mut matched = 0usize;
+                            while matched < hashes && i + 1 + matched < n && bytes[i + 1 + matched] == b'#' {
+                                matched += 1;
+                            }
+                            if matched == hashes {
+                                i += 1 + hashes;
+                                break;
+                            }
+                        }
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Double-quoted strings
+        if b == b'"' {
+            i += 1;
+            while i < n {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(n);
+                    continue;
+                }
+                if bytes[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        // Single-quoted strings / Rust char literals vs lifetimes
+        if b == b'\'' {
+            if is_rust {
+                // Char literal: '\...' or 'x' (one UTF-8 char followed by ')
+                if i + 1 < n && bytes[i + 1] == b'\\' {
+                    i += 2;
+                    while i < n && bytes[i] != b'\'' && bytes[i] != b'\n' {
+                        if bytes[i] == b'\\' {
+                            i = (i + 2).min(n);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if i < n && bytes[i] == b'\'' {
+                        i += 1;
+                    }
+                    continue;
+                } else if let Some(ch) = content[i + 1..].chars().next() {
+                    let after_ch = i + 1 + ch.len_utf8();
+                    if after_ch < n && bytes[after_ch] == b'\'' {
+                        i = after_ch + 1;
+                        continue;
+                    }
+                }
+                // Otherwise it's a Rust lifetime ('a, 'static, '_) — skip just the quote
+                i += 1;
+                continue;
+            } else {
+                i += 1;
+                while i < n {
+                    if bytes[i] == b'\\' {
+                        i = (i + 2).min(n);
+                        continue;
+                    }
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
+        // Template literals (`...` with ${...} expressions) for JS/TS/Svelte
+        if b == b'`' && matches!(ext.to_ascii_lowercase().as_str(), "ts" | "tsx" | "js" | "jsx" | "svelte") {
+            i += 1;
+            while i < n {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(n);
+                    continue;
+                }
+                if bytes[i] == b'$' && i + 1 < n && bytes[i + 1] == b'{' {
+                    braces += 1;
+                    template_expr_braces.push(braces);
+                    i += 2;
+                    break;
+                }
+                if bytes[i] == b'`' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        match b {
+            b'(' => parens += 1,
+            b')' => parens -= 1,
+            b'{' => braces += 1,
+            b'}' => {
+                if let Some(&target_depth) = template_expr_braces.last() {
+                    if braces == target_depth {
+                        template_expr_braces.pop();
+                        braces -= 1;
+                        i += 1;
+                        // Resume scanning rest of template literal until next ${ or closing `
+                        while i < n {
+                            if bytes[i] == b'\\' {
+                                i = (i + 2).min(n);
+                                continue;
+                            }
+                            if bytes[i] == b'$' && i + 1 < n && bytes[i + 1] == b'{' {
+                                braces += 1;
+                                template_expr_braces.push(braces);
+                                i += 2;
+                                break;
+                            }
+                            if bytes[i] == b'`' {
+                                i += 1;
+                                break;
+                            }
+                            i += 1;
+                        }
+                        continue;
+                    }
+                }
+                braces -= 1;
+            }
+            b'[' => brackets += 1,
+            b']' => brackets -= 1,
             _ => {}
         }
+        i += 1;
     }
+
     if parens != 0 || braces != 0 || brackets != 0 {
         Some(format!(
             "Syntax warning: unbalanced delimiters after edit (parens: {:+}, braces: {:+}, brackets: {:+})",
@@ -876,6 +1043,17 @@ pub fn read_file_smart(
     path_str: &str,
     offset: Option<usize>,
     limit: Option<usize>,
+    allowed_roots: &[PathBuf],
+    guard: &crate::tools::safety::FileReadGuard,
+) -> Result<serde_json::Value, String> {
+    read_file_smart_with_char_offset(path_str, offset, limit, None, allowed_roots, guard)
+}
+
+pub fn read_file_smart_with_char_offset(
+    path_str: &str,
+    offset: Option<usize>,
+    limit: Option<usize>,
+    char_offset: Option<usize>,
     allowed_roots: &[PathBuf],
     guard: &crate::tools::safety::FileReadGuard,
 ) -> Result<serde_json::Value, String> {
@@ -975,6 +1153,42 @@ pub fn read_file_smart(
     }
 
     let text = String::from_utf8_lossy(&raw_bytes);
+    if let Some(co) = char_offset {
+        let total_chars = text.chars().count();
+        let max_chars = limit.unwrap_or(16_000).clamp(100, 64_000);
+        if co >= total_chars && total_chars > 0 {
+            return Ok(serde_json::json!({
+                "kind": "text",
+                "path": target.to_string_lossy(),
+                "totalChars": total_chars,
+                "returnedChars": 0,
+                "truncated": false,
+                "content": format!("[char_offset {} is past EOF (totalChars={}).]", co, total_chars),
+            }));
+        }
+        let slice: String = text.chars().skip(co).take(max_chars).collect();
+        let ret_chars = slice.chars().count();
+        let truncated = co + ret_chars < total_chars;
+        let mut body = slice;
+        if truncated {
+            body.push_str(&format!(
+                "\n[Showing chars {}-{} of {}. Use char_offset={} to read further.]",
+                co,
+                co + ret_chars,
+                total_chars,
+                co + ret_chars
+            ));
+        }
+        return Ok(serde_json::json!({
+            "kind": "text",
+            "path": target.to_string_lossy(),
+            "totalChars": total_chars,
+            "returnedChars": ret_chars,
+            "truncated": truncated,
+            "content": body,
+        }));
+    }
+
     let all_lines: Vec<&str> = text.lines().collect();
     let total_lines = all_lines.len();
     let start = offset.unwrap_or(0);
@@ -1063,8 +1277,15 @@ pub fn edit_file_cascade(
     let mut current = before_str.clone();
     let mut applied = 0usize;
 
-    for op in edits {
-        let (next, cnt) = apply_single_edit_cascade(&current, &op.old_text, &op.new_text, replace_all)?;
+    for (idx, op) in edits.iter().enumerate() {
+        let (next, cnt) = apply_single_edit_cascade(&current, &op.old_text, &op.new_text, replace_all)
+            .map_err(|e| {
+                if edits.len() > 1 {
+                    format!("edit #{} (of {}) failed: {}", idx + 1, edits.len(), e)
+                } else {
+                    e
+                }
+            })?;
         current = next;
         applied += cnt;
     }
@@ -1098,8 +1319,8 @@ pub fn edit_file_cascade(
     )?;
 
     let ext = target.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let syntax_warning = if matches!(ext, "rs" | "ts" | "js" | "svelte" | "json" | "cpp" | "h" | "java" | "cs") {
-        check_bracket_balance(&current)
+    let syntax_warning = if matches!(ext, "rs" | "ts" | "js" | "svelte" | "json" | "cpp" | "h" | "java" | "cs" | "py") {
+        check_bracket_balance(&current, ext)
     } else {
         None
     };
@@ -1137,11 +1358,14 @@ pub fn apply_unified_diff_safe(
         .map_err(|_| "File is not valid UTF-8".to_string())?;
     let before_hash = crate::tools::safety::FileReadGuard::hash_bytes(&before_bytes);
 
-    let old_lines: Vec<&str> = before_str.lines().collect();
+    let is_crlf = before_str.contains("\r\n");
+    let norm_before = before_str.replace("\r\n", "\n");
+    let old_lines: Vec<&str> = norm_before.lines().collect();
     let mut new_lines: Vec<String> = old_lines.iter().map(|l| (*l).to_string()).collect();
     let mut line_offset: isize = 0;
 
-    let patch_lines: Vec<&str> = patch_text.lines().collect();
+    let patch_norm = patch_text.replace("\r\n", "\n");
+    let patch_lines: Vec<&str> = patch_norm.lines().collect();
     let mut idx = 0usize;
     while idx < patch_lines.len() {
         let line = patch_lines[idx];
@@ -1158,41 +1382,101 @@ pub fn apply_unified_diff_safe(
                 .and_then(|n| n.parse::<usize>().ok())
                 .ok_or_else(|| format!("Invalid hunk header: {}", line))?;
 
-            let mut cursor = (old_start.saturating_sub(1) as isize + line_offset).max(0) as usize;
+            let hint_cursor = (old_start.saturating_sub(1) as isize + line_offset).max(0) as usize;
             idx += 1;
+            let mut hunk_ops: Vec<(char, String)> = Vec::new();
             while idx < patch_lines.len() && !patch_lines[idx].starts_with("@@") {
                 let hline = patch_lines[idx];
                 if let Some(rest) = hline.strip_prefix(' ') {
-                    if cursor >= new_lines.len() || new_lines[cursor] != rest {
-                        return Err(format!("Patch context mismatch at line {}", cursor + 1));
-                    }
-                    cursor += 1;
+                    hunk_ops.push((' ', rest.to_string()));
                 } else if let Some(rest) = hline.strip_prefix('-') {
-                    if cursor >= new_lines.len() || new_lines[cursor] != rest {
-                        return Err(format!("Patch removal mismatch at line {}", cursor + 1));
-                    }
-                    new_lines.remove(cursor);
-                    line_offset -= 1;
+                    hunk_ops.push(('-', rest.to_string()));
                 } else if let Some(rest) = hline.strip_prefix('+') {
-                    if cursor <= new_lines.len() {
-                        new_lines.insert(cursor, rest.to_string());
-                        cursor += 1;
-                        line_offset += 1;
-                    }
-                } else if hline.starts_with("\\ No newline") {
-                } else if !hline.is_empty() {
+                    hunk_ops.push(('+', rest.to_string()));
+                } else if hline.starts_with("\\ No newline") || hline.is_empty() {
+                } else {
                     return Err(format!("Invalid patch line: {}", hline));
                 }
                 idx += 1;
+            }
+
+            let expected_old: Vec<&str> = hunk_ops
+                .iter()
+                .filter(|(op, _)| *op == ' ' || *op == '-')
+                .map(|(_, s)| s.as_str())
+                .collect();
+
+            let matches_at = |lines: &[String], pos: usize| -> bool {
+                if pos + expected_old.len() > lines.len() {
+                    return false;
+                }
+                expected_old
+                    .iter()
+                    .enumerate()
+                    .all(|(k, exp)| lines[pos + k] == *exp)
+            };
+
+            let resolved_start = if expected_old.is_empty() {
+                hint_cursor.min(new_lines.len())
+            } else if matches_at(&new_lines, hint_cursor) {
+                hint_cursor
+            } else {
+                // Fuzzy hunk search: +-80 lines around hint, then whole file
+                let mut found: Option<usize> = None;
+                let lo = hint_cursor.saturating_sub(80);
+                let hi = (hint_cursor + 80).min(new_lines.len().saturating_sub(expected_old.len()));
+                let mut best_dist = usize::MAX;
+                for pos in lo..=hi {
+                    if matches_at(&new_lines, pos) {
+                        let d = pos.abs_diff(hint_cursor);
+                        if d < best_dist {
+                            best_dist = d;
+                            found = Some(pos);
+                        }
+                    }
+                }
+                if found.is_none() && new_lines.len() >= expected_old.len() {
+                    for pos in 0..=new_lines.len() - expected_old.len() {
+                        if matches_at(&new_lines, pos) {
+                            found = Some(pos);
+                            break;
+                        }
+                    }
+                }
+                found.ok_or_else(|| {
+                    format!(
+                        "Patch hunk context mismatch near line {} (expected '{}')",
+                        hint_cursor + 1,
+                        expected_old.first().copied().unwrap_or("")
+                    )
+                })?
+            };
+
+            let mut cursor = resolved_start;
+            for (op, text) in hunk_ops {
+                match op {
+                    ' ' => cursor += 1,
+                    '-' => {
+                        new_lines.remove(cursor);
+                        line_offset -= 1;
+                    }
+                    '+' => {
+                        new_lines.insert(cursor, text);
+                        cursor += 1;
+                        line_offset += 1;
+                    }
+                    _ => {}
+                }
             }
             continue;
         }
         idx += 1;
     }
 
-    let mut current = new_lines.join("\n");
-    if before_str.ends_with('\n') && !current.ends_with('\n') {
-        current.push('\n');
+    let sep = if is_crlf { "\r\n" } else { "\n" };
+    let mut current = new_lines.join(sep);
+    if norm_before.ends_with('\n') && !current.ends_with(sep) {
+        current.push_str(sep);
     }
 
     let (added, removed) = compute_line_diff(&before_str, &current);
@@ -1286,6 +1570,21 @@ pub fn write_file_atomic(
     })
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), String> {
+    fs::create_dir_all(dst).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(src).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let sp = entry.path();
+        let dp = dst.join(entry.file_name());
+        if sp.is_dir() {
+            copy_dir_recursive(&sp, &dp)?;
+        } else {
+            fs::copy(&sp, &dp).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 pub fn fs_ops_safe(
     action: &str,
     path_str: &str,
@@ -1307,7 +1606,15 @@ pub fn fs_ops_safe(
             if let Some(p) = dest.parent() {
                 fs::create_dir_all(p).map_err(|e| e.to_string())?;
             }
-            fs::rename(&target, &dest).map_err(|e| e.to_string())?;
+            if fs::rename(&target, &dest).is_err() {
+                if target.is_dir() {
+                    copy_dir_recursive(&target, &dest)?;
+                    fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
+                } else {
+                    fs::copy(&target, &dest).map_err(|e| e.to_string())?;
+                    fs::remove_file(&target).map_err(|e| e.to_string())?;
+                }
+            }
             Ok(serde_json::json!({ "action": "move", "from": target.to_string_lossy(), "to": dest.to_string_lossy() }))
         }
         "copy" => {
@@ -1317,7 +1624,11 @@ pub fn fs_ops_safe(
             if let Some(p) = dest.parent() {
                 fs::create_dir_all(p).map_err(|e| e.to_string())?;
             }
-            fs::copy(&target, &dest).map_err(|e| e.to_string())?;
+            if target.is_dir() {
+                copy_dir_recursive(&target, &dest)?;
+            } else {
+                fs::copy(&target, &dest).map_err(|e| e.to_string())?;
+            }
             Ok(serde_json::json!({ "action": "copy", "from": target.to_string_lossy(), "to": dest.to_string_lossy() }))
         }
         "delete" => {
@@ -1329,7 +1640,15 @@ pub fn fs_ops_safe(
             fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
             let fname = target.file_name().and_then(|n| n.to_str()).unwrap_or("item");
             let trashed = trash_dir.join(format!("{}_{}", chrono::Utc::now().timestamp_millis(), fname));
-            fs::rename(&target, &trashed).map_err(|e| e.to_string())?;
+            if fs::rename(&target, &trashed).is_err() {
+                if target.is_dir() {
+                    copy_dir_recursive(&target, &trashed)?;
+                    fs::remove_dir_all(&target).map_err(|e| e.to_string())?;
+                } else {
+                    fs::copy(&target, &trashed).map_err(|e| e.to_string())?;
+                    fs::remove_file(&target).map_err(|e| e.to_string())?;
+                }
+            }
             Ok(serde_json::json!({ "action": "delete", "trashedTo": trashed.to_string_lossy() }))
         }
         other => Err(format!("Unsupported fs_ops action: {}", other)),
@@ -1347,6 +1666,12 @@ pub fn glob_sorted_by_mtime(
         _ => allowed_roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
     };
     let root = crate::tools::path_norm::strip_verbatim_prefix(&raw_root.canonicalize().unwrap_or(raw_root));
+    if crate::tools::path_norm::path_key(&root).len() <= 3 {
+        return Err(format!(
+            "Refusing to recursively glob bare drive root '{}'; specify a subdirectory path.",
+            root.display()
+        ));
+    }
     let root_norm = root
         .to_string_lossy()
         .replace('\\', "/")
@@ -1371,6 +1696,9 @@ pub fn glob_sorted_by_mtime(
     let re = RegexBuilder::new(&regex_str).case_insensitive(true).build().map_err(|e| e.to_string())?;
 
     let mut matches: Vec<(u128, String)> = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    const MAX_GLOB_WALK_ENTRIES: usize = 150_000;
+    let mut visited = 0usize;
     let walker = WalkBuilder::new(&root)
         .hidden(false)
         .git_ignore(true)
@@ -1381,6 +1709,10 @@ pub fn glob_sorted_by_mtime(
         .build();
 
     for entry in walker.flatten() {
+        visited += 1;
+        if visited > MAX_GLOB_WALK_ENTRIES || (visited % 256 == 0 && std::time::Instant::now() > deadline) {
+            break;
+        }
         if entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             let full_norm = entry
                 .path()
@@ -1416,6 +1748,35 @@ pub fn grep_with_context(
     context_lines: usize,
     allowed_roots: &[PathBuf],
 ) -> Result<Vec<serde_json::Value>, String> {
+    let val = grep_with_options(
+        pattern,
+        root_opt,
+        file_type,
+        context_lines,
+        "content",
+        120,
+        0,
+        false,
+        allowed_roots,
+    )?;
+    Ok(val
+        .get("matches")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default())
+}
+
+pub fn grep_with_options(
+    pattern: &str,
+    root_opt: Option<&str>,
+    file_type: Option<&str>,
+    context_lines: usize,
+    mode: &str,
+    limit: usize,
+    offset: usize,
+    case_insensitive: bool,
+    allowed_roots: &[PathBuf],
+) -> Result<serde_json::Value, String> {
     let raw_root = match root_opt {
         Some(r) if !r.trim().is_empty() => validate_read_path(r, allowed_roots)?,
         _ => allowed_roots.first().cloned().unwrap_or_else(|| PathBuf::from(".")),
@@ -1428,10 +1789,10 @@ pub fn grep_with_context(
             pos: Vec<regex::Regex>,
             neg: Vec<regex::Regex>,
         },
-        Literal(String),
+        Literal(String, bool),
     }
 
-    let matcher = match RegexBuilder::new(pattern).build() {
+    let matcher = match RegexBuilder::new(pattern).case_insensitive(case_insensitive).build() {
         Ok(r) => LineMatcher::Simple(r),
         Err(orig_err) => {
             if pattern.contains("(?!") || pattern.contains("(?=") {
@@ -1457,7 +1818,7 @@ pub fn grep_with_context(
                         }
                         if depth == 0 {
                             let inner = &pattern[start..j - 1];
-                            if let Ok(r) = RegexBuilder::new(inner).build() {
+                            if let Ok(r) = RegexBuilder::new(inner).case_insensitive(case_insensitive).build() {
                                 if is_neg { neg_pats.push(r); } else { pos_pats.push(r); }
                             }
                             i = j;
@@ -1469,16 +1830,32 @@ pub fn grep_with_context(
                     i += ch.len_utf8();
                 }
                 let main_pat = if cleaned.trim().is_empty() { ".*" } else { cleaned.as_str() };
-                match RegexBuilder::new(main_pat).build() {
+                match RegexBuilder::new(main_pat).case_insensitive(case_insensitive).build() {
                     Ok(main_re) => LineMatcher::Lookaround { main: main_re, pos: pos_pats, neg: neg_pats },
                     Err(_) => return Err(orig_err.to_string()),
                 }
             } else {
-                LineMatcher::Literal(pattern.to_string())
+                LineMatcher::Literal(pattern.to_string(), case_insensitive)
             }
         }
     };
-    let mut results = Vec::new();
+
+    let eff_mode = match mode.trim().to_ascii_lowercase().as_str() {
+        "files" | "files_with_matches" | "files_only" => "files_with_matches",
+        "count" | "counts" => "count",
+        _ => "content",
+    };
+    let eff_limit = limit.clamp(1, 500);
+    let max_collect = (offset + eff_limit).min(2000);
+
+    let mut content_hits = Vec::new();
+    let mut file_hits: Vec<String> = Vec::new();
+    let mut count_hits: Vec<serde_json::Value> = Vec::new();
+    let mut total_matches = 0usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    const MAX_GREP_WALK_ENTRIES: usize = 150_000;
+    let mut visited = 0usize;
+    let mut timed_out = false;
 
     let walker = WalkBuilder::new(&root)
         .hidden(false)
@@ -1490,20 +1867,40 @@ pub fn grep_with_context(
         .build();
 
     for entry in walker.flatten() {
+        visited += 1;
+        if visited > MAX_GREP_WALK_ENTRIES || (visited % 128 == 0 && std::time::Instant::now() > deadline) {
+            timed_out = true;
+            break;
+        }
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let ext_lower = entry
+            .path()
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            ext_lower.as_str(),
+            "exe" | "dll" | "pdb" | "lib" | "obj" | "o" | "a" | "so" | "dylib"
+                | "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp"
+                | "mp3" | "wav" | "ogg" | "mp4" | "webm" | "mov" | "mkv"
+                | "zip" | "7z" | "tar" | "gz" | "rar" | "db" | "sqlite" | "wasm" | "ttf" | "woff" | "woff2"
+        ) {
             continue;
         }
         if entry.metadata().map(|m| m.len() > MAX_GREP_FILE_BYTES).unwrap_or(false) {
             continue;
         }
         if let Some(ft) = file_type {
-            let ext = entry.path().extension().and_then(|e| e.to_str()).unwrap_or("");
-            if !ext.eq_ignore_ascii_case(ft.trim_start_matches('.')) {
+            if !ext_lower.eq_ignore_ascii_case(ft.trim_start_matches('.')) {
                 continue;
             }
         }
         if let Ok(content) = fs::read_to_string(entry.path()) {
             let lines: Vec<&str> = content.lines().collect();
+            let mut file_match_count = 0usize;
             for (idx, line) in lines.iter().enumerate() {
                 let is_hit = match &matcher {
                     LineMatcher::Simple(r) => r.is_match(line),
@@ -1512,28 +1909,88 @@ pub fn grep_with_context(
                             && pos.iter().all(|p| p.is_match(line))
                             && !neg.iter().any(|n| n.is_match(line))
                     }
-                    LineMatcher::Literal(s) => line.contains(s.as_str()),
+                    LineMatcher::Literal(s, ci) => {
+                        if *ci {
+                            line.to_lowercase().contains(&s.to_lowercase())
+                        } else {
+                            line.contains(s.as_str())
+                        }
+                    }
                 };
                 if is_hit {
-                    let from = idx.saturating_sub(context_lines);
-                    let to = (idx + context_lines + 1).min(lines.len());
-                    let snippet: Vec<String> = (from..to)
-                        .map(|i| format!("L{}: {}", i + 1, lines[i]))
-                        .collect();
-                    results.push(serde_json::json!({
-                        "file": entry.path().to_string_lossy(),
-                        "line": idx + 1,
-                        "snippet": snippet.join("\n"),
-                    }));
-                    if results.len() >= 80 {
-                        return Ok(results);
+                    file_match_count += 1;
+                    total_matches += 1;
+                    if eff_mode == "content" && content_hits.len() < max_collect {
+                        let from = idx.saturating_sub(context_lines);
+                        let to = (idx + context_lines + 1).min(lines.len());
+                        let snippet: Vec<String> = (from..to)
+                            .map(|i| format!("L{}: {}", i + 1, lines[i]))
+                            .collect();
+                        content_hits.push(serde_json::json!({
+                            "file": entry.path().to_string_lossy(),
+                            "line": idx + 1,
+                            "snippet": snippet.join("\n"),
+                        }));
+                    } else if eff_mode == "files_with_matches" {
+                        break;
                     }
+                }
+            }
+            if file_match_count > 0 {
+                let fpath = entry.path().to_string_lossy().to_string();
+                if eff_mode == "files_with_matches" && file_hits.len() < max_collect {
+                    file_hits.push(fpath);
+                } else if eff_mode == "count" && count_hits.len() < max_collect {
+                    count_hits.push(serde_json::json!({
+                        "file": fpath,
+                        "count": file_match_count,
+                    }));
                 }
             }
         }
     }
 
-    Ok(results)
+    match eff_mode {
+        "files_with_matches" => {
+            let total = file_hits.len();
+            let page: Vec<String> = file_hits.into_iter().skip(offset).take(eff_limit).collect();
+            let returned = page.len();
+            Ok(serde_json::json!({
+                "mode": "files_with_matches",
+                "totalFiles": total,
+                "returned": returned,
+                "truncated": offset + returned < total || timed_out,
+                "timedOut": timed_out,
+                "files": page,
+            }))
+        }
+        "count" => {
+            let total = count_hits.len();
+            let page: Vec<serde_json::Value> = count_hits.into_iter().skip(offset).take(eff_limit).collect();
+            let returned = page.len();
+            Ok(serde_json::json!({
+                "mode": "count",
+                "totalFiles": total,
+                "totalMatches": total_matches,
+                "returned": returned,
+                "truncated": offset + returned < total || timed_out,
+                "timedOut": timed_out,
+                "counts": page,
+            }))
+        }
+        _ => {
+            let page: Vec<serde_json::Value> = content_hits.into_iter().skip(offset).take(eff_limit).collect();
+            let returned = page.len();
+            Ok(serde_json::json!({
+                "mode": "content",
+                "totalMatches": total_matches,
+                "returned": returned,
+                "truncated": total_matches > offset + returned || timed_out,
+                "timedOut": timed_out,
+                "matches": page,
+            }))
+        }
+    }
 }
 
 fn decode_pdf_literal(bytes: &[u8]) -> String {

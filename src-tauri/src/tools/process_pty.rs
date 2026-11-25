@@ -308,7 +308,33 @@ pub fn kill_process(target_pid: u32, force: bool) -> Result<bool, String> {
 }
 
 pub fn strip_ansi(input: &str) -> String {
-    let chars: Vec<char> = input.chars().collect();
+    let cleaned_clixml;
+    let src: &str = if input.contains("#< CLIXML") {
+        let mut buf = String::with_capacity(input.len());
+        let mut rest = input;
+        while let Some(pos) = rest.find("#< CLIXML") {
+            buf.push_str(&rest[..pos]);
+            let after = &rest[pos..];
+            if let Some(end_objs) = after.find("</Objs>") {
+                rest = &after[end_objs + 7..];
+                if rest.starts_with("\r\n") {
+                    rest = &rest[2..];
+                } else if rest.starts_with('\n') {
+                    rest = &rest[1..];
+                }
+            } else {
+                // Incomplete CLIXML fragment at end of stream; drop the raw XML noise
+                rest = "";
+                break;
+            }
+        }
+        buf.push_str(rest);
+        cleaned_clixml = buf;
+        &cleaned_clixml
+    } else {
+        input
+    };
+    let chars: Vec<char> = src.chars().collect();
     let len = chars.len();
     let mut lines: Vec<String> = Vec::new();
     let mut cur_line: Vec<char> = Vec::new();
@@ -430,7 +456,7 @@ pub fn strip_ansi(input: &str) -> String {
         i += 1;
     }
 
-    let ended_with_nl = input.ends_with('\n');
+    let ended_with_nl = src.ends_with('\n');
     if !cur_line.is_empty() {
         let s: String = cur_line.iter().collect();
         lines.push(s.trim_end_matches(' ').to_string());
@@ -567,7 +593,7 @@ impl PtyManager {
         let mut cmd = if cfg!(target_os = "windows") {
             use base64::Engine;
             let full_script = format!(
-                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::InputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8;\n{}",
+                "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; [Console]::InputEncoding = [System.Text.Encoding]::UTF8; $OutputEncoding = [System.Text.Encoding]::UTF8;\n{}",
                 command
             );
             let utf16_bytes: Vec<u8> = full_script
@@ -576,7 +602,7 @@ impl PtyManager {
                 .collect();
             let encoded = base64::engine::general_purpose::STANDARD.encode(&utf16_bytes);
             let mut c = tokio::process::Command::new("powershell.exe");
-            c.args(["-NoProfile", "-EncodedCommand", &encoded]);
+            c.args(["-NoProfile", "-OutputFormat", "Text", "-EncodedCommand", &encoded]);
             c
         } else {
             let mut c = tokio::process::Command::new("sh");
@@ -957,7 +983,34 @@ impl PtyManager {
             }));
         }
 
-        Err(format!("Task not found: {}", task_id))
+        Err(self.task_not_found_err(task_id))
+    }
+
+    fn task_not_found_err(&self, task_id: &str) -> String {
+        let mut active: Vec<String> = self
+            .tasks
+            .read()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        if let Ok(sm) = self.sessions.read() {
+            for k in sm.keys() {
+                if !active.contains(k) {
+                    active.push(k.clone());
+                }
+            }
+        }
+        if active.is_empty() {
+            format!(
+                "Task not found: '{}' (no active or recent background tasks in memory — it may have been cleared on app restart).",
+                task_id
+            )
+        } else {
+            format!(
+                "Task not found: '{}' (it may have been cleared on app restart). Known task_ids: {}",
+                task_id,
+                active.join(", ")
+            )
+        }
     }
 
     pub async fn send_task_input(&self, task_id: &str, input: &str) -> Result<Value, String> {

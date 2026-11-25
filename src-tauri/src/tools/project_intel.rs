@@ -229,17 +229,27 @@ pub fn symbol_search(
     let type_filters: Option<HashSet<String>> = symbol_types
         .map(|list| list.into_iter().map(|s| s.to_lowercase()).collect());
 
-    let rust_fn_re = Regex::new(r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+([a-zA-Z0-9_]+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)").unwrap();
-    let rust_struct_re = Regex::new(r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:struct|enum|trait|union)\s+([a-zA-Z0-9_]+)").unwrap();
-    let ts_fn_re = Regex::new(r"(?m)^\s*(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)").unwrap();
-    let ts_class_re = Regex::new(r"(?m)^\s*(?:export\s+)?(?:class|interface|type)\s+([a-zA-Z0-9_]+)").unwrap();
-    let py_fn_re = Regex::new(r"(?m)^\s*(?:async\s+)?def\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)").unwrap();
+    let rust_fn_re = Regex::new(r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+([a-zA-Z0-9_]+)\s*(?:<[^>]*>)?\s*\(").unwrap();
+    let rust_struct_re = Regex::new(r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:struct|enum|trait|union|type|mod)\s+([a-zA-Z0-9_]+)").unwrap();
+    let rust_impl_re = Regex::new(r"(?m)^\s*impl(?:<[^>]*>)?\s+(?:([a-zA-Z0-9_:]+)\s+for\s+)?([a-zA-Z0-9_:]+)").unwrap();
+    let rust_const_re = Regex::new(r"(?m)^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:const|static)\s+([A-Z0-9_]{2,})\s*:").unwrap();
+    let ts_fn_re = Regex::new(r"(?m)^\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?function\s+([a-zA-Z0-9_]+)").unwrap();
+    let ts_arrow_re = Regex::new(r"(?m)^\s*(?:export\s+)?(?:const|let)\s+([a-zA-Z0-9_]+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[a-zA-Z0-9_]+)\s*=>").unwrap();
+    let ts_class_re = Regex::new(r"(?m)^\s*(?:export\s+)?(?:class|interface|type|enum)\s+([a-zA-Z0-9_]+)").unwrap();
+    let py_fn_re = Regex::new(r"(?m)^\s*(?:async\s+)?def\s+([a-zA-Z0-9_]+)\s*\(").unwrap();
     let py_class_re = Regex::new(r"(?m)^\s*class\s+([a-zA-Z0-9_]+)").unwrap();
+    let go_fn_re = Regex::new(r"(?m)^\s*func\s+(?:\([^)]*\)\s*)?([a-zA-Z0-9_]+)\s*\(").unwrap();
+    let go_type_re = Regex::new(r"(?m)^\s*type\s+([a-zA-Z0-9_]+)\s+(?:struct|interface)\b").unwrap();
+    let cpp_class_re = Regex::new(r"(?m)^\s*(?:class|struct|enum(?:\s+class)?|namespace)\s+([a-zA-Z0-9_]+)").unwrap();
 
     let mut results = Vec::new();
     let walker = WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
+        .filter_entry(|e| {
+            let n = e.file_name().to_string_lossy();
+            n != ".git" && n != "node_modules" && n != "target"
+        })
         .build();
 
     for entry in walker.filter_map(Result::ok) {
@@ -248,12 +258,14 @@ pub fn symbol_search(
         }
 
         let p = entry.path();
-        let ext = p.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+        let ext = p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
         let is_rust = ext == "rs";
-        let is_ts_js = ext == "ts" || ext == "tsx" || ext == "js" || ext == "jsx" || ext == "svelte";
+        let is_ts_js = matches!(ext.as_str(), "ts" | "tsx" | "js" | "jsx" | "svelte" | "mjs");
         let is_py = ext == "py";
+        let is_go = ext == "go";
+        let is_cpp = matches!(ext.as_str(), "c" | "h" | "cpp" | "hpp" | "cc" | "hh");
 
-        if !is_rust && !is_ts_js && !is_py {
+        if !is_rust && !is_ts_js && !is_py && !is_go && !is_cpp {
             continue;
         }
 
@@ -272,42 +284,60 @@ pub fn symbol_search(
                     return;
                 }
             }
-            results.push(SymbolItem {
-                name: name.to_string(),
-                kind: kind.to_string(),
-                file_path: file_path_str.clone(),
-                line_number: line_num,
-                signature: sig.to_string(),
-            });
+            if results.len() < 400 {
+                results.push(SymbolItem {
+                    name: name.to_string(),
+                    kind: kind.to_string(),
+                    file_path: file_path_str.clone(),
+                    line_number: line_num,
+                    signature: sig.to_string(),
+                });
+            }
         };
 
         for (idx, line) in content.lines().enumerate() {
             let line_num = idx + 1;
             if is_rust {
                 if let Some(caps) = rust_fn_re.captures(line) {
-                    let name = &caps[1];
-                    check_and_push(&mut results, name, "function", line_num, line.trim());
+                    check_and_push(&mut results, &caps[1], "function", line_num, line.trim());
                 } else if let Some(caps) = rust_struct_re.captures(line) {
-                    let name = &caps[1];
-                    check_and_push(&mut results, name, "type", line_num, line.trim());
+                    check_and_push(&mut results, &caps[1], "type", line_num, line.trim());
+                } else if let Some(caps) = rust_impl_re.captures(line) {
+                    let target = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                    if !target.is_empty() {
+                        check_and_push(&mut results, target, "impl", line_num, line.trim());
+                    }
+                } else if let Some(caps) = rust_const_re.captures(line) {
+                    check_and_push(&mut results, &caps[1], "const", line_num, line.trim());
                 }
             } else if is_ts_js {
                 if let Some(caps) = ts_fn_re.captures(line) {
-                    let name = &caps[1];
-                    check_and_push(&mut results, name, "function", line_num, line.trim());
+                    check_and_push(&mut results, &caps[1], "function", line_num, line.trim());
+                } else if let Some(caps) = ts_arrow_re.captures(line) {
+                    check_and_push(&mut results, &caps[1], "function", line_num, line.trim());
                 } else if let Some(caps) = ts_class_re.captures(line) {
-                    let name = &caps[1];
-                    check_and_push(&mut results, name, "class", line_num, line.trim());
+                    check_and_push(&mut results, &caps[1], "class", line_num, line.trim());
                 }
             } else if is_py {
                 if let Some(caps) = py_fn_re.captures(line) {
-                    let name = &caps[1];
-                    check_and_push(&mut results, name, "function", line_num, line.trim());
+                    check_and_push(&mut results, &caps[1], "function", line_num, line.trim());
                 } else if let Some(caps) = py_class_re.captures(line) {
-                    let name = &caps[1];
-                    check_and_push(&mut results, name, "class", line_num, line.trim());
+                    check_and_push(&mut results, &caps[1], "class", line_num, line.trim());
+                }
+            } else if is_go {
+                if let Some(caps) = go_fn_re.captures(line) {
+                    check_and_push(&mut results, &caps[1], "function", line_num, line.trim());
+                } else if let Some(caps) = go_type_re.captures(line) {
+                    check_and_push(&mut results, &caps[1], "type", line_num, line.trim());
+                }
+            } else if is_cpp {
+                if let Some(caps) = cpp_class_re.captures(line) {
+                    check_and_push(&mut results, &caps[1], "type", line_num, line.trim());
                 }
             }
+        }
+        if results.len() >= 400 {
+            break;
         }
     }
 

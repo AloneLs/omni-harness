@@ -32,6 +32,8 @@ pub struct Message {
     pub chat_id: String,
     pub role: String,
     pub content: String,
+    #[serde(default)]
+    pub model_id: Option<String>,
     pub reasoning_content: Option<String>,
     pub tool_calls: Option<String>,
     pub tool_call_id: Option<String>,
@@ -262,19 +264,25 @@ impl Database {
         Ok(())
     }
 
-    pub fn replace_chat_messages(&self, chat_id: &str, items: &[(String, String)]) -> Result<(), AppError> {
+    pub fn replace_chat_messages(&self, chat_id: &str, items: &[(String, String, Option<String>)]) -> Result<(), AppError> {
         let mut conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM messages WHERE chat_id = ?1", [chat_id])?;
         let now = chrono::Utc::now().to_rfc3339();
-        for (idx, (role, content)) in items.iter().enumerate() {
+        for (idx, (role, content, model_id)) in items.iter().enumerate() {
             let id = uuid::Uuid::new_v4().to_string();
             let seq = (idx + 1) as i64;
             tx.execute(
-                "INSERT INTO messages (id, chat_id, role, content, reasoning_content, tool_calls, tool_call_id, sequence_num, created_at)
-                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6)",
-                rusqlite::params![id, chat_id, role, content, seq, now],
+                "INSERT INTO messages (id, chat_id, role, content, model_id, reasoning_content, tool_calls, tool_call_id, sequence_num, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, ?6, ?7)",
+                rusqlite::params![id, chat_id, role, content, model_id, seq, now],
             )?;
+        }
+        if !items.is_empty() {
+            let _ = tx.execute(
+                "UPDATE chats SET updated_at = ?1 WHERE id = ?2 AND updated_at < ?1",
+                rusqlite::params![now, chat_id],
+            );
         }
         tx.commit()?;
         Ok(())
@@ -284,6 +292,8 @@ impl Database {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
         conn.execute("DELETE FROM chats WHERE id = ?1", [id])?;
         let _ = conn.execute("DELETE FROM agent_checkpoints WHERE chat_id = ?1", [id]);
+        let _ = conn.execute("DELETE FROM agent_checkpoints WHERE chat_id = ?1", [format!("full_ctx:{}", id)]);
+        let _ = conn.execute("DELETE FROM agent_checkpoints WHERE chat_id = ?1", [format!("tg_ctx:{}", id)]);
         let _ = conn.execute("DELETE FROM chat_context_cache WHERE chat_id = ?1", [id]);
         Ok(())
     }
@@ -304,13 +314,14 @@ impl Database {
             }
         }
         conn.execute(
-            "INSERT INTO messages (id, chat_id, role, content, reasoning_content, tool_calls, tool_call_id, sequence_num, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO messages (id, chat_id, role, content, model_id, reasoning_content, tool_calls, tool_call_id, sequence_num, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 message.id,
                 message.chat_id,
                 message.role,
                 message.content,
+                message.model_id,
                 message.reasoning_content,
                 message.tool_calls,
                 message.tool_call_id,
@@ -318,13 +329,17 @@ impl Database {
                 message.created_at
             ],
         )?;
+        let _ = conn.execute(
+            "UPDATE chats SET updated_at = ?1 WHERE id = ?2 AND updated_at < ?1",
+            rusqlite::params![message.created_at, message.chat_id],
+        );
         Ok(())
     }
 
     pub fn list_messages(&self, chat_id: &str) -> Result<Vec<Message>, AppError> {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
         let mut stmt = conn.prepare(
-            "SELECT id, chat_id, role, content, reasoning_content, tool_calls, tool_call_id, sequence_num, created_at
+            "SELECT id, chat_id, role, content, model_id, reasoning_content, tool_calls, tool_call_id, sequence_num, created_at
              FROM messages WHERE chat_id = ?1 ORDER BY sequence_num ASC",
         )?;
         let rows = stmt.query_map([chat_id], |row| {
@@ -333,11 +348,12 @@ impl Database {
                 chat_id: row.get(1)?,
                 role: row.get(2)?,
                 content: row.get(3)?,
-                reasoning_content: row.get(4)?,
-                tool_calls: row.get(5)?,
-                tool_call_id: row.get(6)?,
-                sequence_num: row.get(7)?,
-                created_at: row.get(8)?,
+                model_id: row.get(4)?,
+                reasoning_content: row.get(5)?,
+                tool_calls: row.get(6)?,
+                tool_call_id: row.get(7)?,
+                sequence_num: row.get(8)?,
+                created_at: row.get(9)?,
             })
         })?;
         let mut result = Vec::new();

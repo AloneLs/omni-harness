@@ -317,6 +317,10 @@ pub fn validate_read_path_with_base(
             }
         }
     }
+    let data_dir = crate::state::AppState::resolve_data_dir();
+    if is_within_root(&resolved, &data_dir) {
+        return Ok(resolved);
+    }
     Err(format!(
         "Access denied: path '{}' resolves outside allowed workspace root.",
         path_str

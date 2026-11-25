@@ -448,8 +448,19 @@ impl SingleAgentRunner {
         if let Some(d) = db {
             if let Ok(json) = serde_json::to_string(history) {
                 let _ = d.save_checkpoint(chat_id, &json);
+                let _ = d.save_checkpoint(&format!("full_ctx:{}", chat_id), &json);
             }
         }
+    }
+
+    fn sync_live_and_checkpoint(
+        session: &SessionHandle,
+        db: Option<&crate::db::Database>,
+        chat_id: &str,
+        history: &[ChatMessage],
+    ) {
+        session.set_live_history(history.to_vec());
+        Self::save_checkpoint(db, chat_id, history);
     }
 
     fn sanitize_resumed_history(history: &mut Vec<ChatMessage>) {
@@ -781,7 +792,7 @@ impl SingleAgentRunner {
                 history.push(ChatMessage::user(final_prompt));
             }
         }
-        Self::save_checkpoint(db, chat_id, history);
+        Self::sync_live_and_checkpoint(session, db, chat_id, history);
 
 
         let mut last_request_ts: Option<i64> = None;
@@ -1020,6 +1031,8 @@ impl SingleAgentRunner {
                 assistant_text.clear();
                 assistant_reasoning.clear();
                 active_tool_calls.clear();
+                session.clear_streaming_buffers();
+                session.clear_running_tools();
                 let mut in_stream_error: Option<String> = None;
                 let mut content_prefix_buffer = String::new();
                 let mut content_prefix_flushed = false;
@@ -1057,6 +1070,7 @@ impl SingleAgentRunner {
                     match &evt {
                         StreamEvent::ContentDelta { delta } => {
                             assistant_text.push_str(delta);
+                            session.set_streaming_buffers(&assistant_text, &assistant_reasoning);
                             if !suppress_content_stream {
                                 if !content_prefix_flushed {
                                     content_prefix_buffer.push_str(delta);
@@ -1074,6 +1088,7 @@ impl SingleAgentRunner {
                         }
                         StreamEvent::ReasoningDelta { delta } => {
                             assistant_reasoning.push_str(delta);
+                            session.set_streaming_buffers(&assistant_text, &assistant_reasoning);
                             let _ = event_sender.send(evt.clone()).await;
                         }
                         StreamEvent::ToolCallDelta { id, name, arguments_delta, .. } => {
@@ -1397,8 +1412,9 @@ impl SingleAgentRunner {
             if !active_tool_calls.is_empty() {
                 assistant_msg.tool_calls = Some(active_tool_calls.clone());
             }
+            session.clear_streaming_buffers();
             history.push(assistant_msg);
-            Self::save_checkpoint(db, chat_id, history);
+            Self::sync_live_and_checkpoint(session, db, chat_id, history);
 
             if active_tool_calls.is_empty() {
                 if history.last().map(|m| m.content.as_text_lossy().trim().is_empty()).unwrap_or(true) {
@@ -1471,6 +1487,17 @@ Complete all remaining items and mark each one as completed via task_board(actio
                     .iter()
                     .all(|tc| tc.function.name == "agent" || tc.function.name == "explore_subagent");
             if all_agents {
+                session.set_running_tools(
+                    active_tool_calls
+                        .iter()
+                        .map(|tc| crate::engine::stream_manager::LiveToolCallState {
+                            id: tc.id.clone(),
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                            started_at_ms: chrono::Utc::now().timestamp_millis(),
+                        })
+                        .collect(),
+                );
                 let mut join_set = tokio::task::JoinSet::new();
                 for (idx, tc) in active_tool_calls.iter().enumerate() {
                     let parsed_args: Value = serde_json::from_str(&tc.function.arguments)
@@ -1570,14 +1597,16 @@ Complete all remaining items and mark each one as completed via task_board(actio
                         reasoning_content: None,
                     });
                 }
-                Self::save_checkpoint(db, chat_id, history);
+                session.clear_running_tools();
+                Self::sync_live_and_checkpoint(session, db, chat_id, history);
                 let _ = state.transition(TaskStateEnum::Executing);
                 continue;
             }
 
             if event_sender.is_closed() {
+                session.clear_running_tools();
                 let _ = tools.pty_manager.kill_all_for_chat(chat_id);
-                Self::save_checkpoint(db, chat_id, history);
+                Self::sync_live_and_checkpoint(session, db, chat_id, history);
                 return Err("Client disconnected".to_string());
             }
 
@@ -1587,6 +1616,17 @@ Complete all remaining items and mark each one as completed via task_board(actio
                     .all(|tc| Self::is_concurrency_safe_tool(&tc.function.name));
 
             if all_concurrent_safe {
+                session.set_running_tools(
+                    active_tool_calls
+                        .iter()
+                        .map(|tc| crate::engine::stream_manager::LiveToolCallState {
+                            id: tc.id.clone(),
+                            name: tc.function.name.clone(),
+                            arguments: tc.function.arguments.clone(),
+                            started_at_ms: chrono::Utc::now().timestamp_millis(),
+                        })
+                        .collect(),
+                );
                 let mut join_set = tokio::task::JoinSet::new();
                 for (idx, tc) in active_tool_calls.iter().enumerate() {
                     let parsed_args: Value = serde_json::from_str(&tc.function.arguments)
@@ -1686,7 +1726,8 @@ Complete all remaining items and mark each one as completed via task_board(actio
                         reasoning_content: None,
                     });
                 }
-                Self::save_checkpoint(db, chat_id, history);
+                session.clear_running_tools();
+                Self::sync_live_and_checkpoint(session, db, chat_id, history);
                 let _ = state.transition(TaskStateEnum::Executing);
                 continue;
             }
@@ -1703,6 +1744,7 @@ Complete all remaining items and mark each one as completed via task_board(actio
                 let tool_name = &tc.function.name;
                 let parsed_args: Value = serde_json::from_str(&tc.function.arguments)
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                session.add_running_tool(tc.id.clone(), tool_name.clone(), tc.function.arguments.clone());
 
                 if tool_name == "terminal_exec" {
                     let exec_cp_id = uuid::Uuid::new_v4().to_string();
@@ -1780,7 +1822,8 @@ Complete all remaining items and mark each one as completed via task_board(actio
                         reasoning_content: None,
                     });
 
-                    Self::save_checkpoint(db, chat_id, history);
+                    session.remove_running_tool(&tc.id);
+                    Self::sync_live_and_checkpoint(session, db, chat_id, history);
                     if !session.is_active() {
                         let _ = tools.pty_manager.kill_all_for_chat(chat_id);
                         let _ = event_sender
@@ -1826,6 +1869,8 @@ Complete all remaining items and mark each one as completed via task_board(actio
                         tool_call_id: Some(tc.id.clone()),
                         reasoning_content: None,
                     });
+                    session.remove_running_tool(&tc.id);
+                    Self::sync_live_and_checkpoint(session, db, chat_id, history);
                     continue;
                 }
                 if tool_name == "enter_plan_mode" {
@@ -1856,6 +1901,8 @@ Complete all remaining items and mark each one as completed via task_board(actio
                         tool_call_id: Some(tc.id.clone()),
                         reasoning_content: None,
                     });
+                    session.remove_running_tool(&tc.id);
+                    Self::sync_live_and_checkpoint(session, db, chat_id, history);
                     continue;
                 }
 
@@ -1922,6 +1969,8 @@ Complete all remaining items and mark each one as completed via task_board(actio
                         tool_call_id: Some(tc.id.clone()),
                         reasoning_content: None,
                     });
+                    session.remove_running_tool(&tc.id);
+                    Self::sync_live_and_checkpoint(session, db, chat_id, history);
                     continue;
                 }
 
@@ -1949,7 +1998,8 @@ Complete all remaining items and mark each one as completed via task_board(actio
                         reasoning_content: None,
                     };
                     history.push(tool_msg);
-                Self::save_checkpoint(db, chat_id, history);
+                    session.remove_running_tool(&tc.id);
+                    Self::sync_live_and_checkpoint(session, db, chat_id, history);
                     continue;
                 }
 
@@ -1968,7 +2018,8 @@ Complete all remaining items and mark each one as completed via task_board(actio
                     3
                 };
                 if same_call_streak >= streak_limit {
-                    Self::save_checkpoint(db, chat_id, history);
+                    session.remove_running_tool(&tc.id);
+                    Self::sync_live_and_checkpoint(session, db, chat_id, history);
                     let msg = format!("Anti-Loop Circuit Breaker: '{}' called {} times identically. Pausing.", tool_name, streak_limit);
                     let _ = event_sender.send(StreamEvent::Error { error: msg.clone() }).await;
                     return Err(msg);
@@ -2186,7 +2237,8 @@ Complete all remaining items and mark each one as completed via task_board(actio
                 history.push(tool_msg);
                 if is_art {
                     let _ = event_sender.send(StreamEvent::TurnBufferReset).await;
-                    Self::save_checkpoint(db, chat_id, history);
+                    session.remove_running_tool(&tc.id);
+                    Self::sync_live_and_checkpoint(session, db, chat_id, history);
                     continue;
                 }
                 if exec_result.success {
@@ -2244,7 +2296,8 @@ Complete all remaining items and mark each one as completed via task_board(actio
                     if let Some(d) = db {
                         let _ = d.save_plan_state(chat_id, false, &plan_sum);
                     }
-                    Self::save_checkpoint(db, chat_id, history);
+                    session.remove_running_tool(&tc.id);
+                    Self::sync_live_and_checkpoint(session, db, chat_id, history);
                     let _ = event_sender
                         .send(StreamEvent::PlanApprovalRequired {
                             plan_summary: plan_sum,
@@ -2367,6 +2420,8 @@ Complete all remaining items and mark each one as completed via task_board(actio
                         });
                     }
                 }
+                session.remove_running_tool(&tc.id);
+                Self::sync_live_and_checkpoint(session, db, chat_id, history);
             }
 
             let _ = state.transition(TaskStateEnum::Executing);
@@ -2417,7 +2472,13 @@ Complete all remaining items and mark each one as completed via task_board(actio
         }
 
         crate::tools::phantom_session::restore_all_staged_windows(true);
+        session.clear_streaming_buffers();
+        session.clear_running_tools();
+        session.set_live_history(history.clone());
         if let Some(d) = db {
+            if let Ok(json) = serde_json::to_string(history) {
+                let _ = d.save_checkpoint(&format!("full_ctx:{}", chat_id), &json);
+            }
             let _ = d.delete_checkpoint(chat_id);
         }
         Ok(state)

@@ -142,6 +142,7 @@ impl Database {
                 chat_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
+                model_id TEXT,
                 reasoning_content TEXT,
                 tool_calls TEXT,
                 tool_call_id TEXT,
@@ -297,6 +298,8 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_checkpoints_chat ON checkpoints (chat_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_events_session_seq ON events (session_id, seq);",
         )?;
+
+        let _ = conn.execute("ALTER TABLE messages ADD COLUMN model_id TEXT", []);
 
         let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<EventWriteItem>(2048);
         let writer_db_path = db_path.to_path_buf();

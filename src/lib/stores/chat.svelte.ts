@@ -1,7 +1,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import type { ToolExecutionRecord } from '../toolMapper';
 import { formatToolExecution, isInternalArtifactTool } from '../toolMapper';
-import { settingsStore, resolveModelForReasoning, resolveValidModelForProvider, isImageGenerationModel, type ReasoningLevel } from './settings.svelte';
+import { settingsStore, resolveModelForReasoning, resolveValidModelForProvider, findModelGroup, isImageGenerationModel, type ReasoningLevel } from './settings.svelte';
 import { workspaceStore } from './workspace.svelte';
 
 export interface ChatAttachment {
@@ -126,6 +126,7 @@ class ChatStore {
   sessions = $state<ChatSession[]>([]);
   draftSession = $state<ChatSession | null>(null);
   activeChatId = $state<string | null>(null);
+  imagePreview = $state<{ src: string; alt?: string } | null>(null);
   messagesByChat = $state<Record<string, ChatMessage[]>>({});
   streamingChats = $state<Record<string, boolean>>({});
   pendingQueueByChat = $state<Record<string, PendingQueueItem[]>>({});
@@ -557,6 +558,15 @@ class ChatStore {
     this.filePreview = null;
   }
 
+  public openImagePreview(src: string, alt?: string): void {
+    if (!src) return;
+    this.imagePreview = { src, alt };
+  }
+
+  public closeImagePreview(): void {
+    this.imagePreview = null;
+  }
+
   public async refreshGoalState(targetChatId?: string): Promise<void> {
     const cid = targetChatId || this.activeChatId;
     if (!cid) return;
@@ -716,21 +726,50 @@ class ChatStore {
       const prov = settingsStore.currentProvider;
       const detectedInfo = prov?.modelCapabilities?.[settingsStore.data.activeModel];
       const list = chatId ? this.messagesByChat[chatId] || [] : [];
+      const formatToolRec = (rec: any): string => {
+        const name = rec.toolName || 'tool';
+        const status = rec.status || 'unknown';
+        const elapsed = typeof rec.elapsedMs === 'number' ? ` | ${rec.elapsedMs}ms` : '';
+        const rawArgs = (typeof rec.rawArgs === 'string' && rec.rawArgs.trim())
+          ? rec.rawArgs.trim()
+          : (rec.args && Object.keys(rec.args).length > 0 ? JSON.stringify(rec.args, null, 2) : '');
+        const lines: string[] = [`[TOOL CALL: ${name} | status=${status}${elapsed}]`];
+        if (rawArgs) lines.push(`Arguments:\n${rawArgs.slice(0, 8000)}`);
+        if (rec.output) lines.push(`Tool Output:\n${String(rec.output).slice(0, 12000)}`);
+        if (rec.error) lines.push(`Tool Error:\n${String(rec.error).slice(0, 3000)}`);
+        return lines.join('\n');
+      };
       const history = list
         .filter((m) => m.role === 'user' || m.role === 'assistant')
         .map((m) => {
           let text = m.content.trim();
+          const parts: string[] = [];
+          if (m.reasoningContent && m.reasoningContent.trim()) {
+            parts.push(`[Reasoning]\n${m.reasoningContent.trim().slice(0, 3000)}`);
+          }
+          const seenIds = new Set<string>();
+          let hasMsgStep = false;
           if (m.steps && m.steps.length > 0) {
-            const parts: string[] = [];
             for (const s of m.steps) {
-              if (s.kind === 'message' && s.text.trim()) parts.push(s.text.trim());
-              else if (s.kind === 'tool' && s.record) {
-                const out = s.record.output ? ` -> ${s.record.output.slice(0, 600)}` : '';
-                parts.push(`[Tool ${s.record.toolName}${out}]`);
+              if (s.kind === 'message' && s.text.trim()) {
+                hasMsgStep = true;
+                parts.push(s.text.trim());
+              } else if (s.kind === 'tool' && s.record) {
+                if (s.record.toolCallId) seenIds.add(s.record.toolCallId);
+                parts.push(formatToolRec(s.record));
+              } else if (s.kind === 'compact' && s.summary) {
+                parts.push(`[Compacted Context]\n${s.summary}`);
               }
             }
-            if (parts.length > 0) text = parts.join('\n');
           }
+          if (m.toolCalls && m.toolCalls.length > 0) {
+            for (const tc of m.toolCalls) {
+              if (tc.toolCallId && seenIds.has(tc.toolCallId)) continue;
+              parts.push(formatToolRec(tc));
+            }
+          }
+          if (text && !hasMsgStep) parts.push(text);
+          if (parts.length > 0) text = parts.join('\n\n');
           return { role: m.role, content: text };
         })
         .filter((m) => m.content.length > 0);
@@ -865,6 +904,8 @@ class ChatStore {
     let sess = this.sessions.find((s) => s.id === chatId);
     if (evtType === 'start') {
       const userText = (payload?.userText || '').trim();
+      const evtModelId = typeof payload?.modelId === 'string' && payload.modelId.trim() ? payload.modelId.trim() : undefined;
+      const evtProviderId = typeof payload?.providerId === 'string' && payload.providerId.trim() ? payload.providerId.trim() : undefined;
       if (!sess) {
         sess = {
           id: chatId,
@@ -872,6 +913,8 @@ class ChatStore {
           createdAt: Date.now(),
           updatedAt: Date.now(),
           pinned: false,
+          providerId: evtProviderId,
+          modelId: evtModelId,
           messageCount: 1,
           preview: userText.slice(0, 80)
         };
@@ -881,6 +924,8 @@ class ChatStore {
         sess.isPaused = false;
         sess.hasUnreadCompletion = false;
         sess.updatedAt = Date.now();
+        if (evtProviderId) sess.providerId = evtProviderId;
+        if (evtModelId) sess.modelId = evtModelId;
         if (userText) sess.preview = userText.slice(0, 80);
       }
       this.streamingChats[chatId] = true;
@@ -903,6 +948,7 @@ class ChatStore {
           chatId,
           role: 'assistant',
           content: '',
+          modelId: evtModelId || sess.modelId,
           reasoningContent: '',
           toolCalls: [],
           steps: [],
@@ -912,6 +958,9 @@ class ChatStore {
         });
       } else {
         tail.error = undefined;
+        if (evtModelId || sess.modelId) {
+          tail.modelId = evtModelId || sess.modelId;
+        }
       }
       this.safeSetStorage('omni_chat_sessions', JSON.stringify(this.sessions.filter((s) => !s.isDraft && !s.isThemeStudio)));
       return;
@@ -1008,11 +1057,22 @@ class ChatStore {
       msg.streaming = false;
       msg.finishedAt = Date.now();
       this.streamingChats[chatId] = false;
-      if (sess) sess.hasError = true;
+      if (sess) {
+        sess.hasError = true;
+        sess.updatedAt = Date.now();
+      }
       this.saveLocalOnly(chatId);
       return;
     }
     if (evtType === 'done') {
+      const evtModelId = typeof payload?.modelId === 'string' && payload.modelId.trim() ? payload.modelId.trim() : undefined;
+      const evtProviderId = typeof payload?.providerId === 'string' && payload.providerId.trim() ? payload.providerId.trim() : undefined;
+      if (sess) {
+        if (evtProviderId) sess.providerId = evtProviderId;
+        if (evtModelId) sess.modelId = evtModelId;
+        sess.updatedAt = Date.now();
+      }
+      msg.modelId = evtModelId || msg.modelId || sess?.modelId;
       msg.streaming = false;
       msg.statusText = undefined;
       msg.finishedAt = Date.now();
@@ -1120,8 +1180,16 @@ class ChatStore {
             existing.projectPath = nextProj;
             sessionsChanged = true;
           }
-          if (bc.modelId && bc.modelId !== existing.modelId && targetChatId === bc.id) {
+          if (bc.modelId && bc.modelId !== existing.modelId && (targetChatId === bc.id || bcUpdatedMs > (existing.updatedAt || 0))) {
             existing.modelId = bc.modelId;
+            const curProv = existing.providerId ? settingsStore.data.providers[existing.providerId] : null;
+            const curHasModel = curProv && curProv.enabled !== false && (curProv.availableModels.includes(bc.modelId) || findModelGroup(curProv, bc.modelId) !== null);
+            if (!curHasModel) {
+              const matchingProv = Object.values(settingsStore.data.providers).find(
+                (p) => p.enabled !== false && (p.availableModels.includes(bc.modelId) || findModelGroup(p, bc.modelId) !== null)
+              );
+              if (matchingProv) existing.providerId = matchingProv.id;
+            }
             sessionsChanged = true;
           }
         }
@@ -1153,6 +1221,7 @@ class ChatStore {
               chatId: string;
               role: 'user' | 'assistant' | 'system' | 'tool';
               content: string;
+              modelId?: string | null;
               reasoningContent?: string | null;
               createdAt: string;
             }>
@@ -1162,7 +1231,11 @@ class ChatStore {
             const lastDb = dbMsgs[dbMsgs.length - 1];
             const changed =
               dbMsgs.length !== localMsgs.length ||
-              (lastDb && lastLocal && (lastDb.content !== lastLocal.content || lastDb.id !== lastLocal.id));
+              (lastDb &&
+                lastLocal &&
+                (lastDb.content !== lastLocal.content ||
+                  lastDb.id !== lastLocal.id ||
+                  (Boolean(lastDb.modelId) && lastDb.modelId !== lastLocal.modelId)));
             const isTgDoneInDb =
               isTgStreaming &&
               targetChatId === bc.id &&
@@ -1199,7 +1272,7 @@ class ChatStore {
                   chatId: m.chatId,
                   role: m.role,
                   content: m.content,
-                  modelId: prev?.modelId,
+                  modelId: m.modelId || prev?.modelId || undefined,
                   attachments: prev?.attachments,
                   reasoningContent: prev?.reasoningContent || m.reasoningContent || undefined,
                   toolCalls: prev?.toolCalls,
@@ -1227,7 +1300,8 @@ class ChatStore {
                   sess.preview = lastDb.content.slice(0, 80);
                 }
                 if (dbMsgs.length > localMsgs.length) {
-                  sess.updatedAt = bcUpdatedMs;
+                  const lastMsgMs = lastDb?.createdAt ? Date.parse(lastDb.createdAt) : 0;
+                  sess.updatedAt = Math.max(bcUpdatedMs, Number.isFinite(lastMsgMs) ? lastMsgMs : 0);
                 }
                 sessionsChanged = true;
               }
@@ -1527,8 +1601,15 @@ class ChatStore {
     if (this.streamSaveTimers[chatId]) return;
     this.streamSaveTimers[chatId] = window.setTimeout(() => {
       delete this.streamSaveTimers[chatId];
-      this.saveLocalOnly(chatId);
-    }, 6000);
+      const runSave = () => {
+        if (!this.disposed) this.saveLocalOnly(chatId);
+      };
+      if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
+        (window as Window & { requestIdleCallback: (cb: () => void, opts?: { timeout: number }) => number }).requestIdleCallback(runSave, { timeout: 2500 });
+      } else {
+        runSave();
+      }
+    }, 20000);
   }
 
   private takeSmoothSlice(buf: string): [string, string] {
@@ -2322,6 +2403,10 @@ class ChatStore {
         this.finalizeRunningTools(targetMsg, failed ? 'error' : 'success');
       }
       if (isCurrentStream) {
+        const sess = this.sessions.find((s) => s.id === chatId);
+        if (sess) {
+          sess.updatedAt = Date.now();
+        }
         await this.saveSessions(chatId);
         await this.processNextInQueue(chatId);
       }
