@@ -495,12 +495,21 @@ async function checkAccountLiveness(acc: OAuthAccountItem) {
 async function refreshQuotas(provider?: string) {
   const key = provider ? `q_${provider}` : 'q_all';
   oauthBusy = { ...oauthBusy, [key]: true };
+  oauthStatus = null;
   try {
-    await invoke('oauth_refresh_quotas', {
+    const refreshed = await invoke<OAuthAccountItem[]>('oauth_refresh_quotas', {
       provider: provider || null,
       ...getOAuthProxyParams(provider)
     });
     await loadOAuthAccounts();
+    const active = refreshed.filter((a) => a.enabled);
+    const failed = active.filter((a) => Boolean(a.lastError));
+    if (failed.length > 0) {
+      const sample = failed[0];
+      oauthStatus = `Quota refresh failed for ${failed.length}/${active.length} account(s): ${sample.email} — ${sample.lastError}`;
+    } else if (active.length > 0) {
+      oauthStatus = `Quotas updated for ${active.length} account(s)`;
+    }
   } catch (err: any) {
     oauthStatus = err instanceof Error ? err.message : String(err);
   } finally {
@@ -1154,7 +1163,7 @@ function handleSaveProvider(e: Event) {
                       <span class="font-mono text-[10px] text-[#686870] truncate">{acc.projectId}</span>
                     {/if}
                     {#if acc.lastError}
-                      <span class="text-[10px] text-[#F87171] truncate max-w-[160px]" title={acc.lastError}>{acc.lastError}</span>
+                      <span class="text-[10px] text-[#F87171] truncate max-w-[260px]" title={acc.lastError}>{acc.lastError}</span>
                     {/if}
                   </div>
                   <div class="flex items-center gap-1 shrink-0">

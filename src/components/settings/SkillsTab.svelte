@@ -12,6 +12,7 @@ interface SkillItem {
   version: string;
   scope: string;
   filePath: string;
+  isProtected?: boolean;
 }
 
 let skills = $state<SkillItem[]>([]);
@@ -36,23 +37,21 @@ async function loadSkills() {
       skills = res
         .filter((r) => {
           const n = String(r?.metadata?.name || r?.name || '').trim().toLowerCase();
-          return n !== 'skill-creator' && !n.startsWith('system:');
+          return !n.startsWith('system:');
         })
         .map((r) => {
           const meta = r.metadata || r;
           const rootDir = r.root_dir || r.filePath || r.path || '';
-          const scope = rootDir.includes('.claude')
-            ? 'claude'
-            : rootDir.includes('.agents')
-              ? 'agents'
-              : 'omni';
+          const name = meta.name || 'unnamed';
+          const isProtected = name.toLowerCase() === 'skill-creator';
           return {
-            id: `${meta.name || 'unnamed'}-${rootDir}`,
-            name: meta.name || 'unnamed',
+            id: `${name}-${rootDir}`,
+            name,
             description: meta.description || '',
             version: meta.version || '1.0.0',
-            scope,
-            filePath: rootDir
+            scope: 'omni',
+            filePath: rootDir,
+            isProtected
           };
         });
     }
@@ -115,6 +114,7 @@ async function exportSkill(skillName: string) {
 }
 
 async function deleteSkill(sk: SkillItem) {
+  if (sk.isProtected) return;
   if (confirmDeleteId !== sk.id) {
     confirmDeleteId = sk.id;
     return;
@@ -177,7 +177,7 @@ async function createSkillViaChat() {
 
   {#if filteredSkills.length === 0}
     <div class="p-6 rounded-[6px] bg-[#1C1C1F] border border-white/[0.06] text-xs text-[#73737A] text-center">
-      No skills installed yet. Import a .zip skill or place folders in .omni/skills or .agents/skills.
+      No skills installed yet. Import a .zip skill or click '+ Create Skill'.
     </div>
   {:else}
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
@@ -186,9 +186,15 @@ async function createSkillViaChat() {
           <div class="space-y-1.5">
             <div class="flex items-center justify-between gap-2">
               <span class="font-mono text-xs font-medium text-[#EDEDEF] truncate">{sk.name}</span>
-              <span class="font-mono text-[10px] px-1.5 py-0.5 rounded-[4px] bg-[#121214] border border-white/[0.06] text-[#A3A3AA] shrink-0">
-                {sk.scope} · v{sk.version}
-              </span>
+              {#if sk.isProtected}
+                <span class="font-mono text-[10px] px-1.5 py-0.5 rounded-[4px] bg-[#3B82F6]/15 border border-[#3B82F6]/30 text-[#60A5FA] shrink-0">
+                  Built-in · v{sk.version}
+                </span>
+              {:else}
+                <span class="font-mono text-[10px] px-1.5 py-0.5 rounded-[4px] bg-[#121214] border border-white/[0.06] text-[#A3A3AA] shrink-0">
+                  {sk.scope} · v{sk.version}
+                </span>
+              {/if}
             </div>
             <p class="text-xs text-[#9BA1B0] leading-relaxed line-clamp-2">{sk.description}</p>
           </div>
@@ -210,13 +216,19 @@ async function createSkillViaChat() {
               >
                 Export
               </button>
-              <button
-                type="button"
-                class="h-7 px-2.5 rounded-[6px] border text-[11px] active:scale-[0.97] transition-all whitespace-nowrap {confirmDeleteId === sk.id ? 'bg-[#EF4444]/15 border-[#EF4444]/40 text-[#F87171]' : 'bg-[#1E1E22] hover:bg-[#27272A] border-white/[0.08] text-[#A3A3AA] hover:text-[#F87171]'}"
-                onclick={() => deleteSkill(sk)}
-              >
-                {confirmDeleteId === sk.id ? 'Confirm?' : 'Delete'}
-              </button>
+              {#if sk.isProtected}
+                <span class="h-7 px-2.5 rounded-[6px] border border-white/[0.06] bg-[#141416] text-[11px] text-[#71717A] flex items-center select-none" title="Системный навык защищен от удаления">
+                  Protected
+                </span>
+              {:else}
+                <button
+                  type="button"
+                  class="h-7 px-2.5 rounded-[6px] border text-[11px] active:scale-[0.97] transition-all whitespace-nowrap {confirmDeleteId === sk.id ? 'bg-[#EF4444]/15 border-[#EF4444]/40 text-[#F87171]' : 'bg-[#1E1E22] hover:bg-[#27272A] border-white/[0.08] text-[#A3A3AA] hover:text-[#F87171]'}"
+                  onclick={() => deleteSkill(sk)}
+                >
+                  {confirmDeleteId === sk.id ? 'Confirm?' : 'Delete'}
+                </button>
+              {/if}
             </div>
           </div>
         </div>

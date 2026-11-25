@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -284,22 +284,117 @@ pub fn load_all_skills(skills_dir: &Path) -> Result<Vec<SkillPackage>, String> {
 }
 
 
-pub fn skill_search_roots(workspace_root: &str) -> Vec<std::path::PathBuf> {
-    let mut roots = Vec::new();
-    roots.push(crate::state::AppState::resolve_skills_dir());
-    let ws = Path::new(workspace_root);
-    if !workspace_root.trim().is_empty() && ws.is_dir() {
-        roots.push(ws.join(".omni").join("skills"));
-        roots.push(ws.join(".agents").join("skills"));
-        roots.push(ws.join(".claude").join("skills"));
+pub fn remove_dir_all_force(path: &Path) -> std::io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    if path.is_file() || path.is_symlink() {
+        if let Ok(meta) = path.symlink_metadata() {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+        return fs::remove_file(path);
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        if let Ok(meta) = entry_path.symlink_metadata() {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                perms.set_readonly(false);
+                let _ = fs::set_permissions(&entry_path, perms);
+            }
+        }
+        if entry_path.is_dir() {
+            remove_dir_all_force(&entry_path)?;
+        } else {
+            let _ = fs::remove_file(&entry_path);
+        }
+    }
+    if let Ok(meta) = path.symlink_metadata() {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+    fs::remove_dir(path)
+}
+
+pub fn copy_dir_force(src: &Path, dst: &Path) -> std::io::Result<()> {
+    if !dst.exists() {
+        fs::create_dir_all(dst)?;
+    }
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let dest_path = dst.join(entry.file_name());
+        if entry_path.is_dir() {
+            copy_dir_force(&entry_path, &dest_path)?;
+        } else {
+            let _ = fs::copy(&entry_path, &dest_path)?;
+            if let Ok(meta) = dest_path.symlink_metadata() {
+                let mut perms = meta.permissions();
+                if perms.readonly() {
+                    perms.set_readonly(false);
+                    let _ = fs::set_permissions(&dest_path, perms);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn migrate_legacy_external_skills(skills_dir: &Path) {
+    let mut candidate_roots = Vec::new();
+    let mut home_candidates = Vec::new();
+    if let Some(h) = dirs::home_dir() {
+        home_candidates.push(h);
     }
     if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-        let h = Path::new(&home);
-        roots.push(h.join(".omni").join("skills"));
-        roots.push(h.join(".agents").join("skills"));
-        roots.push(h.join(".claude").join("skills"));
+        let h = PathBuf::from(home);
+        if !home_candidates.iter().any(|c| c == &h) {
+            home_candidates.push(h);
+        }
     }
-    roots
+    for h in home_candidates {
+        candidate_roots.push(h.join(".agents").join("skills"));
+        candidate_roots.push(h.join(".claude").join("skills"));
+        candidate_roots.push(h.join(".gemini").join("skills"));
+        candidate_roots.push(h.join(".gemini").join("config").join("skills"));
+        candidate_roots.push(h.join(".omni").join("skills"));
+    }
+
+    for root in candidate_roots {
+        if !root.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.eq_ignore_ascii_case("java-patcher") {
+                    continue;
+                }
+                if path.join("SKILL.md").exists() {
+                    let dest = skills_dir.join(&name);
+                    if !dest.exists() {
+                        let _ = copy_dir_force(&path, &dest);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn skill_search_roots(_workspace_root: &str) -> Vec<PathBuf> {
+    vec![crate::state::AppState::resolve_skills_dir()]
 }
 
 fn builtin_system_skills() -> Vec<SkillPackage> {
@@ -540,64 +635,11 @@ Ensure that `validate_skill_sections` passes with 0 missing sections and file si
     }
 
     let patcher_dir = skills_dir.join("java-patcher");
-    if !patcher_dir.exists() {
-        fs::create_dir_all(&patcher_dir).map_err(|e| e.to_string())?;
-        let patcher_content = r#"---
-name: java-patcher
-title: Java Bytecode & Class Modification Specialist
-description: Expert system for decompiling, analyzing, patching bytecode, and verifying Java applications.
-command: /patch-java
-version: 1.0.0
-author: System
-tags:
-  - java
-  - bytecode
-  - patch
-  - reverse
-keywords:
-  - patch jar
-  - java bytecode
-  - asm patch
-  - class transformer
-auto_start: false
-enabled: true
-trusted: true
----
-
-# Java Patcher
-
-## When to use
-Use when inspecting Java classes, decompiling JARs, modifying class files, or building runtime byte injection hooks.
-
-## Inputs
-- Target JAR or class file paths.
-- Patch requirements, target class names, methods, and replacement opcodes.
-
-## Rules
-- Always create a physical snapshot backup before modifying existing JAR archives.
-- Ensure JVM stack frame consistency when editing bytecode.
-- Do not introduce conflicting dependencies or invalid constant pool entries.
-
-## Workflow
-1. Inspect the archive structure and extract target class files.
-2. Decompile bytecode using CFR or Fernflower to map signatures.
-3. Generate minimal delta patch instructions or ASM visitor transforms.
-4. Apply the patch to the target class and rebuild the archive.
-5. Verify class loading and checksum integrity.
-
-## Output
-Patched class or JAR file with verification log and delta diff summary.
-
-## Assets and scripts
-- scripts/dump_class.py
-- scripts/verify_checksum.py
-
-## Validation
-Confirm that javap -c on the patched class succeeds without verification errors.
-"#;
-        fs::write(patcher_dir.join("SKILL.md"), patcher_content.trim().as_bytes())
-            .map_err(|e| e.to_string())?;
+    if patcher_dir.exists() {
+        let _ = remove_dir_all_force(&patcher_dir);
     }
+
+    migrate_legacy_external_skills(skills_dir);
 
     Ok(())
 }

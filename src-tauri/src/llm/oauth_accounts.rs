@@ -760,16 +760,20 @@ async fn refresh_account_tokens(client: &reqwest::Client, acc: &mut OAuthAccount
             ];
             let resp = client
                 .post("https://oauth2.googleapis.com/token")
-                .header("User-Agent", antigravity_hub_ua())
+                .header("User-Agent", "Go-http-client/2.0")
                 .form(&params)
                 .send()
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    let detailed = crate::error::format_reqwest_error(&e);
+                    crate::logger::error("OAuthRefresh", &format!("Google refresh network error ({}): {}", acc.email, detailed));
+                    detailed
+                })?;
             let st_code = resp.status().as_u16();
             if !resp.status().is_success() {
                 let txt = resp.text().await.unwrap_or_default();
                 crate::logger::record_http("OAuthRefresh", "POST", "https://oauth2.googleapis.com/token", st_code, &txt);
-                return Err(format!("Google refresh failed ({}): {}", st_code, txt));
+                return Err(format!("Google refresh failed ({}): {}", st_code, crate::error::extract_api_error_message(&txt)));
             }
             let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
             let at = data.get("access_token").and_then(|v| v.as_str()).ok_or("No access_token")?;
@@ -1099,6 +1103,14 @@ pub async fn acquire_valid_account_for_model(
         }
     };
 
+    let is_tos_blocked = |a: &OAuthAccount| -> bool {
+        if let Some(ref err) = a.last_error {
+            is_tos_or_disabled_error(err) && a.cooldown_until_ms.map(|c| c > now).unwrap_or(false)
+        } else {
+            false
+        }
+    };
+
     if candidates.is_empty() {
         candidates = list
             .iter()
@@ -1108,6 +1120,7 @@ pub async fn acquire_valid_account_for_model(
                     && a.enabled
                     && !excluded_ids.contains(&a.id)
                     && !is_revoked(a)
+                    && !is_tos_blocked(a)
                     && !is_quota_exhausted_for_now(a, now)
                     && account_supports_model(a, requested_model)
             })
@@ -1128,7 +1141,22 @@ pub async fn acquire_valid_account_for_model(
         }));
     }
 
-    candidates.sort_by_key(|&idx| list[idx].last_used_ms);
+    if provider == "antigravity" {
+        candidates.sort_by(|&a_idx, &b_idx| {
+            let a = &list[a_idx];
+            let b = &list[b_idx];
+            b.last_used_ms
+                .cmp(&a.last_used_ms)
+                .then_with(|| {
+                    let qa = a.quota_5h_remaining.unwrap_or(100.0);
+                    let qb = b.quota_5h_remaining.unwrap_or(100.0);
+                    qb.partial_cmp(&qa).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    } else {
+        candidates.sort_by_key(|&idx| list[idx].last_used_ms);
+    }
     let mut last_refresh_err: Option<String> = None;
 
     for &chosen_idx in &candidates {
@@ -1192,7 +1220,7 @@ async fn exchange_code_for_account(
             ];
             let resp = client
                 .post("https://oauth2.googleapis.com/token")
-                .header("User-Agent", antigravity_hub_ua())
+                .header("User-Agent", "Go-http-client/2.0")
                 .form(&params)
                 .send()
                 .await
@@ -1207,9 +1235,9 @@ async fn exchange_code_for_account(
             let exp_in = data.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(3600);
 
             let email = match client
-                .get("https://www.googleapis.com/oauth2/v3/userinfo")
+                .get("https://www.googleapis.com/oauth2/v2/userinfo")
                 .bearer_auth(&at)
-                .header("User-Agent", antigravity_hub_ua())
+                .header("User-Agent", "Go-http-client/2.0")
                 .send()
                 .await
             {
@@ -1439,7 +1467,11 @@ async fn exchange_code_for_account(
 }
 
 pub fn antigravity_version() -> &'static str {
-    "2.32.2"
+    "2.34.0"
+}
+
+pub fn antigravity_cl() -> &'static str {
+    "1026637980"
 }
 
 pub fn antigravity_platform_name() -> &'static str {
@@ -1448,6 +1480,26 @@ pub fn antigravity_platform_name() -> &'static str {
         "linux" => "LINUX",
         _ => "WINDOWS",
     }
+}
+
+pub fn antigravity_client_platform() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "DARWIN_ARM64",
+        ("macos", _) => "DARWIN_AMD64",
+        ("linux", "aarch64") => "LINUX_ARM64",
+        ("linux", _) => "LINUX_AMD64",
+        _ => "WINDOWS_AMD64",
+    }
+}
+
+pub fn antigravity_client_metadata() -> serde_json::Value {
+    serde_json::json!({
+        "ideType": "ANTIGRAVITY",
+        "ideVersion": antigravity_version(),
+        "platform": antigravity_client_platform(),
+        "pluginType": "GEMINI",
+        "ideName": "antigravity"
+    })
 }
 
 pub fn antigravity_hub_ua() -> &'static str {
@@ -1463,13 +1515,61 @@ pub fn antigravity_hub_ua() -> &'static str {
             _ => "amd64",
         };
         format!(
-            "antigravity/hub/{} (aidev_client; os_type={}; arch={})",
+            "antigravity/hub/{} (aidev_client; os_type={}; arch={}; cl={})",
             antigravity_version(),
             os_type,
-            arch
+            arch,
+            antigravity_cl()
         )
     })
     .as_str()
+}
+
+pub fn antigravity_session_id(key: &str) -> String {
+    let input = if key.trim().is_empty() { "default" } else { key.trim() };
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in input.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash as i64).to_string()
+}
+
+pub fn is_tos_or_disabled_error(text: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    text.contains("TOS_VIOLATION")
+        || text.contains("VALIDATION_REQUIRED")
+        || text.contains("GOOGLE_TOS_NOT_SUPPORTED")
+        || text.contains("ACCOUNT_DISABLED")
+        || low.contains("violation of terms of service")
+        || low.contains("disabled in this account")
+        || low.contains("account has been disabled")
+}
+
+static AG_ACTIVE_STATE: OnceLock<Mutex<(Option<String>, i64)>> = OnceLock::new();
+
+pub fn antigravity_switch_pacing_wait_ms(target_account_id: &str, min_gap_ms: i64) -> u64 {
+    let lock = AG_ACTIVE_STATE.get_or_init(|| Mutex::new((None, 0)));
+    let now = chrono::Utc::now().timestamp_millis();
+    if let Ok(guard) = lock.lock() {
+        if let Some(ref prev_id) = guard.0 {
+            if prev_id != target_account_id && guard.1 > 0 {
+                let elapsed = now.saturating_sub(guard.1);
+                if elapsed < min_gap_ms {
+                    return (min_gap_ms - elapsed) as u64;
+                }
+            }
+        }
+    }
+    0
+}
+
+pub fn record_antigravity_active_account(account_id: &str) {
+    let lock = AG_ACTIVE_STATE.get_or_init(|| Mutex::new((None, 0)));
+    let now = chrono::Utc::now().timestamp_millis();
+    if let Ok(mut guard) = lock.lock() {
+        *guard = (Some(account_id.to_string()), now);
+    }
 }
 
 pub fn persistent_device_id() -> &'static str {
@@ -1565,26 +1665,31 @@ pub async fn fetch_antigravity_experiments(client: &reqwest::Client, acc: &OAuth
     if acc.access_token.is_empty() {
         return;
     }
+    static EXP_CACHE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+    let cache = EXP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = chrono::Utc::now().timestamp_millis();
+    if let Ok(mut map) = cache.lock() {
+        if let Some(&last_ms) = map.get(&acc.id) {
+            if now.saturating_sub(last_ms) < 30 * 60 * 1000 {
+                return;
+            }
+        }
+        map.insert(acc.id.clone(), now);
+    }
     let pid = acc.project_id.as_deref().unwrap_or("");
-    let trace_id = antigravity_trace_id();
     let body = serde_json::json!({
         "project": pid,
-        "ideType": "ANTIGRAVITY",
-        "clientVersion": antigravity_version(),
+        "metadata": antigravity_client_metadata(),
     });
     for ep in [
-        "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchExperimentsAndConfigs",
-        "https://cloudcode-pa.googleapis.com/v1internal:fetchExperiments",
+        "https://daily-cloudcode-pa.googleapis.com/v1internal:listExperiments",
+        "https://cloudcode-pa.googleapis.com/v1internal:listExperiments",
     ] {
-        let mut req = client
+        let req = client
             .post(ep)
             .bearer_auth(&acc.access_token)
-            .header("User-Agent", antigravity_hub_ua())
-            .header("X-Goog-Request-Reason", "periodic_sync")
-            .header("x-cloudaicompanion-trace-id", &trace_id);
-        if !pid.is_empty() {
-            req = req.header("X-Goog-User-Project", pid);
-        }
+            .header("Content-Type", "application/json")
+            .header("User-Agent", antigravity_hub_ua());
         if let Ok(resp) = req.json(&body).send().await {
             if resp.status().is_success() {
                 break;
@@ -1598,11 +1703,7 @@ pub async fn fetch_antigravity_account_meta(
     access_token: &str,
 ) -> (String, Option<String>) {
     let meta = serde_json::json!({
-        "metadata": {
-            "ideType": "ANTIGRAVITY",
-            "pluginType": "GEMINI",
-            "hasShellIntegration": true
-        },
+        "metadata": antigravity_client_metadata(),
         "mode": "FULL_ELIGIBILITY_CHECK"
     });
     let mut found_pid = String::new();
@@ -1624,16 +1725,16 @@ pub async fn fetch_antigravity_account_meta(
         "https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
         "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
     ] {
-        if let Ok(resp) = client
+        match client
             .post(ep)
             .bearer_auth(access_token)
+            .header("Content-Type", "application/json")
             .header("User-Agent", antigravity_hub_ua())
-            .header("X-Goog-Request-Reason", "user_initiated")
-            .header("x-cloudaicompanion-trace-id", antigravity_trace_id())
             .json(&meta)
             .send()
             .await
         {
+            Ok(resp) => {
             if resp.status().is_success() {
                 if let Ok(val) = resp.json::<serde_json::Value>().await {
                     if let Some(proj_v) = val.get("cloudaicompanionProject") {
@@ -1658,6 +1759,14 @@ pub async fn fetch_antigravity_account_meta(
                         return (found_pid, found_tier);
                     }
                 }
+            } else {
+                let st = resp.status().as_u16();
+                let txt = resp.text().await.unwrap_or_default();
+                crate::logger::record_http("AntigravityMeta", "POST", ep, st, &txt);
+            }
+            }
+            Err(e) => {
+                crate::logger::warn("AntigravityMeta", &format!("loadCodeAssist failed ({}): {}", ep, crate::error::format_reqwest_error(&e)));
             }
         }
     }
@@ -1671,28 +1780,29 @@ pub async fn fetch_antigravity_project_id(client: &reqwest::Client, access_token
 pub async fn fetch_antigravity_models(client: &reqwest::Client) -> Result<Vec<serde_json::Value>, String> {
     let excluded = std::collections::HashSet::new();
     let acc = acquire_valid_account(client, "antigravity", &excluded).await?;
+    let eff_client = client_for_account(&acc).unwrap_or_else(|| client.clone());
     let pid = match acc.project_id.clone() {
         Some(p) if !p.is_empty() => p,
-        _ => fetch_antigravity_project_id(client, &acc.access_token).await,
+        _ => fetch_antigravity_project_id(&eff_client, &acc.access_token).await,
     };
-    let mut req = client
+    let resp = eff_client
         .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
         .bearer_auth(&acc.access_token)
+        .header("Content-Type", "application/json")
         .header("User-Agent", antigravity_hub_ua())
-        .header("X-Goog-Request-Reason", "user_initiated")
-        .header("x-cloudaicompanion-trace-id", antigravity_trace_id());
-    if !pid.is_empty() {
-        req = req.header("X-Goog-User-Project", &pid);
-    }
-    let resp = req
         .json(&serde_json::json!({ "project": pid }))
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let detailed = crate::error::format_reqwest_error(&e);
+            crate::logger::error("AntigravityModels", &format!("fetchAvailableModels failed ({}): {}", acc.email, detailed));
+            detailed
+        })?;
     if !resp.status().is_success() {
-        let status = resp.status();
+        let status = resp.status().as_u16();
         let txt = resp.text().await.unwrap_or_default();
-        return Err(format!("Antigravity models fetch failed ({}): {}", status, txt));
+        crate::logger::record_http("AntigravityModels", "POST", "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", status, &txt);
+        return Err(format!("Antigravity models fetch failed ({}): {}", status, crate::error::extract_api_error_message(&txt)));
     }
     let val: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -2174,8 +2284,9 @@ pub async fn import_local_accounts(
                 if !acc.access_token.is_empty() {
                     if email.is_empty() {
                         if let Ok(r) = http_client
-                            .get("https://www.googleapis.com/oauth2/v1/userinfo?alt=json")
+                            .get("https://www.googleapis.com/oauth2/v2/userinfo")
                             .bearer_auth(&acc.access_token)
+                            .header("User-Agent", "Go-http-client/2.0")
                             .send()
                             .await
                         {
@@ -2842,25 +2953,25 @@ async fn fetch_account_quota_inner(client: &reqwest::Client, acc: &mut OAuthAcco
             } else {
                 acc.project_id.clone().unwrap_or_default()
             };
-            let trace_id = antigravity_trace_id();
-            let mut req = client
+            let resp = client
                 .post("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels")
                 .bearer_auth(&acc.access_token)
+                .header("Content-Type", "application/json")
                 .header("User-Agent", antigravity_hub_ua())
-                .header("X-Goog-Request-Reason", "user_initiated")
-                .header("x-cloudaicompanion-trace-id", &trace_id);
-            if !pid.is_empty() {
-                req = req.header("X-Goog-User-Project", &pid);
-            }
-            let resp = req
                 .json(&serde_json::json!({ "project": pid }))
                 .send()
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| {
+                    let detailed = crate::error::format_reqwest_error(&e);
+                    crate::logger::error("AntigravityQuota", &format!("Quota check failed ({}): {}", acc.email, detailed));
+                    detailed
+                })?;
             let status = resp.status();
             if !status.is_success() {
+                let st = status.as_u16();
                 let txt = resp.text().await.unwrap_or_default();
-                return Err(format!("Antigravity check HTTP {}: {}", status.as_u16(), txt));
+                crate::logger::record_http("AntigravityQuota", "POST", "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels", st, &txt);
+                return Err(format!("Antigravity HTTP {}: {}", st, crate::error::extract_api_error_message(&txt)));
             }
             let acc_clone = acc.clone();
             let client_clone = client.clone();
@@ -3013,16 +3124,23 @@ async fn fetch_account_quota_inner(client: &reqwest::Client, acc: &mut OAuthAcco
 }
 
 pub async fn check_account_liveness(client: &reqwest::Client, id: &str) -> Result<OAuthAccountPublic, String> {
+    let mut acc = {
+        let _guard = store_lock().lock().await;
+        let list = read_accounts_unlocked();
+        list.into_iter().find(|a| a.id == id).ok_or("Account not found")?
+    };
+    let eff_client = client_for_account(&acc).unwrap_or_else(|| client.clone());
+    let res = fetch_account_quota_inner(&eff_client, &mut acc).await;
+    if let Err(ref e) = res {
+        crate::logger::warn("OAuthQuota", &format!("check_account_liveness failed ({}): {}", acc.email, e));
+        acc.last_error = Some(e.chars().take(360).collect());
+    }
     let _guard = store_lock().lock().await;
     let mut list = read_accounts_unlocked();
-    let idx = list.iter().position(|a| a.id == id).ok_or("Account not found")?;
-    let mut acc = list[idx].clone();
-    let res = fetch_account_quota_inner(client, &mut acc).await;
-    if let Err(ref e) = res {
-        acc.last_error = Some(e.chars().take(240).collect());
+    if let Some(slot) = list.iter_mut().find(|a| a.id == id) {
+        *slot = acc.clone();
+        write_accounts_unlocked(&list)?;
     }
-    list[idx] = acc.clone();
-    write_accounts_unlocked(&list)?;
     match res {
         Ok(()) => Ok(OAuthAccountPublic::from(&acc)),
         Err(e) => Err(e),
@@ -3030,25 +3148,50 @@ pub async fn check_account_liveness(client: &reqwest::Client, id: &str) -> Resul
 }
 
 pub async fn refresh_all_quotas(client: &reqwest::Client, provider: Option<&str>) -> Result<Vec<OAuthAccountPublic>, String> {
-    let _guard = store_lock().lock().await;
-    let mut list = read_accounts_unlocked();
-    let mut first = true;
-    for acc in list.iter_mut() {
-        if let Some(p) = provider {
-            if acc.provider != p {
-                continue;
-            }
-        }
-        if !acc.enabled {
-            continue;
-        }
-        if !first {
-            let delay_ms = 1100 + (uuid::Uuid::new_v4().as_u128() % 1300) as u64;
+    let now = chrono::Utc::now().timestamp_millis();
+    let targets: Vec<OAuthAccount> = {
+        let _guard = store_lock().lock().await;
+        read_accounts_unlocked()
+            .into_iter()
+            .filter(|a| {
+                if !a.enabled || !provider.map(|p| a.provider == p).unwrap_or(true) {
+                    return false;
+                }
+                if let Some(cd) = a.cooldown_until_ms {
+                    if cd > now {
+                        if let Some(ref err) = a.last_error {
+                            let low = err.to_ascii_lowercase();
+                            if is_tos_or_disabled_error(err)
+                                || low.contains("invalid_grant")
+                                || low.contains("expired or revoked")
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            })
+            .collect()
+    };
+    let mut updated: Vec<OAuthAccount> = Vec::with_capacity(targets.len());
+    for (idx, mut acc) in targets.into_iter().enumerate() {
+        if idx > 0 {
+            let delay_ms = 2500 + (uuid::Uuid::new_v4().as_u128() % 3000) as u64;
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
-        first = false;
-        if let Err(e) = fetch_account_quota_inner(client, acc).await {
-            acc.last_error = Some(e.chars().take(240).collect());
+        let eff_client = client_for_account(&acc).unwrap_or_else(|| client.clone());
+        if let Err(e) = fetch_account_quota_inner(&eff_client, &mut acc).await {
+            crate::logger::warn("OAuthQuota", &format!("refresh_all_quotas failed ({}): {}", acc.email, e));
+            acc.last_error = Some(e.chars().take(360).collect());
+        }
+        updated.push(acc);
+    }
+    let _guard = store_lock().lock().await;
+    let mut list = read_accounts_unlocked();
+    for upd in updated {
+        if let Some(slot) = list.iter_mut().find(|a| a.id == upd.id) {
+            *slot = upd;
         }
     }
     write_accounts_unlocked(&list)?;

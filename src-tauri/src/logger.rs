@@ -120,6 +120,10 @@ pub fn warn(tag: &str, msg: &str) {
     append_raw(&format!("[{}] [WARN] [{}] {}", ts(), tag, msg));
 }
 
+pub fn error(tag: &str, msg: &str) {
+    append_raw(&format!("[{}] [ERROR] [{}] {}", ts(), tag, msg));
+}
+
 pub fn record_http(tag: &str, method: &str, url: &str, status: u16, detail: &str) {
     let clean_detail: String = detail.chars().take(600).collect();
     append_raw(&format!(

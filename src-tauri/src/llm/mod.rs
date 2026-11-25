@@ -120,7 +120,7 @@ pub enum StreamEvent {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
-    #[error("Network error: {0}")]
+    #[error("Network error: {}", crate::error::format_reqwest_error(.0))]
     Network(#[from] reqwest::Error),
     #[error("JSON serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

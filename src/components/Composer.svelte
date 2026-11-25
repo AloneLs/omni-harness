@@ -896,19 +896,6 @@ async function stopAndTranscribe() {
   try {
     const result = await voiceCaptureInstance.stop();
     cancelVoice();
-    if (await activeModelNativeAudio()) {
-      attachments = [
-        ...attachments,
-        {
-          id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          name: `voice_${Date.now()}.wav`,
-          path: '',
-          kind: 'audio',
-          previewUrl: `data:audio/wav;base64,${result.base64}`
-        }
-      ];
-      return;
-    }
     try {
       const transcribed = await invoke<string>('transcribe_audio', {
         audioBase64: result.base64,
@@ -933,8 +920,22 @@ async function stopAndSendVoice() {
   try {
     const result = await voiceCaptureInstance.stop();
     cancelVoice();
+    let textToSend = '';
+    try {
+      const transcribed = await invoke<string>('transcribe_audio', {
+        audioBase64: result.base64,
+        model: settingsStore.data.whisperModel,
+        language: settingsStore.data.whisperLanguage || 'ru'
+      });
+      if (transcribed && transcribed.trim()) {
+        textToSend = transcribed.trim();
+      }
+    } catch (e) {
+      console.warn('Voice transcription error:', e);
+    }
+
     if (await activeModelNativeAudio()) {
-      await chatStore.sendMessage('', {
+      await chatStore.sendMessage(textToSend || '[Голосовая команда]', {
         attachments: [
           {
             id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -947,18 +948,7 @@ async function stopAndSendVoice() {
       });
       return;
     }
-    let textToSend = '[Голосовая команда]';
-    try {
-      const transcribed = await invoke<string>('transcribe_audio', {
-        audioBase64: result.base64,
-        model: settingsStore.data.whisperModel,
-        language: settingsStore.data.whisperLanguage || 'ru'
-      });
-      if (transcribed && transcribed.trim()) {
-        textToSend = transcribed.trim();
-      }
-    } catch {}
-    await chatStore.sendMessage(textToSend);
+    await chatStore.sendMessage(textToSend || '[Голосовая команда]');
   } catch {
     cancelVoice();
   }

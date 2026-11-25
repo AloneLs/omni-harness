@@ -124,6 +124,68 @@ fn is_location_not_eligible(status: u16, text: &str) -> bool {
             || text.contains("Detected location: RU"))
 }
 
+fn parse_retry_delay_ms(retry_after_hdr: Option<&str>, body: &str) -> Option<u64> {
+    if let Some(ra) = retry_after_hdr {
+        if let Ok(secs) = ra.trim().parse::<f64>() {
+            if secs.is_finite() && secs > 0.0 {
+                return Some((secs * 1000.0).round() as u64);
+            }
+        }
+    }
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+        let err_v = val.get("error").unwrap_or(&val);
+        if let Some(details) = err_v.get("details").and_then(|d| d.as_array()) {
+            for d in details {
+                if let Some(raw_delay) = d.get("retryDelay").and_then(|v| v.as_str()) {
+                    let s = raw_delay.trim().trim_end_matches('s');
+                    if let Ok(secs) = s.parse::<f64>() {
+                        if secs.is_finite() && secs > 0.0 {
+                            return Some((secs * 1000.0).round() as u64);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn is_transient_retryable_body(status: u16, body: &str) -> bool {
+    if matches!(status, 500 | 502 | 503 | 504) {
+        return true;
+    }
+    body.contains("MODEL_CAPACITY_EXHAUSTED")
+        || body.contains("PREFILL_QUEUE_OVERLOADED")
+        || body.contains("PREFILL_QUEUE_PREEMPTED")
+        || body.contains("OVERLOADED_TOO_MANY_RETRIES")
+        || body.contains("THROTTLED_TASK_LIMIT")
+        || body.contains("TPU_EXECUTE_ERROR")
+        || body.contains("DECODE_PREEMPTED")
+}
+
+fn compute_antigravity_request_id(model: &str, session_id: &str, attempt: u32) -> String {
+    let ts_ms = chrono::Utc::now().timestamp_millis();
+    format!("{}/{}/{}/{}/{}", model, session_id, ts_ms, "1", attempt)
+}
+
+fn derive_conversation_key(request: &ChatRequest) -> String {
+    if let Some(ref k) = request.prompt_cache_key {
+        let trimmed = k.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let mut seed = String::new();
+    for m in request.messages.iter().take(3) {
+        seed.push_str(&m.role);
+        seed.push(':');
+        let txt = m.content.as_text_lossy();
+        seed.extend(txt.chars().take(120));
+        seed.push('\n');
+    }
+    oauth_accounts::antigravity_session_id(&seed)
+}
+
 pub async fn stream_antigravity(
     client: &reqwest::Client,
     caps_registry: &CapabilityRegistry,
@@ -162,6 +224,8 @@ pub async fn stream_antigravity(
                     });
                     if let Some(sig) = get_thought_sig(&tc.id) {
                         part_val["thoughtSignature"] = serde_json::Value::String(sig);
+                    } else if !model_clean.to_ascii_lowercase().contains("claude") {
+                        part_val["thoughtSignature"] = serde_json::Value::String("skip_thought_signature_validator".to_string());
                     }
                     parts.push(part_val);
                 }
@@ -347,7 +411,7 @@ pub async fn stream_antigravity(
     if !system_parts.is_empty() {
         inner_req["systemInstruction"] = serde_json::json!({ "role": "user", "parts": system_parts });
     }
-    inner_req["session_id"] = serde_json::json!(uuid::Uuid::new_v4().to_string());
+    let conv_key = derive_conversation_key(&request);
     if let Some(ref tools) = request.tools {
         if !tools.is_empty() {
             let decls: Vec<serde_json::Value> = tools
@@ -371,7 +435,10 @@ pub async fn stream_antigravity(
     let target_url = "https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse";
     let mut excluded_ids = HashSet::new();
     let mut last_err: Option<LlmError> = None;
-    let max_attempts = 6u32;
+    let mut fresh_client_override: Option<reqwest::Client> = None;
+    let mut last_tried_acc_id: Option<String> = None;
+    let mut same_acc_retries: u32 = 0;
+    let max_attempts = 8u32;
 
     for attempt in 1..=max_attempts {
         let mut acc = match oauth_accounts::acquire_valid_account_for_model(client, "antigravity", &excluded_ids, Some(&model_clean)).await {
@@ -380,12 +447,40 @@ pub async fn stream_antigravity(
                 return Err(last_err.unwrap_or(LlmError::ProviderError { status: 401, message: e }));
             }
         };
-        let effective_client = oauth_accounts::client_for_account(&acc).unwrap_or_else(|| client.clone());
+        let switched_account = last_tried_acc_id.as_deref().map(|prev| prev != acc.id).unwrap_or(false);
+        if switched_account {
+            same_acc_retries = 0;
+            let min_gap_ms = {
+                use rand::Rng;
+                rand::thread_rng().gen_range(16_000..=28_000)
+            };
+            let wait_ms = oauth_accounts::antigravity_switch_pacing_wait_ms(&acc.id, min_gap_ms);
+            if wait_ms > 0 {
+                let _ = sender
+                    .send(StreamEvent::RetryNotice {
+                        reason: format!("Switching Antigravity account to {} in {}s...", acc.email, (wait_ms + 999) / 1000),
+                        attempt,
+                        model: request.model.clone(),
+                    })
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+            }
+        }
+        last_tried_acc_id = Some(acc.id.clone());
+
+        let acc_proxy_client = oauth_accounts::client_for_account(&acc);
+        if switched_account && acc_proxy_client.is_none() {
+            fresh_client_override = crate::build_http_client(None, None, None).ok();
+        }
+        let effective_client = acc_proxy_client
+            .clone()
+            .or_else(|| fresh_client_override.clone())
+            .unwrap_or_else(|| client.clone());
 
         let project_id = match acc.project_id.clone() {
             Some(p) if !p.trim().is_empty() => p,
             _ => {
-                let pid = oauth_accounts::fetch_antigravity_project_id(client, &acc.access_token).await;
+                let pid = oauth_accounts::fetch_antigravity_project_id(&effective_client, &acc.access_token).await;
                 if !pid.is_empty() {
                     acc.project_id = Some(pid.clone());
                     let acc_to_save = acc.clone();
@@ -397,50 +492,62 @@ pub async fn stream_antigravity(
             }
         };
 
-        let turn_session = uuid::Uuid::new_v4().to_string();
+        let turn_session = oauth_accounts::antigravity_session_id(&format!("{}:{}", conv_key, acc.id));
         let mut inner_req_copy = inner_req.clone();
-        inner_req_copy["session_id"] = serde_json::json!(&turn_session);
+        inner_req_copy["sessionId"] = serde_json::json!(&turn_session);
 
+        let user_prompt_id = uuid::Uuid::new_v4().to_string();
+        let req_id = compute_antigravity_request_id(&model_clean, &turn_session, attempt);
         let envelope = serde_json::json!({
             "project": project_id,
             "model": model_clean,
             "request": inner_req_copy,
+            "userPromptId": user_prompt_id,
             "requestType": "agent",
             "userAgent": "antigravity",
-            "requestId": uuid::Uuid::new_v4().to_string(),
+            "requestId": req_id,
         });
 
+        oauth_accounts::record_antigravity_active_account(&acc.id);
         crate::logger::info("Antigravity", &format!("POST {} model={} account={} project={}", target_url, model_clean, acc.email, project_id));
-        let trace_id = oauth_accounts::antigravity_trace_id();
-        let mut req_builder = effective_client
+        let response = match effective_client
             .post(target_url)
             .bearer_auth(&acc.access_token)
             .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
             .header("User-Agent", oauth_accounts::antigravity_hub_ua())
-            .header("X-Goog-Request-Reason", "user_initiated")
-            .header("x-cloudaicompanion-trace-id", &trace_id);
-        if !project_id.is_empty() {
-            req_builder = req_builder.header("X-Goog-User-Project", &project_id);
-        }
-        let response = match req_builder
             .json(&envelope)
             .send()
             .await
         {
             Ok(r) => r,
             Err(err) => {
+                let detailed = crate::error::format_reqwest_error(&err);
+                crate::logger::error(
+                    "Antigravity",
+                    &format!("Request failed (attempt {}/{}, account={}): {}", attempt, max_attempts, acc.email, detailed),
+                );
+                if acc_proxy_client.is_none() {
+                    fresh_client_override = crate::build_http_client(None, None, None).ok();
+                }
                 if attempt == max_attempts {
                     return Err(LlmError::Network(err));
                 }
+                same_acc_retries += 1;
+                if same_acc_retries > 2 {
+                    excluded_ids.insert(acc.id.clone());
+                }
+                let backoff_ms = {
+                    use rand::Rng;
+                    rand::thread_rng().gen_range(1800..=4200)
+                };
                 let _ = sender
                     .send(StreamEvent::RetryNotice {
-                        reason: format!("Antigravity connection retry ({}): {}", acc.email, err),
+                        reason: format!("Antigravity connection retry ({}): {}", acc.email, detailed),
                         attempt,
                         model: request.model.clone(),
                     })
                     .await;
-                tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 continue;
             }
         };
@@ -449,31 +556,23 @@ pub async fn stream_antigravity(
         if status.as_u16() == 401 {
             if let Ok(refreshed) = oauth_accounts::force_refresh_account(&effective_client, &acc.id).await {
                 acc = refreshed;
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                let retry_trace = oauth_accounts::antigravity_trace_id();
-                let retry_turn_session = uuid::Uuid::new_v4().to_string();
+                tokio::time::sleep(std::time::Duration::from_millis(650)).await;
                 let mut retry_inner = inner_req.clone();
-                retry_inner["session_id"] = serde_json::json!(&retry_turn_session);
+                retry_inner["sessionId"] = serde_json::json!(&turn_session);
                 let retry_envelope = serde_json::json!({
                     "project": project_id,
                     "model": model_clean,
                     "request": retry_inner,
+                    "userPromptId": uuid::Uuid::new_v4().to_string(),
                     "requestType": "agent",
                     "userAgent": "antigravity",
-                    "requestId": uuid::Uuid::new_v4().to_string(),
+                    "requestId": compute_antigravity_request_id(&model_clean, &turn_session, attempt),
                 });
-                let mut retry_builder = effective_client
+                if let Ok(r2) = effective_client
                     .post(target_url)
                     .bearer_auth(&acc.access_token)
                     .header("Content-Type", "application/json")
-                    .header("Accept", "text/event-stream")
                     .header("User-Agent", oauth_accounts::antigravity_hub_ua())
-                    .header("X-Goog-Request-Reason", "user_initiated")
-                    .header("x-cloudaicompanion-trace-id", &retry_trace);
-                if !project_id.is_empty() {
-                    retry_builder = retry_builder.header("X-Goog-User-Project", &project_id);
-                }
-                if let Ok(r2) = retry_builder
                     .json(&retry_envelope)
                     .send()
                     .await
@@ -496,6 +595,18 @@ pub async fn stream_antigravity(
                     message: msg_401,
                 });
             }
+            let wait_secs = {
+                use rand::Rng;
+                rand::thread_rng().gen_range(8..=18)
+            };
+            let _ = sender
+                .send(StreamEvent::RetryNotice {
+                    reason: format!("Antigravity auth failed (401, {}): switching account in {}s...", acc.email, wait_secs),
+                    attempt,
+                    model: request.model.clone(),
+                })
+                .await;
+            tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
             continue;
         }
 
@@ -509,11 +620,42 @@ pub async fn stream_antigravity(
                             message: "Antigravity geographic restriction: Detected location is not supported (LOCATION_NOT_ELIGIBLE). Ensure your VPN or Proxy (v2RayTun/Incy) is active and routing Google traffic through a supported region.".to_string(),
                         });
                     }
+                    let is_tos = oauth_accounts::is_tos_or_disabled_error(&smsg);
                     let is_rate_limit = scode == 429
                         || smsg.contains("RESOURCE_EXHAUSTED")
                         || smsg.to_ascii_lowercase().contains("quota")
                         || smsg.to_ascii_lowercase().contains("rate limit");
-                    let cd = if is_rate_limit { 120 } else { 30 };
+                    let is_transient = !is_tos && is_transient_retryable_body(scode, &smsg);
+                    let parsed_delay_ms = parse_retry_delay_ms(None, &smsg);
+
+                    if is_transient && same_acc_retries < 2 && attempt < max_attempts {
+                        same_acc_retries += 1;
+                        let delay_ms = parsed_delay_ms.unwrap_or_else(|| {
+                            use rand::Rng;
+                            if same_acc_retries == 1 {
+                                rand::thread_rng().gen_range(2500..=5500)
+                            } else {
+                                rand::thread_rng().gen_range(5500..=11000)
+                            }
+                        }).min(20_000);
+                        let _ = sender
+                            .send(StreamEvent::RetryNotice {
+                                reason: format!("Antigravity transient {} ({}): retrying in {}s...", scode, acc.email, (delay_ms + 999) / 1000),
+                                attempt,
+                                model: request.model.clone(),
+                            })
+                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+
+                    let cd = if is_tos {
+                        86400
+                    } else if is_rate_limit {
+                        parsed_delay_ms.map(|ms| (ms / 1000).max(180)).unwrap_or(300)
+                    } else {
+                        120
+                    };
                     if is_rate_limit {
                         oauth_accounts::mark_account_quota_exhausted(&acc.id, Some(0.0), None).await;
                     }
@@ -525,22 +667,20 @@ pub async fn stream_antigravity(
                     });
                     if attempt < max_attempts && (is_rate_limit || scode >= 500 || scode == 403) {
                         let acc_cnt = oauth_accounts::list_accounts(Some("antigravity")).await.into_iter().filter(|a| a.enabled).count();
-                        let (delay_ms, reason) = if is_rate_limit {
+                        let delay_secs = {
                             use rand::Rng;
-                            let delay_secs = rand::thread_rng().gen_range(12..=34);
-                            let r = if acc_cnt > 1 {
-                                format!("Antigravity quota limit ({}, {}): switching account in {}s...", scode, acc.email, delay_secs)
+                            if is_tos {
+                                rand::thread_rng().gen_range(25..=52)
+                            } else if is_rate_limit {
+                                rand::thread_rng().gen_range(18..=38)
                             } else {
-                                format!("Antigravity rate limited ({}, {}): retrying in {}s...", scode, acc.email, delay_secs)
-                            };
-                            (delay_secs * 1000, r)
+                                rand::thread_rng().gen_range(10..=22)
+                            }
+                        };
+                        let reason = if acc_cnt > 1 {
+                            format!("Antigravity {} ({}): switching account in {}s...", scode, acc.email, delay_secs)
                         } else {
-                            let r = if acc_cnt > 1 {
-                                format!("Antigravity stream {} ({}): switching account", scode, acc.email)
-                            } else {
-                                format!("Antigravity stream {} ({}), retrying...", scode, acc.email)
-                            };
-                            (450, r)
+                            format!("Antigravity {} ({}): retrying in {}s...", scode, acc.email, delay_secs)
                         };
                         let _ = sender
                             .send(StreamEvent::RetryNotice {
@@ -549,7 +689,7 @@ pub async fn stream_antigravity(
                                 model: request.model.clone(),
                             })
                             .await;
-                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                         continue;
                     }
                     return Err(LlmError::ProviderError {
@@ -558,15 +698,31 @@ pub async fn stream_antigravity(
                     });
                 }
                 Err(LlmError::Network(e)) => {
+                    let detailed = crate::error::format_reqwest_error(&e);
+                    crate::logger::error(
+                        "Antigravity",
+                        &format!("Stream network error (attempt {}/{}, account={}): {}", attempt, max_attempts, acc.email, detailed),
+                    );
+                    if acc_proxy_client.is_none() {
+                        fresh_client_override = crate::build_http_client(None, None, None).ok();
+                    }
                     if attempt < max_attempts {
+                        same_acc_retries += 1;
+                        if same_acc_retries > 2 {
+                            excluded_ids.insert(acc.id.clone());
+                        }
+                        let delay_ms = {
+                            use rand::Rng;
+                            rand::thread_rng().gen_range(2000..=4500)
+                        };
                         let _ = sender
                             .send(StreamEvent::RetryNotice {
-                                reason: format!("Stream network error, retrying: {}", e),
+                                reason: format!("Stream network error, retrying: {}", detailed),
                                 attempt,
                                 model: request.model.clone(),
                             })
                             .await;
-                        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                         continue;
                     }
                     return Err(LlmError::Network(e));
@@ -576,6 +732,11 @@ pub async fn stream_antigravity(
         }
 
         let code = status.as_u16();
+        let retry_after_hdr = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let err_body = response.text().await.unwrap_or_default();
         crate::logger::record_http("Antigravity", "POST", target_url, code, &err_body);
 
@@ -586,15 +747,50 @@ pub async fn stream_antigravity(
             });
         }
 
+        let is_tos_banned = oauth_accounts::is_tos_or_disabled_error(&err_body);
         let is_rate_limit = code == 429
             || err_body.contains("RESOURCE_EXHAUSTED")
             || err_body.to_ascii_lowercase().contains("quota")
             || err_body.to_ascii_lowercase().contains("rate limit");
-        let cooldown = if is_rate_limit { 120 } else { 30 };
+        let parsed_delay_ms = parse_retry_delay_ms(retry_after_hdr.as_deref(), &err_body);
+        let is_transient = !is_tos_banned && (is_transient_retryable_body(code, &err_body)
+            || (code == 429 && parsed_delay_ms.map(|ms| ms <= 15_000).unwrap_or(false)));
+
+        if is_transient && same_acc_retries < 2 && attempt < max_attempts {
+            same_acc_retries += 1;
+            let delay_ms = parsed_delay_ms.map(|ms| ms + 1200).unwrap_or_else(|| {
+                use rand::Rng;
+                if same_acc_retries == 1 {
+                    rand::thread_rng().gen_range(2500..=5500)
+                } else {
+                    rand::thread_rng().gen_range(5500..=11000)
+                }
+            }).min(20_000);
+            let _ = sender
+                .send(StreamEvent::RetryNotice {
+                    reason: format!("Antigravity HTTP {} ({}): retrying in {}s...", code, acc.email, (delay_ms + 999) / 1000),
+                    attempt,
+                    model: request.model.clone(),
+                })
+                .await;
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            continue;
+        }
+
+        let cooldown = if is_tos_banned {
+            86400
+        } else if is_rate_limit {
+            parsed_delay_ms.map(|ms| (ms / 1000).max(180)).unwrap_or(300)
+        } else if code == 403 {
+            600
+        } else {
+            120
+        };
         if is_rate_limit {
             oauth_accounts::mark_account_quota_exhausted(&acc.id, Some(0.0), None).await;
         }
-        oauth_accounts::mark_account_cooldown(&acc.id, cooldown, &err_body).await;
+        let clean_err = format!("HTTP {}: {}", code, crate::error::extract_api_error_message(&err_body));
+        oauth_accounts::mark_account_cooldown(&acc.id, cooldown, &clean_err).await;
         excluded_ids.insert(acc.id.clone());
         last_err = Some(LlmError::ProviderError {
             status: code,
@@ -603,22 +799,20 @@ pub async fn stream_antigravity(
 
         if attempt < max_attempts && (is_rate_limit || code >= 500 || code == 403) {
             let acc_cnt = oauth_accounts::list_accounts(Some("antigravity")).await.into_iter().filter(|a| a.enabled).count();
-            let (delay_ms, reason) = if is_rate_limit {
+            let delay_secs = {
                 use rand::Rng;
-                let delay_secs = rand::thread_rng().gen_range(12..=34);
-                let r = if acc_cnt > 1 {
-                    format!("Antigravity {} ({}): switching account in {}s...", code, acc.email, delay_secs)
+                if is_tos_banned {
+                    rand::thread_rng().gen_range(25..=52)
+                } else if is_rate_limit || code == 403 {
+                    rand::thread_rng().gen_range(18..=38)
                 } else {
-                    format!("Antigravity rate limited (429, {}): retrying in {}s...", acc.email, delay_secs)
-                };
-                (delay_secs * 1000, r)
+                    rand::thread_rng().gen_range(10..=22)
+                }
+            };
+            let reason = if acc_cnt > 1 {
+                format!("Antigravity {} ({}): switching account in {}s...", code, acc.email, delay_secs)
             } else {
-                let r = if acc_cnt > 1 {
-                    format!("Antigravity {} ({}): switching account", code, acc.email)
-                } else {
-                    format!("Antigravity {} ({}), retrying...", code, acc.email)
-                };
-                (450, r)
+                format!("Antigravity {} ({}): retrying in {}s...", code, acc.email, delay_secs)
             };
             let _ = sender
                 .send(StreamEvent::RetryNotice {
@@ -627,7 +821,7 @@ pub async fn stream_antigravity(
                     model: request.model.clone(),
                 })
                 .await;
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
             continue;
         }
 
@@ -840,7 +1034,7 @@ pub async fn generate_antigravity_image(
         gen_cfg["imageConfig"] = serde_json::json!({ "aspectRatio": ar });
     }
 
-    let session_id = oauth_accounts::account_machine_session_id(&acc);
+    let session_id = oauth_accounts::antigravity_session_id(&format!("img:{}:{}", acc.id, prompt));
     let envelope = serde_json::json!({
         "project": &project_id,
         "model": model_id,
@@ -850,34 +1044,33 @@ pub async fn generate_antigravity_image(
                 "parts": [{ "text": prompt }]
             }],
             "generationConfig": gen_cfg,
-            "session_id": &session_id
+            "sessionId": &session_id
         },
+        "userPromptId": uuid::Uuid::new_v4().to_string(),
         "requestType": "agent",
         "userAgent": "antigravity",
-        "requestId": uuid::Uuid::new_v4().to_string(),
+        "requestId": compute_antigravity_request_id(&model_id, &session_id, 1),
     });
 
     let url = "https://daily-cloudcode-pa.googleapis.com/v1internal:generateContent";
     crate::logger::info("AntigravityImage", &format!("Generating image with model={} account={}", model_id, acc.email));
-    let trace_id = oauth_accounts::antigravity_trace_id();
-    let mut req_builder = effective_client
+    oauth_accounts::record_antigravity_active_account(&acc.id);
+    let resp = effective_client
         .post(url)
         .bearer_auth(&acc.access_token)
         .header("Content-Type", "application/json")
         .header("User-Agent", oauth_accounts::antigravity_hub_ua())
-        .header("X-Goog-Request-Reason", "user_initiated")
-        .header("x-cloudaicompanion-trace-id", &trace_id);
-    if !project_id.is_empty() {
-        req_builder = req_builder.header("X-Goog-User-Project", &project_id);
-    }
-    let resp = req_builder
         .json(&envelope)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            let detailed = crate::error::format_reqwest_error(&e);
+            crate::logger::error("AntigravityImage", &format!("Request failed ({}): {}", acc.email, detailed));
+            detailed
+        })?;
 
     let status = resp.status().as_u16();
-    let body_text = resp.text().await.map_err(|e| e.to_string())?;
+    let body_text = resp.text().await.map_err(|e| crate::error::format_reqwest_error(&e))?;
     crate::logger::record_http("AntigravityImage", "POST", url, status, &body_text[..body_text.len().min(300)]);
     if !(200..300).contains(&status) {
         crate::logger::error_with_trace("AntigravityImage", &format!("Image gen failed ({}): {}", status, body_text));
