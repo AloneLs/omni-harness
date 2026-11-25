@@ -2448,6 +2448,28 @@ class ChatStore {
     } catch {}
   }
 
+  private normalizeQueueAttachments(raw: unknown): ChatAttachment[] | undefined {
+    if (!Array.isArray(raw) || raw.length === 0) return undefined;
+    return raw.map((att: unknown, idx: number) => {
+      const a = (att && typeof att === 'object' ? att : {}) as Record<string, unknown>;
+      const kindRaw = typeof a.kind === 'string' ? a.kind : 'file';
+      const kind: ChatAttachment['kind'] =
+        kindRaw === 'image' || kindRaw === 'video' || kindRaw === 'audio' ? kindRaw : 'file';
+      return {
+        id: typeof a.id === 'string' && a.id ? a.id : `qatt-${Date.now()}-${idx}`,
+        name: typeof a.name === 'string' ? a.name : 'attachment',
+        path: typeof a.path === 'string' ? a.path : '',
+        kind,
+        previewUrl:
+          typeof a.previewUrl === 'string'
+            ? a.previewUrl
+            : typeof a.dataUrl === 'string'
+              ? a.dataUrl
+              : undefined
+      };
+    });
+  }
+
   private applyBackendQueue(chatId: string, items: PendingQueueItem[]): void {
     this.pendingQueueByChat[chatId] = (items || []).map((it) => ({
       id: it.id,
@@ -2455,7 +2477,7 @@ class ChatStore {
       createdAt: it.createdAt ?? Date.now(),
       priority: (it.priority as 'normal' | 'intervention') || 'normal',
       source: it.source,
-      attachments: Array.isArray(it.attachments) ? it.attachments : undefined
+      attachments: this.normalizeQueueAttachments(it.attachments)
     }));
     this.persistPendingQueues();
   }
@@ -2504,7 +2526,7 @@ class ChatStore {
           createdAt: taken.createdAt ?? Date.now(),
           priority: (taken.priority as 'normal' | 'intervention') || 'normal',
           source: taken.source,
-          attachments: Array.isArray(taken.attachments) ? taken.attachments : undefined
+          attachments: this.normalizeQueueAttachments(taken.attachments)
         };
         const items = await invoke<PendingQueueItem[]>('queue_list', { chatId: cid });
         this.applyBackendQueue(cid, items);

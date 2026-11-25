@@ -189,8 +189,27 @@ impl ShellPolicyGuard {
         }
 
         if plan_mode {
-            if lower.contains("$(") || lower.contains('`') || lower.contains('>') || lower.contains(">>") {
-                return Err("Plan Mode Guard: command substitution or redirection is blocked in read-only Plan mode.".to_string());
+            let mut in_single = false;
+            let mut in_double = false;
+            let chars: Vec<char> = lower.chars().collect();
+            for (idx, &ch) in chars.iter().enumerate() {
+                if !in_double && ch == '\'' {
+                    in_single = !in_single;
+                    continue;
+                }
+                if !in_single && ch == '"' {
+                    in_double = !in_double;
+                    continue;
+                }
+                if in_single {
+                    continue;
+                }
+                if ch == '`' || (ch == '$' && chars.get(idx + 1) == Some(&'(')) {
+                    return Err("Plan Mode Guard: command substitution is blocked in read-only Plan mode.".to_string());
+                }
+                if !in_double && ch == '>' {
+                    return Err("Plan Mode Guard: output redirection is blocked in read-only Plan mode.".to_string());
+                }
             }
             let segments: Vec<&str> = lower
                 .split(['|', ';', '\n'])

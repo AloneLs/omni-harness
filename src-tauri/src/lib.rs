@@ -3624,10 +3624,19 @@ pub fn run() {
                         let _ = st.tool_dispatcher.pty_manager.kill_all();
                         let tg = st.telegram_mgr.clone();
                         let mcp = st.mcp_catalog.clone();
-                        tauri::async_runtime::spawn(async move {
-                            tg.stop().await;
-                            mcp.disconnect_all().await;
-                        });
+                        let _ = std::thread::spawn(move || {
+                            tauri::async_runtime::block_on(async move {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    async {
+                                        tg.stop().await;
+                                        mcp.disconnect_all().await;
+                                    },
+                                )
+                                .await;
+                            });
+                        })
+                        .join();
                         let _ = tools::phantom_session::restore_all_staged_windows(true);
                         app.exit(0);
                     }
