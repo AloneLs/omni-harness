@@ -129,11 +129,13 @@ pub struct SecretShield;
 impl SecretShield {
     pub fn check_path(path: &Path) -> Result<(), String> {
         let lower = path.to_string_lossy().to_lowercase().replace('\\', "/");
-        let file_name = path
+        let raw_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_lowercase();
+        let base_name = raw_name.split(':').next().unwrap_or(&raw_name);
+        let file_name = base_name.trim_end_matches(['.', ' ']);
 
         if file_name == ".env"
             || file_name.starts_with(".env.")
@@ -175,7 +177,6 @@ impl ShellPolicyGuard {
             ":(){ :|:& };:",
             "env | curl",
             "printenv | curl",
-            "curl.*id_rsa",
             "powershell -enc",
         ];
         for pat in red_patterns {
@@ -183,11 +184,36 @@ impl ShellPolicyGuard {
                 return Err(format!("Policy Guard (RED): blocked dangerous command pattern '{}'", pat));
             }
         }
+        if lower.contains("curl") && lower.contains("id_rsa") {
+            return Err("Policy Guard (RED): blocked dangerous command pattern 'curl + id_rsa'".to_string());
+        }
 
         if plan_mode {
-            // Block file-mutating shell redirections or PowerShell write cmdlets even if prefixed with read-only command
+            let mut in_single = false;
+            let mut in_double = false;
+            let chars: Vec<char> = lower.chars().collect();
+            for (idx, &ch) in chars.iter().enumerate() {
+                if !in_double && ch == '\'' {
+                    in_single = !in_single;
+                    continue;
+                }
+                if !in_single && ch == '"' {
+                    in_double = !in_double;
+                    continue;
+                }
+                if in_single {
+                    continue;
+                }
+                if ch == '`' || (ch == '$' && chars.get(idx + 1) == Some(&'(')) {
+                    return Err("Plan Mode Guard: command substitution is blocked in read-only Plan mode.".to_string());
+                }
+                if !in_double && ch == '>' {
+                    return Err("Plan Mode Guard: output redirection is blocked in read-only Plan mode.".to_string());
+                }
+            }
+
             let forbidden_in_plan = [
-                ">", ">>", "out-file", "set-content", "add-content", "new-item",
+                "out-file", "set-content", "add-content", "new-item",
                 "remove-item", "move-item", "copy-item", "rename-item",
                 "-outfile", "-exec", "-delete", "tee ",
             ];
@@ -199,7 +225,6 @@ impl ShellPolicyGuard {
                     ));
                 }
             }
-
             let segments: Vec<&str> = lower
                 .split(['|', ';', '\n'])
                 .flat_map(|s| s.split("&&"))
@@ -217,7 +242,10 @@ impl ShellPolicyGuard {
                 "select-object", "where-object", "sort-object", "format-table", "format-list",
             ];
             for seg in segments {
-                if !allowed_ro.iter().any(|p| seg.starts_with(p)) {
+                let ok = allowed_ro.iter().any(|p| {
+                    seg == *p || seg.strip_prefix(p).map(|r| r.starts_with(char::is_whitespace)).unwrap_or(false)
+                });
+                if !ok {
                     return Err(format!(
                         "Plan Mode Guard: command '{}' is blocked in read-only Plan mode.",
                         seg

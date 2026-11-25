@@ -669,12 +669,9 @@ impl TelegramBotManager {
     }
 
     pub async fn generate_pairing_code(&self) -> String {
-        use std::time::SystemTime;
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(123456);
-        let code = format!("{:06}", (nanos % 900000) + 100000);
+        use rand::Rng;
+        let num: u32 = rand::thread_rng().gen_range(100_000..1_000_000);
+        let code = format!("{:06}", num);
         let mut lock = self.pairing_code.write().await;
         *lock = Some(code.clone());
         code
@@ -825,7 +822,16 @@ impl TelegramBotManager {
                                         .trim()
                                         .to_string();
 
-                                    let authorized = allowed_chats.read().await.contains(&chat_id);
+                                    let chat_type = msg["chat"]["type"].as_str().unwrap_or("");
+                                    let sender_id = msg["from"]["id"].as_i64().unwrap_or(0);
+                                    let authorized = {
+                                        let allowed = allowed_chats.read().await;
+                                        if chat_type == "private" || chat_type == "channel" {
+                                            allowed.contains(&chat_id)
+                                        } else {
+                                            allowed.contains(&chat_id) && allowed.contains(&sender_id)
+                                        }
+                                    };
                                     if !authorized {
                                         let ctx_opt_unauth = runtime_ctx_arc.read().await.clone();
                                         handle_unauthorized_message(
@@ -877,7 +883,16 @@ impl TelegramBotManager {
                                     let msg_id = cb["message"]["message_id"].as_i64().unwrap_or(0);
                                     let chat_id = cb["message"]["chat"]["id"].as_i64().unwrap_or(0);
 
-                                    let authorized = allowed_chats.read().await.contains(&chat_id);
+                                    let chat_type = cb["message"]["chat"]["type"].as_str().unwrap_or("");
+                                    let sender_id = cb["from"]["id"].as_i64().unwrap_or(0);
+                                    let authorized = {
+                                        let allowed = allowed_chats.read().await;
+                                        if chat_type == "private" || chat_type == "channel" {
+                                            allowed.contains(&chat_id)
+                                        } else {
+                                            allowed.contains(&chat_id) && allowed.contains(&sender_id)
+                                        }
+                                    };
                                     if !authorized || chat_id == 0 || msg_id == 0 {
                                         tg_client
                                             .answer_callback(cb_id, Some("Доступ запрещён"))
@@ -1063,22 +1078,46 @@ async fn handle_unauthorized_message(
     drop(pair_lock);
 
     if paired {
-        allowed_chats.write().await.insert(chat_id);
-        let sender_name = msg["chat"]["first_name"]
+        {
+            let mut allowed = allowed_chats.write().await;
+            allowed.insert(chat_id);
+            if let Some(uid) = msg["from"]["id"].as_i64().filter(|&id| id > 0) {
+                allowed.insert(uid);
+            }
+        }
+        let sender_name = msg["chat"]["title"]
             .as_str()
+            .or_else(|| msg["chat"]["first_name"].as_str())
             .or_else(|| msg["chat"]["username"].as_str())
             .unwrap_or("User")
             .to_string();
+        let now_str = chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string();
         let entry = PairedChatEntry {
             chat_id: chat_id.to_string(),
             name: sender_name,
-            paired_at: chrono::Utc::now().format("%Y-%m-%d %H:%M").to_string(),
+            paired_at: now_str.clone(),
             role: "admin".to_string(),
         };
         {
             let mut cfg = config_arc.write().await;
             if !cfg.paired_chats.iter().any(|c| c.chat_id == entry.chat_id) {
                 cfg.paired_chats.push(entry);
+            }
+            if let Some(uid) = msg["from"]["id"].as_i64().filter(|&id| id > 0 && id != chat_id) {
+                let uid_str = uid.to_string();
+                if !cfg.paired_chats.iter().any(|c| c.chat_id == uid_str) {
+                    let from_name = msg["from"]["first_name"]
+                        .as_str()
+                        .or_else(|| msg["from"]["username"].as_str())
+                        .unwrap_or("Admin")
+                        .to_string();
+                    cfg.paired_chats.push(PairedChatEntry {
+                        chat_id: uid_str,
+                        name: from_name,
+                        paired_at: now_str,
+                        role: "admin".to_string(),
+                    });
+                }
             }
             if let Some(path) = config_path_arc.read().await.as_ref() {
                 if let Ok(data) = serde_json::to_vec_pretty(&*cfg) {

@@ -3129,6 +3129,7 @@ pub async fn check_account_liveness(client: &reqwest::Client, id: &str) -> Resul
         let list = read_accounts_unlocked();
         list.into_iter().find(|a| a.id == id).ok_or("Account not found")?
     };
+    let orig_access_token = acc.access_token.clone();
     let eff_client = client_for_account(&acc).unwrap_or_else(|| client.clone());
     let res = fetch_account_quota_inner(&eff_client, &mut acc).await;
     if let Err(ref e) = res {
@@ -3138,7 +3139,30 @@ pub async fn check_account_liveness(client: &reqwest::Client, id: &str) -> Resul
     let _guard = store_lock().lock().await;
     let mut list = read_accounts_unlocked();
     if let Some(slot) = list.iter_mut().find(|a| a.id == id) {
-        *slot = acc.clone();
+        slot.last_error = acc.last_error.clone();
+        slot.email = acc.email.clone();
+        slot.quota_5h_remaining = acc.quota_5h_remaining;
+        slot.quota_5h_reset_at_ms = acc.quota_5h_reset_at_ms;
+        slot.quota_weekly_remaining = acc.quota_weekly_remaining;
+        slot.quota_weekly_reset_at_ms = acc.quota_weekly_reset_at_ms;
+        slot.quota_label = acc.quota_label.clone();
+        slot.quota_updated_at_ms = acc.quota_updated_at_ms;
+        slot.plan_tier = acc.plan_tier.clone();
+        slot.allowed_models = acc.allowed_models.clone();
+        if acc.project_id.is_some() {
+            slot.project_id = acc.project_id.clone();
+        }
+        if acc.account_id.is_some() {
+            slot.account_id = acc.account_id.clone();
+        }
+        if acc.cooldown_until_ms.is_some() {
+            slot.cooldown_until_ms = acc.cooldown_until_ms;
+        }
+        if !acc.access_token.is_empty() && slot.access_token == orig_access_token {
+            slot.access_token = acc.access_token.clone();
+            slot.refresh_token = acc.refresh_token.clone();
+            slot.expires_at_ms = acc.expires_at_ms;
+        }
         write_accounts_unlocked(&list)?;
     }
     match res {

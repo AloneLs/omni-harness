@@ -14,56 +14,69 @@ export class VoiceCapture {
   private totalSampleCount = 0;
   private startTime = 0;
   private recording = false;
+  private starting = false;
   private smoothedBands: number[] = new Array(28).fill(0);
   private sampleRate = 16000;
 
   public async start(): Promise<void> {
-    if (this.recording) {
+    if (this.recording || this.starting) {
       return;
     }
+    this.starting = true;
 
     this.recordedChunks = [];
     this.totalSampleCount = 0;
     this.smoothedBands = new Array(28).fill(0);
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
+    let stream: MediaStream | null = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      this.mediaStream = stream;
+      const AudioContextClass = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      this.audioContext = new AudioContextClass({ sampleRate: 16000 });
+      this.sampleRate = this.audioContext.sampleRate;
+
+      this.analyser = this.audioContext.createAnalyser();
+      this.analyser.fftSize = 512;
+      this.analyser.smoothingTimeConstant = 0.3;
+
+      this.sourceNode = this.audioContext.createMediaStreamSource(stream);
+      this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
+
+      this.scriptProcessor.onaudioprocess = (event: AudioProcessingEvent) => {
+        if (!this.recording) {
+          return;
+        }
+        const inputBuffer = event.inputBuffer.getChannelData(0);
+        const chunk = new Float32Array(inputBuffer.length);
+        chunk.set(inputBuffer);
+        this.recordedChunks.push(chunk);
+        this.totalSampleCount += chunk.length;
+      };
+
+      this.sourceNode.connect(this.analyser);
+      this.analyser.connect(this.scriptProcessor);
+      this.scriptProcessor.connect(this.audioContext.destination);
+
+      this.recording = true;
+      this.startTime = Date.now();
+    } catch (err) {
+      if (stream) {
+        for (const track of stream.getTracks()) track.stop();
       }
-    });
-
-    this.mediaStream = stream;
-    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-    this.audioContext = new AudioContextClass({ sampleRate: 16000 });
-    this.sampleRate = this.audioContext.sampleRate;
-
-    this.analyser = this.audioContext.createAnalyser();
-    this.analyser.fftSize = 512;
-    this.analyser.smoothingTimeConstant = 0.3;
-
-    this.sourceNode = this.audioContext.createMediaStreamSource(stream);
-    this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 1, 1);
-
-    this.scriptProcessor.onaudioprocess = (event: AudioProcessingEvent) => {
-      if (!this.recording) {
-        return;
-      }
-      const inputBuffer = event.inputBuffer.getChannelData(0);
-      const chunk = new Float32Array(inputBuffer.length);
-      chunk.set(inputBuffer);
-      this.recordedChunks.push(chunk);
-      this.totalSampleCount += chunk.length;
-    };
-
-    this.sourceNode.connect(this.analyser);
-    this.analyser.connect(this.scriptProcessor);
-    this.scriptProcessor.connect(this.audioContext.destination);
-
-    this.recording = true;
-    this.startTime = Date.now();
+      this.mediaStream = null;
+      throw err;
+    } finally {
+      this.starting = false;
+    }
   }
 
   public getBands(): number[] {
@@ -116,6 +129,7 @@ export class VoiceCapture {
     }
 
     if (this.scriptProcessor) {
+      this.scriptProcessor.onaudioprocess = null;
       this.scriptProcessor.disconnect();
       this.scriptProcessor = null;
     }
@@ -131,8 +145,11 @@ export class VoiceCapture {
     }
 
     if (this.audioContext && this.audioContext.state !== 'closed') {
-      await this.audioContext.close();
-      this.audioContext = null;
+      try {
+        await this.audioContext.close();
+      } finally {
+        this.audioContext = null;
+      }
     }
 
     const wavBlob = this.encodeWav(this.recordedChunks, this.sampleRate);

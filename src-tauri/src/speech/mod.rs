@@ -508,8 +508,9 @@ impl SpeechEngine {
                     tokio::time::sleep(Duration::from_millis(backoff)).await;
                     continue;
                 } else {
-                    let _ = tokio::fs::rename(&part_path, &dest_path).await;
-                    return Ok(dest_path);
+                    last_error = format!("Downloaded file too small ({} bytes)", final_len);
+                    let _ = tokio::fs::remove_file(&part_path).await;
+                    continue;
                 }
             } else {
                 let backoff = (attempt as u64 + 1) * 2000;
@@ -530,6 +531,9 @@ impl SpeechEngine {
         }
 
         let channels = u16::from_le_bytes([wav_bytes[22], wav_bytes[23]]);
+        if channels == 0 {
+            return Err("Invalid WAV header: 0 channels".to_string());
+        }
         let sample_rate = u32::from_le_bytes([
             wav_bytes[24],
             wav_bytes[25],

@@ -273,6 +273,7 @@ pub async fn stream_google_gemini(
         if status.is_success() {
             key_pool.mark_success(provider_name, base_url, &api_key).await;
             let mut byte_stream = response.bytes_stream();
+            let mut raw_buf: Vec<u8> = Vec::new();
             let mut line_buffer = String::new();
             let mut tool_idx: usize = 0;
             let mut token_usage: Option<TokenUsage> = None;
@@ -367,7 +368,8 @@ pub async fn stream_google_gemini(
                     Ok(c) => c,
                     Err(e) => return Err(LlmError::Network(e)),
                 };
-                line_buffer.push_str(&String::from_utf8_lossy(&chunk));
+                raw_buf.extend_from_slice(&chunk);
+                crate::llm::drain_valid_utf8(&mut raw_buf, &mut line_buffer);
 
                 while let Some(pos) = line_buffer.find('\n') {
                     let line = line_buffer[..pos].trim_end_matches('\r').to_string();

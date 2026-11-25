@@ -213,7 +213,9 @@ impl CronScheduler {
     where
         F: Fn(ScheduledJob) + Send + Sync + 'static,
     {
-        self.is_active.store(true, Ordering::SeqCst);
+        if self.is_active.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let is_running = self.is_active.clone();
         let jobs_ref = self.jobs.clone();
         let running_jobs_ref = self.running_jobs.clone();
@@ -244,7 +246,13 @@ impl CronScheduler {
                                 false
                             }
                         } else if let Ok(parsed) = CronSchedule::parse(&job.cron_expression) {
-                            parsed.matches(&now)
+                            let recently_ran = job
+                                .last_run_at
+                                .as_deref()
+                                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                                .map(|dt| (now - dt.with_timezone(&Utc)).num_seconds() < 60)
+                                .unwrap_or(false);
+                            !recently_ran && parsed.matches(&now)
                         } else {
                             false
                         };
@@ -277,7 +285,8 @@ impl CronScheduler {
                     let job_clone = job.clone();
 
                     tokio::spawn(async move {
-                        (exec_clone)(job_clone.clone());
+                        let job_for_exec = job_clone.clone();
+                        let _ = tokio::task::spawn_blocking(move || (exec_clone)(job_for_exec)).await;
                         let mut running = running_jobs_clone.write().await;
                         running.remove(&job_clone.id);
                     });

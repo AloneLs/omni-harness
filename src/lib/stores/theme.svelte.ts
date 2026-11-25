@@ -179,9 +179,48 @@ export function compileThemeCss(theme: OmniTheme | null, scopeSelector: string):
   const { atRules, remaining } = extractGlobalAtRules(css);
 
   let scopedBody = remaining
+    .replace(/<\/style/gi, '')
     .replace(/:root(?![\w-])/gi, ':scope')
     .replace(/(^|[\s,>+~])(html|body)(?![\w-])/gi, '$1:scope')
     .replace(/(^|[\s,>+~])\[data-omni-app\]/gi, '$1:scope');
+
+  let depth = 0;
+  let inQuote: string | null = null;
+  let inComment = false;
+  for (let i = 0; i < scopedBody.length; i++) {
+    const ch = scopedBody[i];
+    if (inComment) {
+      if (ch === '*' && scopedBody[i + 1] === '/') {
+        inComment = false;
+        i++;
+      }
+      continue;
+    }
+    if (inQuote) {
+      if (ch === '\\') {
+        i++;
+        continue;
+      }
+      if (ch === inQuote) inQuote = null;
+      continue;
+    }
+    if (ch === '/' && scopedBody[i + 1] === '*') {
+      inComment = true;
+      i++;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inQuote = ch;
+      continue;
+    }
+    if (ch === '{') {
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth < 0) return '';
+    }
+  }
+  if (depth !== 0 || inComment || inQuote !== null) return '';
 
   return `${atRules.join('\n')}\n@scope (${scopeSelector}) to ([data-omni-studio-ui], [data-omni-preview-bar], [data-omni-window-bar]) {\n${scopedBody}\n}`;
 }
@@ -320,6 +359,7 @@ class ThemeStore {
     if (this.activeThemeId === id) {
       this.activeThemeId = null;
       await invoke('set_active_theme_id', { id: null }).catch(() => {});
+      this.syncCustomRuntime();
     }
     if (this.editingTheme?.id === id) {
       this.editingTheme = this.themes[0] || null;

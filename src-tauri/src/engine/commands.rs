@@ -30,15 +30,20 @@ impl SlashCommandParser {
         }
 
         let without_slash = &trimmed[1..];
-        let mut parts = without_slash.split_whitespace();
-        let cmd = parts.next()?.to_lowercase();
-        let rest = without_slash.strip_prefix(&cmd)?.trim();
+        let mut parts = without_slash.splitn(2, char::is_whitespace);
+        let raw_cmd = parts.next()?.trim();
+        if raw_cmd.is_empty() {
+            return None;
+        }
+        let cmd = raw_cmd.to_lowercase();
+        let rest = parts.next().unwrap_or("").trim();
 
         match cmd.as_str() {
             "goal" => {
-                let mut sub_parts = rest.split_whitespace();
-                let sub_action = sub_parts.next().unwrap_or("list").to_lowercase();
-                let sub_rest = rest.strip_prefix(&sub_action).unwrap_or("").trim();
+                let mut sub_parts = rest.splitn(2, char::is_whitespace);
+                let raw_sub = sub_parts.next().unwrap_or("").trim();
+                let sub_action = if raw_sub.is_empty() { "list".to_string() } else { raw_sub.to_lowercase() };
+                let sub_rest = sub_parts.next().unwrap_or("").trim();
 
                 match sub_action.as_str() {
                     "add" => Some(SlashCommand::Goal(GoalSubcommand::Add {

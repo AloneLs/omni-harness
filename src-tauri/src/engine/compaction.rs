@@ -28,7 +28,7 @@ impl ContextCompactor {
         messages: Vec<ChatMessage>,
         keep_recent: usize,
     ) -> (Vec<ChatMessage>, bool) {
-        if messages.len() <= keep_recent + 2 {
+        if messages.len() <= 2 {
             return (messages, false);
         }
 
@@ -42,7 +42,7 @@ impl ContextCompactor {
             }
         }
 
-        if work_messages.len() <= keep_recent {
+        if work_messages.len() <= 1 {
             let mut result = Vec::new();
             if let Some(sys) = system_message {
                 result.push(sys);
@@ -51,7 +51,24 @@ impl ContextCompactor {
             return (result, false);
         }
 
-        let split_idx = work_messages.len().saturating_sub(keep_recent);
+        let mut split_idx = work_messages.len().saturating_sub(keep_recent.min(work_messages.len().saturating_sub(1)));
+        while split_idx > 0 && work_messages[split_idx].role == "tool" {
+            split_idx -= 1;
+        }
+        if split_idx == 0 {
+            split_idx = work_messages.len().saturating_sub(1);
+            while split_idx < work_messages.len() && work_messages[split_idx].role == "tool" {
+                split_idx += 1;
+            }
+        }
+        if split_idx == 0 {
+            let mut result = Vec::new();
+            if let Some(sys) = system_message {
+                result.push(sys);
+            }
+            result.extend(work_messages);
+            return (result, false);
+        }
         let older_slice = &work_messages[..split_idx];
         let recent_slice = &work_messages[split_idx..];
 

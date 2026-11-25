@@ -11,8 +11,8 @@ interface MemoryItem {
   key: string;
   category: 'preferences' | 'architecture' | 'environment' | 'skills' | 'lessons';
   content: string;
-  tokens: number;
-  priority: 'high' | 'normal' | 'low';
+  tokenCount: number;
+  createdAt: string;
   updatedAt: string;
 }
 
@@ -34,7 +34,7 @@ let newCategory = $state<MemoryItem['category']>('architecture');
 let newContent = $state<string>('');
 let notification = $state<{ type: 'success' | 'error'; message: string } | null>(null);
 
-let totalTokens = $derived(memories.reduce((acc, m) => acc + m.tokens, 0));
+let totalTokens = $derived(memories.reduce((acc, m) => acc + (m.tokenCount || 0), 0));
 let capacityPct = $derived(Math.min(100, (totalTokens / MAX_TOKENS) * 100));
 
 const animatedTokens = new Tween(0, { duration: 300, easing: cubicOut });
@@ -129,14 +129,15 @@ async function addMemory(e: Event) {
   e.preventDefault();
   if (!newKey.trim() || !newContent.trim()) return;
   const estTokens = Math.max(8, Math.ceil(newContent.trim().length / 4));
+  const nowIso = new Date().toISOString();
   const entry: MemoryItem = {
     id: `mem-${Date.now()}`,
     key: newKey.trim(),
     category: newCategory,
     content: newContent.trim(),
-    tokens: estTokens,
-    priority: 'normal',
-    updatedAt: new Date().toISOString().slice(0, 16).replace('T', ' ')
+    tokenCount: estTokens,
+    createdAt: nowIso,
+    updatedAt: nowIso
   };
   const prev = memories;
   memories = [entry, ...memories];
@@ -296,7 +297,7 @@ async function addMemory(e: Event) {
           </div>
 
           <div class="font-mono text-xs text-[#A3A3AA] text-right pt-0.5">
-            {item.tokens}
+            {item.tokenCount}
           </div>
 
           <div class="flex justify-end">

@@ -1719,16 +1719,11 @@ pub fn glob_sorted_by_mtime(
                 .to_string_lossy()
                 .replace('\\', "/");
             let full_clean = full_norm.trim_start_matches("//?/");
-            let rel_str = if full_clean.to_lowercase().starts_with(&root_norm) {
-                full_clean[root_norm.len()..].trim_start_matches('/').to_string()
-            } else {
-                entry
-                    .path()
-                    .strip_prefix(&root)
-                    .unwrap_or(entry.path())
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            };
+            let rel_str = entry
+                .path()
+                .strip_prefix(&root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| full_clean.to_string());
             if re.is_match(&rel_str) {
                 let mtime = crate::tools::safety::FileReadGuard::file_mtime_nanos(entry.path());
                 matches.push((mtime, full_clean.to_string()));
@@ -1809,7 +1804,8 @@ pub fn grep_with_options(
                         let mut j = start;
                         while j < bytes.len() && depth > 0 {
                             if bytes[j] == b'\\' {
-                                j += 2;
+                                let step = pattern[j + 1..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                                j += 1 + step;
                                 continue;
                             }
                             if bytes[j] == b'(' { depth += 1; }
@@ -1887,7 +1883,7 @@ pub fn grep_with_options(
                 | "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "bmp"
                 | "mp3" | "wav" | "ogg" | "mp4" | "webm" | "mov" | "mkv"
                 | "zip" | "7z" | "tar" | "gz" | "rar" | "db" | "sqlite" | "wasm" | "ttf" | "woff" | "woff2"
-        ) {
+        ) || crate::tools::safety::SecretShield::check_path(entry.path()).is_err() {
             continue;
         }
         if entry.metadata().map(|m| m.len() > MAX_GREP_FILE_BYTES).unwrap_or(false) {

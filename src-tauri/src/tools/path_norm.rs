@@ -101,7 +101,7 @@ pub fn lexical_clean(path: &Path) -> PathBuf {
             }
             Component::CurDir => {}
             Component::ParentDir => {
-                if !parts.is_empty() {
+                if parts.last().map(|p| p != "..").unwrap_or(false) {
                     parts.pop();
                 } else if !has_root && prefix.is_none() {
                     parts.push(OsString::from(".."));

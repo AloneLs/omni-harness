@@ -187,13 +187,22 @@ async fn stream_anthropic_inner(
                 has_tool_results = true;
                 let call_id = msg.tool_call_id.clone().unwrap_or_default();
                 let tool_content = msg.content.as_text_lossy();
+                let block = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": call_id,
+                    "content": tool_content,
+                });
+                if let Some(last) = messages_payload.last_mut() {
+                    if last.get("role").and_then(|v| v.as_str()) == Some("user") {
+                        if let Some(arr) = last.get_mut("content").and_then(|v| v.as_array_mut()) {
+                            arr.push(block);
+                            continue;
+                        }
+                    }
+                }
                 messages_payload.push(serde_json::json!({
                     "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": call_id,
-                        "content": tool_content,
-                    }]
+                    "content": [block]
                 }));
             } else if msg.role == "assistant" {
                 if let Some(ref tcs) = msg.tool_calls {
@@ -470,6 +479,7 @@ async fn stream_anthropic_inner(
             key_pool.mark_success(provider_name, base_url, &api_key).await;
 
             let mut byte_stream = response.bytes_stream();
+            let mut raw_buf: Vec<u8> = Vec::new();
             let mut line_buffer = String::new();
             let mut current_event_type = String::new();
             let mut tool_blocks: HashMap<usize, AnthropicToolBlock> = HashMap::new();
@@ -485,23 +495,27 @@ async fn stream_anthropic_inner(
                     Err(e) => return Err(LlmError::Network(e)),
                 };
 
-                let text = String::from_utf8_lossy(&chunk);
-                line_buffer.push_str(&text);
+                raw_buf.extend_from_slice(&chunk);
+                crate::llm::drain_valid_utf8(&mut raw_buf, &mut line_buffer);
 
                 while let Some(pos) = line_buffer.find('\n') {
                     let line = line_buffer[..pos].trim_end_matches('\r').to_string();
                     line_buffer.drain(..=pos);
 
-                    if line.is_empty() || line.starts_with(':') {
+                    if line.is_empty() {
+                        current_event_type.clear();
+                        continue;
+                    }
+                    if line.starts_with(':') {
                         continue;
                     }
 
-                    if let Some(ev) = line.strip_prefix("event: ") {
+                    if let Some(ev) = line.strip_prefix("event:") {
                         current_event_type = ev.trim().to_string();
                         continue;
                     }
 
-                    if let Some(stripped) = line.strip_prefix("data: ") {
+                    if let Some(stripped) = line.strip_prefix("data:") {
                         let data_str = stripped.trim();
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_str) {
                             let event_name = val

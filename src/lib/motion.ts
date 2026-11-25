@@ -8,20 +8,33 @@ export const SPRING_SLIDER = { stiffness: 0.32, damping: 0.78 } as const;
 
 export function attachPressScale(node: HTMLElement, targetScale = 0.95) {
   const scaleSpring = new Spring(1, { stiffness: 0.28, damping: 0.76 });
-  let rafActive = true;
+  let rafActive = false;
+  let disposed = false;
 
   const sync = () => {
-    if (!rafActive) return;
-    node.style.transform = `scale(${scaleSpring.current})`;
+    if (!rafActive || disposed) return;
+    const cur = scaleSpring.current;
+    node.style.transform = `scale(${cur})`;
+    if (Math.abs(cur - scaleSpring.target) < 0.0005) {
+      rafActive = false;
+      node.style.transform = scaleSpring.target === 1 ? '' : `scale(${scaleSpring.target})`;
+      return;
+    }
     requestAnimationFrame(sync);
   };
-  requestAnimationFrame(sync);
+  const wake = () => {
+    if (rafActive || disposed) return;
+    rafActive = true;
+    requestAnimationFrame(sync);
+  };
 
   const down = () => {
     scaleSpring.target = targetScale;
+    wake();
   };
   const up = () => {
     scaleSpring.target = 1;
+    wake();
   };
 
   node.addEventListener('pointerdown', down);
@@ -31,6 +44,7 @@ export function attachPressScale(node: HTMLElement, targetScale = 0.95) {
 
   return {
     destroy() {
+      disposed = true;
       rafActive = false;
       node.removeEventListener('pointerdown', down);
       node.removeEventListener('pointerup', up);

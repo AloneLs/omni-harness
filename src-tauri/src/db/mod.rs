@@ -608,17 +608,19 @@ impl Database {
         manifest_json: &str,
         max_per_session: usize,
     ) -> Result<(), AppError> {
-        let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        let mut conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        let tx = conn.transaction()?;
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
+        tx.execute(
             "INSERT INTO checkpoints (id, chat_id, turn_seq, kind, message_seq, manifest_json, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![checkpoint_id, chat_id, turn_seq, kind, message_seq, manifest_json, now],
         )?;
-        conn.execute(
+        tx.execute(
             "DELETE FROM checkpoints WHERE chat_id = ?1 AND id NOT IN (SELECT id FROM checkpoints WHERE chat_id = ?1 ORDER BY created_at DESC LIMIT ?2)",
             rusqlite::params![chat_id, max_per_session as i64],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -698,12 +700,14 @@ impl Database {
     }
 
     pub fn truncate_messages_after_seq(&self, chat_id: &str, message_seq: i64) -> Result<(), AppError> {
-        let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
-        conn.execute(
+        let mut conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        let tx = conn.transaction()?;
+        tx.execute(
             "DELETE FROM messages WHERE chat_id = ?1 AND sequence_num > ?2",
             rusqlite::params![chat_id, message_seq],
         )?;
-        conn.execute("DELETE FROM agent_checkpoints WHERE chat_id = ?1", [chat_id])?;
+        tx.execute("DELETE FROM agent_checkpoints WHERE chat_id = ?1", [chat_id])?;
+        tx.commit()?;
         Ok(())
     }
 }

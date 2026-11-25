@@ -442,6 +442,7 @@ onMount(() => {
   return () => {
     disposed = true;
     if (modelPopupSearchTimer) clearTimeout(modelPopupSearchTimer);
+    if (isVoiceActive) void cancelVoice();
     window.removeEventListener('omni-whisper-updated', onWhisperUpdated);
     if (unlisten) unlisten();
     if (unlistenOAuth) unlistenOAuth();
@@ -822,11 +823,14 @@ function handleSubmit() {
   }
   if (dynamicButtonState === 'queue') {
     const qText = inputText.trim();
+    const qAttachments = [...attachments];
+    if (!qText && qAttachments.length === 0) return;
     inputText = '';
+    attachments = [];
     resetTextareaHeight();
     chatStore.setDraftText(chatStore.activeChatId, '');
     chatStore.setDraftText(null, '');
-    chatStore.enqueueMessage(qText);
+    chatStore.enqueueMessage(qText, 'normal', qAttachments);
     return;
   }
   if (inputText.trim() || attachments.length > 0) {

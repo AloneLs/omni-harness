@@ -150,10 +150,11 @@ impl Database {
 
     pub fn search_memory_entries(&self, query: &str) -> Result<Vec<MemoryEntry>, AppError> {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
-        let pattern = format!("%{}%", query);
+        let escaped = query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        let pattern = format!("%{}%", escaped);
         let mut stmt = conn.prepare(
             "SELECT id, category, key, content, token_count, created_at, updated_at
-             FROM memory_entries WHERE key LIKE ?1 OR content LIKE ?1 ORDER BY updated_at DESC",
+             FROM memory_entries WHERE key LIKE ?1 ESCAPE '\\' OR content LIKE ?1 ESCAPE '\\' ORDER BY updated_at DESC",
         )?;
         let rows = stmt.query_map([pattern], |row| {
             Ok(MemoryEntry {
@@ -178,5 +179,42 @@ impl Database {
         let mut stmt = conn.prepare("SELECT COALESCE(SUM(token_count), 0) FROM memory_entries")?;
         let total: i64 = stmt.query_row([], |row| row.get(0))?;
         Ok(total)
+    }
+
+    pub fn compact_memory_entries(&self, max_tokens: i64) -> Result<(usize, i64), AppError> {
+        let mut conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        let mut total: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(token_count), 0) FROM memory_entries",
+            [],
+            |row| row.get(0),
+        )?;
+        let target = max_tokens.max(0);
+        if total <= target {
+            return Ok((0, 0));
+        }
+        let mut candidates: Vec<(String, i64)> = Vec::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, token_count FROM memory_entries ORDER BY updated_at ASC",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+            for r in rows {
+                candidates.push(r?);
+            }
+        }
+        let tx = conn.transaction()?;
+        let mut pruned_count = 0usize;
+        let mut saved_tokens = 0i64;
+        for (id, tok) in candidates {
+            if total <= target {
+                break;
+            }
+            tx.execute("DELETE FROM memory_entries WHERE id = ?1", [&id])?;
+            total -= tok;
+            saved_tokens += tok;
+            pruned_count += 1;
+        }
+        tx.commit()?;
+        Ok((pruned_count, saved_tokens))
     }
 }

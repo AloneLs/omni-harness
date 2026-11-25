@@ -80,6 +80,7 @@ export interface PendingQueueItem {
   createdAt: number;
   priority?: 'normal' | 'intervention';
   source?: string;
+  attachments?: ChatAttachment[];
 }
 
 export interface GoalStatusInfo {
@@ -2494,15 +2495,22 @@ class ChatStore {
     } catch {}
   }
 
-  public async enqueueMessage(text: string, priority: 'normal' | 'intervention' = 'normal'): Promise<void> {
+  public async enqueueMessage(
+    text: string,
+    priority: 'normal' | 'intervention' = 'normal',
+    attachments?: ChatAttachment[]
+  ): Promise<void> {
     const cid = this.activeChatId;
-    if (!cid || !text.trim()) return;
+    const cleanText = text.trim();
+    const hasAtts = Boolean(attachments && attachments.length > 0);
+    if (!cid || (!cleanText && !hasAtts)) return;
     const item: PendingQueueItem = {
       id: `queue-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      text: text.trim(),
+      text: cleanText,
       createdAt: Date.now(),
       priority,
-      source: 'app'
+      source: 'app',
+      attachments: hasAtts ? attachments : undefined
     };
     const cur = this.pendingQueueByChat[cid] || [];
     this.pendingQueueByChat[cid] = priority === 'intervention' ? [item, ...cur] : [...cur, item];
@@ -2511,11 +2519,40 @@ class ChatStore {
       const items = await invoke<PendingQueueItem[]>('queue_add', {
         chatId: cid,
         text: item.text,
-        attachments: null,
+        attachments: hasAtts
+          ? attachments!.map((a) => ({
+              name: a.name,
+              path: a.path,
+              kind: a.kind,
+              dataUrl: a.previewUrl || null
+            }))
+          : null,
         priority
       });
       this.applyBackendQueue(cid, items);
     } catch {}
+  }
+
+  private normalizeQueueAttachments(raw: unknown): ChatAttachment[] | undefined {
+    if (!Array.isArray(raw) || raw.length === 0) return undefined;
+    return raw.map((att: unknown, idx: number) => {
+      const a = (att && typeof att === 'object' ? att : {}) as Record<string, unknown>;
+      const kindRaw = typeof a.kind === 'string' ? a.kind : 'file';
+      const kind: ChatAttachment['kind'] =
+        kindRaw === 'image' || kindRaw === 'video' || kindRaw === 'audio' ? kindRaw : 'file';
+      return {
+        id: typeof a.id === 'string' && a.id ? a.id : `qatt-${Date.now()}-${idx}`,
+        name: typeof a.name === 'string' ? a.name : 'attachment',
+        path: typeof a.path === 'string' ? a.path : '',
+        kind,
+        previewUrl:
+          typeof a.previewUrl === 'string'
+            ? a.previewUrl
+            : typeof a.dataUrl === 'string'
+              ? a.dataUrl
+              : undefined
+      };
+    });
   }
 
   private applyBackendQueue(chatId: string, items: PendingQueueItem[]): void {
@@ -2524,7 +2561,8 @@ class ChatStore {
       text: it.text,
       createdAt: it.createdAt ?? Date.now(),
       priority: (it.priority as 'normal' | 'intervention') || 'normal',
-      source: it.source
+      source: it.source,
+      attachments: this.normalizeQueueAttachments(it.attachments)
     }));
     this.persistPendingQueues();
   }
@@ -2572,7 +2610,8 @@ class ChatStore {
           text: taken.text,
           createdAt: taken.createdAt ?? Date.now(),
           priority: (taken.priority as 'normal' | 'intervention') || 'normal',
-          source: taken.source
+          source: taken.source,
+          attachments: this.normalizeQueueAttachments(taken.attachments)
         };
         const items = await invoke<PendingQueueItem[]>('queue_list', { chatId: cid });
         this.applyBackendQueue(cid, items);
@@ -2585,7 +2624,7 @@ class ChatStore {
       this.pendingQueueByChat[cid] = q.slice(1);
       this.persistPendingQueues();
     }
-    await this.sendMessage(next.text, { targetChatId: cid });
+    await this.sendMessage(next.text, { targetChatId: cid, attachments: next.attachments });
   }
 
   public handleStreamEvent(event: any, targetChatId?: string, targetMessageId?: string): void {

@@ -191,7 +191,7 @@ pub fn parse_evaluator_verdict(raw: &str) -> EvaluatorVerdict {
     let trimmed = raw.trim();
     let json_candidate = if let Some(start) = trimmed.find('{') {
         if let Some(end) = trimmed.rfind('}') {
-            &trimmed[start..=end]
+            if start <= end { &trimmed[start..=end] } else { trimmed }
         } else {
             trimmed
         }
@@ -223,7 +223,7 @@ pub fn parse_evaluator_verdict(raw: &str) -> EvaluatorVerdict {
     }
 
     let upper = trimmed.to_uppercase();
-    if upper.contains("VERDICT: MET") || upper.contains("\"MET\"") {
+    if upper.contains("VERDICT: MET") {
         EvaluatorVerdict::Met {
             reason: trimmed.chars().take(400).collect(),
         }
@@ -293,14 +293,24 @@ pub async fn evaluate_transcript(
     });
 
     let mut collected = String::new();
+    let mut stream_err: Option<String> = None;
     while let Some(evt) = rx.recv().await {
-        if let StreamEvent::ContentDelta { delta } = evt {
-            collected.push_str(&delta);
+        match evt {
+            StreamEvent::ContentDelta { delta } => collected.push_str(&delta),
+            StreamEvent::Error { error } => stream_err = Some(error),
+            _ => {}
         }
     }
 
     match join.await {
-        Ok(Ok(())) => Ok(parse_evaluator_verdict(&collected)),
+        Ok(Ok(())) => {
+            if let Some(e) = stream_err {
+                if collected.trim().is_empty() {
+                    return Err(e);
+                }
+            }
+            Ok(parse_evaluator_verdict(&collected))
+        }
         Ok(Err(e)) => Err(e.to_string()),
         Err(e) => Err(e.to_string()),
     }

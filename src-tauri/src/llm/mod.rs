@@ -118,6 +118,38 @@ pub enum StreamEvent {
     },
 }
 
+pub fn drain_valid_utf8(raw_buf: &mut Vec<u8>, out: &mut String) {
+    loop {
+        if raw_buf.is_empty() {
+            break;
+        }
+        match std::str::from_utf8(raw_buf) {
+            Ok(s) => {
+                out.push_str(s);
+                raw_buf.clear();
+                break;
+            }
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                if valid_up_to > 0 {
+                    if let Ok(valid) = std::str::from_utf8(&raw_buf[..valid_up_to]) {
+                        out.push_str(valid);
+                    }
+                    raw_buf.drain(..valid_up_to);
+                }
+                match err.error_len() {
+                    Some(invalid_len) => {
+                        out.push('\u{FFFD}');
+                        let drop_n = invalid_len.min(raw_buf.len());
+                        raw_buf.drain(..drop_n);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LlmError {
     #[error("Network error: {}", crate::error::format_reqwest_error(.0))]

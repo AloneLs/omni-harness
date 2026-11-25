@@ -12,8 +12,15 @@ impl PromptBuilder {
         model_id: Option<&str>,
     ) -> String {
         let mut prompt = String::with_capacity(12288);
-        let norm_ws = workspace_path.replace('\\', "/").to_ascii_lowercase();
-        let is_full_pc = norm_ws.contains("/workspace/") || norm_ws.ends_with("/workspace");
+        let norm_ws = workspace_path.replace('\\', "/").trim_end_matches('/').to_ascii_lowercase();
+        let install_ws = crate::state::AppState::resolve_install_workspace()
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        let is_full_pc = norm_ws.is_empty()
+            || norm_ws == install_ws
+            || norm_ws.starts_with(&format!("{}/", install_ws));
 
         prompt.push_str("Environment: OmniHarness (Omni Harness) — Windows Desktop & Telegram AI-Agent Harness.\n");
         if let Some(mid) = model_id.map(|m| m.trim()).filter(|m| !m.is_empty()) {

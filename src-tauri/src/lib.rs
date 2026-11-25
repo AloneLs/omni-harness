@@ -324,6 +324,9 @@ async fn update_chat_pinned(
 
 #[tauri::command]
 async fn delete_chat(state: State<'_, AppManagedState>, id: String) -> Result<(), String> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("Invalid chat id".to_string());
+    }
     let _ = state.stream_mgr.cancel_session(&id).await;
     let _ = state.tool_dispatcher.pty_manager.kill_all_for_chat(&id);
     let chat_ws = state::AppState::resolve_install_workspace().join(&id);
@@ -343,7 +346,9 @@ async fn delete_chat(state: State<'_, AppManagedState>, id: String) -> Result<()
 
 #[tauri::command]
 async fn read_file_full(path: String) -> Result<String, String> {
-    tokio::task::spawn_blocking(move || std::fs::read_to_string(&path).map_err(|e| e.to_string()))
+    let target = std::path::PathBuf::from(&path);
+    tools::safety::SecretShield::check_path(&target)?;
+    tokio::task::spawn_blocking(move || std::fs::read_to_string(&target).map_err(|e| e.to_string()))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -954,6 +959,152 @@ async fn get_total_memory_tokens(state: State<'_, AppManagedState>) -> Result<i6
         .db
         .get_total_memory_tokens()
         .map_err(|e| e.to_string())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactMemoryResult {
+    pruned_count: usize,
+    saved_tokens: i64,
+}
+
+#[tauri::command]
+async fn compact_memory_entries(
+    state: State<'_, AppManagedState>,
+    max_tokens: i64,
+) -> Result<CompactMemoryResult, String> {
+    let (pruned_count, saved_tokens) = state
+        .app_state
+        .db
+        .compact_memory_entries(max_tokens)
+        .map_err(|e| e.to_string())?;
+    Ok(CompactMemoryResult {
+        pruned_count,
+        saved_tokens,
+    })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceFileEntry {
+    path: String,
+    name: String,
+    is_directory: bool,
+    size: Option<u64>,
+    extension: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceSearchResult {
+    path: String,
+    name: String,
+    match_line: Option<usize>,
+    match_snippet: Option<String>,
+    is_directory: bool,
+}
+
+#[tauri::command]
+async fn list_workspace_files(path: String) -> Result<Vec<WorkspaceFileEntry>, String> {
+    tokio::task::spawn_blocking(move || {
+        let root = std::path::PathBuf::from(&path);
+        if !root.is_dir() {
+            return Ok(Vec::new());
+        }
+        let mut entries = Vec::new();
+        let walker = ignore::WalkBuilder::new(&root)
+            .max_depth(Some(4))
+            .hidden(false)
+            .filter_entry(|e| {
+                let n = e.file_name().to_string_lossy();
+                n != ".git" && n != "node_modules" && n != "target"
+            })
+            .build();
+        for entry in walker.flatten() {
+            let p = entry.path();
+            if p == root || tools::safety::SecretShield::check_path(p).is_err() {
+                continue;
+            }
+            let is_directory = p.is_dir();
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            let size = if is_directory {
+                None
+            } else {
+                entry.metadata().ok().map(|m| m.len())
+            };
+            let extension = if is_directory {
+                None
+            } else {
+                p.extension().and_then(|e| e.to_str()).map(|s| s.to_string())
+            };
+            entries.push(WorkspaceFileEntry {
+                path: p.to_string_lossy().to_string(),
+                name,
+                is_directory,
+                size,
+                extension,
+            });
+            if entries.len() >= 1000 {
+                break;
+            }
+        }
+        Ok(entries)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn search_workspace_files(
+    path: String,
+    query: String,
+) -> Result<Vec<WorkspaceSearchResult>, String> {
+    tokio::task::spawn_blocking(move || {
+        let root = std::path::PathBuf::from(&path);
+        let q = query.trim().to_lowercase();
+        if !root.is_dir() || q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::new();
+        let walker = ignore::WalkBuilder::new(&root)
+            .max_depth(Some(6))
+            .hidden(false)
+            .filter_entry(|e| {
+                let n = e.file_name().to_string_lossy();
+                n != ".git" && n != "node_modules" && n != "target"
+            })
+            .build();
+        for entry in walker.flatten() {
+            let p = entry.path();
+            if p == root || tools::safety::SecretShield::check_path(p).is_err() {
+                continue;
+            }
+            let name = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            if name.to_lowercase().contains(&q) {
+                results.push(WorkspaceSearchResult {
+                    path: p.to_string_lossy().to_string(),
+                    name,
+                    match_line: None,
+                    match_snippet: None,
+                    is_directory: p.is_dir(),
+                });
+                if results.len() >= 200 {
+                    break;
+                }
+            }
+        }
+        Ok(results)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -3445,6 +3596,21 @@ pub fn run() {
                     "quit" => {
                         let st = app.state::<AppManagedState>();
                         let _ = st.tool_dispatcher.pty_manager.kill_all();
+                        let tg = st.telegram_mgr.clone();
+                        let mcp = st.mcp_catalog.clone();
+                        let _ = std::thread::spawn(move || {
+                            tauri::async_runtime::block_on(async move {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(2),
+                                    async {
+                                        tg.stop().await;
+                                        mcp.disconnect_all().await;
+                                    },
+                                )
+                                .await;
+                            });
+                        })
+                        .join();
                         let _ = tools::phantom_session::restore_all_staged_windows(true);
                         app.exit(0);
                     }
@@ -3490,6 +3656,7 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.hide();
                 } else {
+                    let _ = state.tool_dispatcher.pty_manager.kill_all();
                     let _ = tools::phantom_session::restore_all_staged_windows(true);
                 }
             }
@@ -3554,6 +3721,9 @@ pub fn run() {
             delete_memory_entry,
             search_memory_entries,
             get_total_memory_tokens,
+            compact_memory_entries,
+            list_workspace_files,
+            search_workspace_files,
             sync_chat_context,
             get_cached_chat_messages,
             get_bootstrap_config,

@@ -622,7 +622,7 @@ pub fn apply_single_edit_cascade(
             if !tok_hits.is_empty() {
                 let targets: &[(usize, usize)] = if replace_all { &tok_hits } else { &tok_hits[..1] };
                 let mut patched = clean_s.clone();
-                let trimmed_new = clean_n.trim();
+                let trimmed_new = clean_n.trim_matches(['\r', '\n']);
                 for &(b_start, b_end) in targets.iter().rev() {
                     patched.replace_range(b_start..b_end, trimmed_new);
                 }

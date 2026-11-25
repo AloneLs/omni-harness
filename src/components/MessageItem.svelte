@@ -479,7 +479,7 @@ function handleContainerClick(event: MouseEvent) {
           <div
             data-omni-message-bubble=""
             bind:this={userBoxEl}
-            style={isLongUserMessage ? `max-height: ${isUserExpanded ? (userFullHeight || 'none') : '132px'};` : undefined}
+            style={isLongUserMessage ? `max-height: ${isUserExpanded ? (userFullHeight ? `${userFullHeight}px` : 'none') : '132px'};` : undefined}
             class="max-w-[78%] rounded-[12px] bg-[#1E1E22] border border-white/[0.07] px-3.5 pt-2 font-sans text-[13.5px] text-[#EDEDEF] leading-relaxed select-text relative transition-[max-height] duration-200 ease-out overflow-hidden {isLongUserMessage && !isUserExpanded ? 'pb-5' : 'pb-2'}">
             <span class="whitespace-pre-wrap">{message.content}</span>
             {#if isLongUserMessage && !isUserExpanded}

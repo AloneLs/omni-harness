@@ -166,9 +166,12 @@ export function renderMarkdown(content: string): string {
     return `\u0000SLOT_${idx}\u0000`;
   };
 
-  let text = content.replace(/\r\n/g, '\n');
+  let text = content.replace(/\r\n/g, '\n').replace(/\u0000/g, '');
 
-  text = text.replace(/<div class="interactive-viz-mount[^>]*><\/div>/g, (m) => hold(m));
+  text = text.replace(
+    /<div class="interactive-viz-mount my-4" data-viz-id="(viz-[\w-]+)" data-viz-title="([^"]*)"><\/div>/g,
+    (_, id, title) => hold(`<div class="interactive-viz-mount my-4" data-viz-id="${escapeHtml(id)}" data-viz-title="${escapeHtml(title)}"></div>`)
+  );
 
   const renderCodeBlockHtml = (rawLang: string, code: string): string => {
     const lang = (rawLang || '').trim().toLowerCase() || 'text';

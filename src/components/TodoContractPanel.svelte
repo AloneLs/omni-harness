@@ -57,7 +57,7 @@ let {
   initialTodos?: TodoItem[];
   contract?: TaskContract | null;
   files?: ModifiedFile[];
-  onRollback?: (path: string) => void;
+  onRollback?: (snapshotId: string) => void;
 } = $props();
 
 let activeTab = $state<'todos' | 'goals' | 'files'>('todos');
@@ -194,12 +194,11 @@ async function rollbackFile(file: ModifiedFile) {
   rollbackError = null;
   try {
     await invoke('rollback_file_snapshot', {
-      path: file.path,
       snapshotId: file.lastSnapshotId
     });
     modifiedFiles = modifiedFiles.filter((f) => f.id !== file.id);
     rollbackMessage = `Successfully restored snapshot for ${file.path}`;
-    onRollback(file.path);
+    onRollback(file.lastSnapshotId);
   } catch (err: unknown) {
     rollbackError = `Rollback failed: ${err instanceof Error ? err.message : String(err)}`;
   }

@@ -1363,6 +1363,9 @@ impl PtyManager {
     }
 
     pub fn kill_all_for_chat(&self, chat_id: &str) -> Result<(), String> {
+        if chat_id.trim().is_empty() {
+            return Ok(());
+        }
         if let Ok(mut tasks) = self.tasks.write() {
             let tids: Vec<String> = tasks
                 .iter()

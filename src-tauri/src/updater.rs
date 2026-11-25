@@ -38,6 +38,9 @@ fn validate_update_url(raw_url: &str) -> Result<url::Url, String> {
     if !ALLOWED_UPDATE_HOSTS.contains(&host.as_str()) {
         return Err(format!("Untrusted update host: {}", host));
     }
+    if host == "github.com" && !parsed.path().starts_with(&format!("/{}/", GITHUB_REPO)) {
+        return Err("Update URL repository mismatch".to_string());
+    }
     Ok(parsed)
 }
 
@@ -90,10 +93,16 @@ pub async fn check_github_update(client: &reqwest::Client) -> Result<UpdateInfo,
             let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let dl = a.get("browser_download_url").and_then(|v| v.as_str()).unwrap_or("");
             let low = name.to_ascii_lowercase();
-            if !dl.is_empty() && (low.ends_with(".zip") || low.ends_with(".exe")) && validate_update_url(dl).is_ok() {
+            if !dl.is_empty()
+                && (low.ends_with(".zip") || low.ends_with(".exe"))
+                && (low.contains("win") || low.contains("x64"))
+                && !low.contains("linux")
+                && !low.contains("macos")
+                && validate_update_url(dl).is_ok()
+            {
                 chosen_name = Some(name.to_string());
                 chosen_url = Some(dl.to_string());
-                if low.contains("win64") || low.contains("x64") {
+                if low.contains("win64") || (low.contains("win") && low.contains("x64")) {
                     break;
                 }
             }
@@ -227,21 +236,22 @@ pub async fn install_github_update(
     #[cfg(target_os = "windows")]
     {
         let ps_script = stage_dir.join("apply_update.ps1");
+        let esc_ps = |s: &str| s.replace('\'', "''");
         let script_body = format!(
             "$pidToWait = {pid}\n\
             for ($i = 0; $i -lt 60; $i++) {{\n\
               if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) {{ break }}\n\
               Start-Sleep -Milliseconds 250\n\
             }}\n\
-            Copy-Item -Path \"{staged}\" -Destination \"{target_exe}\" -Force\n\
-            $dll = Join-Path \"{stage_dir}\" \"WebView2Loader.dll\"\n\
-            if (Test-Path $dll) {{ Copy-Item -Path $dll -Destination (Join-Path \"{target_dir}\" \"WebView2Loader.dll\") -Force }}\n\
-            Start-Process -FilePath \"{target_exe}\"\n",
+            Copy-Item -LiteralPath '{staged}' -Destination '{target_exe}' -Force\n\
+            $dll = Join-Path '{stage_dir}' 'WebView2Loader.dll'\n\
+            if (Test-Path -LiteralPath $dll) {{ Copy-Item -LiteralPath $dll -Destination (Join-Path '{target_dir}' 'WebView2Loader.dll') -Force }}\n\
+            Start-Process -FilePath '{target_exe}'\n",
             pid = pid,
-            staged = staged_exe.to_string_lossy().replace('"', "`\""),
-            target_exe = current_exe.to_string_lossy().replace('"', "`\""),
-            stage_dir = stage_dir.to_string_lossy().replace('"', "`\""),
-            target_dir = target_dir.to_string_lossy().replace('"', "`\""),
+            staged = esc_ps(&staged_exe.to_string_lossy()),
+            target_exe = esc_ps(&current_exe.to_string_lossy()),
+            stage_dir = esc_ps(&stage_dir.to_string_lossy()),
+            target_dir = esc_ps(&target_dir.to_string_lossy()),
         );
         std::fs::write(&ps_script, script_body).map_err(|e| e.to_string())?;
         std::process::Command::new("powershell")

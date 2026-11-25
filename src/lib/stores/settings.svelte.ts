@@ -647,9 +647,16 @@ class SettingsStore {
     return this.saveChain;
   }
 
+  private pendingSaveResolvers: Array<() => void> = [];
+
+  private flushSaveResolvers(): void {
+    const list = this.pendingSaveResolvers.splice(0);
+    for (const r of list) r();
+  }
+
   public async saveSettings(immediate = false): Promise<void> {
-    if (!this.diskLoaded) return;
     this.mutationVersion++;
+    if (!this.diskLoaded) return;
     if (typeof localStorage !== 'undefined') {
       try {
         localStorage.setItem('omni_settings', JSON.stringify($state.snapshot(this.data)));
@@ -661,12 +668,14 @@ class SettingsStore {
     }
     if (immediate) {
       await this.enqueueDiskSave();
+      this.flushSaveResolvers();
       return;
     }
     await new Promise<void>((resolve) => {
+      this.pendingSaveResolvers.push(resolve);
       this.saveTimer = setTimeout(() => {
         this.saveTimer = null;
-        this.enqueueDiskSave().finally(resolve);
+        this.enqueueDiskSave().finally(() => this.flushSaveResolvers());
       }, 220);
     });
   }
@@ -676,7 +685,7 @@ class SettingsStore {
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
-      void this.enqueueDiskSave();
+      void this.enqueueDiskSave().finally(() => this.flushSaveResolvers());
     }
   }
 

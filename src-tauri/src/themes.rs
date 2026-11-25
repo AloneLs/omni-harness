@@ -16,6 +16,10 @@ pub struct OmniTheme {
     #[serde(default)]
     pub css: String,
     #[serde(default)]
+    pub raw_css: String,
+    #[serde(default)]
+    pub custom_js: String,
+    #[serde(default)]
     pub icon_overrides: HashMap<String, String>,
     #[serde(default)]
     pub text_overrides: HashMap<String, String>,

@@ -239,6 +239,12 @@ class OmniBridge {
     this.widgets.delete(widgetId);
   }
 
+  registerCleanup(fn: () => void) {
+    if (typeof fn === 'function') {
+      this.scriptCleanupFns.push(fn);
+    }
+  }
+
   cleanupCustomScripts() {
     while (this.scriptCleanupFns.length > 0) {
       const fn = this.scriptCleanupFns.pop();
@@ -304,9 +310,15 @@ class OmniBridge {
         opacity: 1 !important;
       }
       [data-omni-titlebar] {
+        display: flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
         pointer-events: auto !important;
       }
       [data-omni-settings-modal] {
+        display: flex !important;
+        visibility: visible !important;
+        opacity: 1 !important;
         pointer-events: auto !important;
       }
     `;
