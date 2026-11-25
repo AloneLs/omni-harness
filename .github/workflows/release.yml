@@ -4,12 +4,13 @@ on:
   push:
     tags:
       - 'v*'
+      - '[0-9]*'
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release tag name (e.g. v1.0.0)'
+        description: 'Release tag name (empty = auto 1.0.7-<run_number>-alpha)'
         required: false
-        default: 'v1.0.6'
+        default: ''
       draft:
         description: 'Create draft release'
         required: false
@@ -19,7 +20,7 @@ on:
         description: 'Mark as prerelease'
         required: false
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write
@@ -62,19 +63,53 @@ jobs:
       - name: Svelte Typecheck
         run: npm run check
 
+      - name: Prepare Release Version
+        shell: powershell
+        run: |
+          $rawInput = "${{ inputs.tag_name }}".Trim()
+          $ver = if ("${{ github.ref_type }}" -eq "tag") {
+            "${{ github.ref_name }}"
+          } elseif ($rawInput) {
+            $rawInput
+          } else {
+            "1.0.7-${{ github.run_number }}-alpha"
+          }
+
+          $pkgVer = $ver -replace '^[vV]', ''
+          $isPrerelease = if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            "${{ inputs.prerelease }}"
+          } elseif ($ver -match '(?i)(alpha|beta|rc)') {
+            "true"
+          } else {
+            "false"
+          }
+
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+          $pkgPath = Join-Path $PWD "package.json"
+          $pkg = [System.IO.File]::ReadAllText($pkgPath) | ConvertFrom-Json
+          $pkg.version = $pkgVer
+          [System.IO.File]::WriteAllText($pkgPath, ($pkg | ConvertTo-Json -Depth 100), $utf8NoBom)
+
+          $tauriPath = Join-Path $PWD "src-tauri\tauri.conf.json"
+          $tauriConf = [System.IO.File]::ReadAllText($tauriPath) | ConvertFrom-Json
+          $tauriConf.version = $pkgVer
+          [System.IO.File]::WriteAllText($tauriPath, ($tauriConf | ConvertTo-Json -Depth 100), $utf8NoBom)
+
+          $cargoPath = Join-Path $PWD "src-tauri\Cargo.toml"
+          $cargoToml = [System.IO.File]::ReadAllText($cargoPath)
+          $cargoToml = [regex]::Replace($cargoToml, '(?m)^version\s*=\s*"[^"]+"', "version = `"$pkgVer`"", 1)
+          [System.IO.File]::WriteAllText($cargoPath, $cargoToml, $utf8NoBom)
+
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "RELEASE_VERSION=$ver`nIS_PRERELEASE=$isPrerelease`n", $utf8NoBom)
+
       - name: Build Tauri Release Binary
         run: npx tauri build
 
       - name: Package Release Artifacts (EXE + DLL + Docs)
         shell: powershell
         run: |
-          $ver = if ("${{ github.ref_type }}" -eq "tag") {
-            "${{ github.ref_name }}"
-          } elseif ("${{ inputs.tag_name }}") {
-            "${{ inputs.tag_name }}"
-          } else {
-            "v1.0.0"
-          }
+          $ver = $env:RELEASE_VERSION
 
           $pkgDir = "OmniHarness-$ver-win64"
           New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
@@ -114,15 +149,15 @@ jobs:
           $hashDll  WebView2Loader.dll
           $hashZip  $zipFile
           "@
-          Set-Content -Path "checksums.txt" -Value $checksums -Encoding utf8
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText((Join-Path $PWD "checksums.txt"), "$checksums`n", $utf8NoBom)
 
           Write-Output "Artifacts ready:"
           Get-ChildItem -Path $pkgDir
           Write-Output "Archive created: $zipFile"
           Get-Content "checksums.txt"
 
-          "RELEASE_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "ZIP_PATH=$zipFile" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "ZIP_PATH=$zipFile`n", $utf8NoBom)
 
       - name: Upload Build Artifacts (Actions Storage)
         uses: actions/upload-artifact@v4
@@ -137,12 +172,12 @@ jobs:
 
       - name: Create or Update GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           tag_name: ${{ env.RELEASE_VERSION }}
           name: OmniHarness ${{ env.RELEASE_VERSION }}
           draft: ${{ inputs.draft || false }}
-          prerelease: ${{ inputs.prerelease || false }}
+          prerelease: ${{ env.IS_PRERELEASE == 'true' }}
           generate_release_notes: true
           files: |
             ${{ env.ZIP_PATH }}
