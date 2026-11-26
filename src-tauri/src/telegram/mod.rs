@@ -3751,6 +3751,14 @@ async fn run_telegram_agent_turn(
                         );
                     }
                 }
+                crate::llm::StreamEvent::TaskBoardUpdated { items } => {
+                    if let Some(ref app) = stream_app_ev {
+                        let _ = app.emit(
+                            "telegram-chat-stream",
+                            json!({ "chatId": stream_chat_id, "type": "task_board_updated", "items": items }),
+                        );
+                    }
+                }
                 crate::llm::StreamEvent::Error { error } => {
                     if let Some(ref app) = stream_app_ev {
                         let _ = app.emit(

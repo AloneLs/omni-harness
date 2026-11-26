@@ -53,17 +53,19 @@ $effect(() => {
         onclick={() => (collapsed = !collapsed)}
       >
         <div class="flex items-center gap-2 min-w-0">
-          {#if doneCount < todos.length && chatStore.isStreaming}
-            <svg class="w-3.5 h-3.5 text-[#EDEDEF] animate-spin shrink-0" viewBox="0 0 24 24" fill="none">
-              <circle class="opacity-20" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2.2"></circle>
-              <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
-            </svg>
-          {:else if todos.length > 0 && doneCount === todos.length}
-            <span in:scale={{ start: 0.5, duration: 180 }} class="w-3.5 h-3.5 rounded-full bg-[#6EE7B7]/20 text-[#6EE7B7] flex items-center justify-center shrink-0">
-              <Icon name="check" class="w-2.5 h-2.5" strokeWidth={2.5} />
-            </span>
-          {:else}
-            <span class="w-2 h-2 rounded-full bg-[#A3A3AA] shrink-0"></span>
+          {#if collapsed}
+            {#if doneCount < todos.length && chatStore.isStreaming}
+              <svg class="w-3.5 h-3.5 text-[#EDEDEF] animate-spin shrink-0" viewBox="0 0 24 24" fill="none">
+                <circle class="opacity-20" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2.2"></circle>
+                <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
+              </svg>
+            {:else if todos.length > 0 && doneCount === todos.length}
+              <span class="w-3.5 h-3.5 rounded-full bg-[#6EE7B7]/20 text-[#6EE7B7] flex items-center justify-center shrink-0">
+                <Icon name="check" class="w-2.5 h-2.5" strokeWidth={2.5} />
+              </span>
+            {:else}
+              <span class="w-2 h-2 rounded-full bg-[#A3A3AA] shrink-0"></span>
+            {/if}
           {/if}
           <span class="text-xs font-medium text-[#EDEDEF] truncate">Tasks</span>
         </div>

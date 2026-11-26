@@ -1050,6 +1050,17 @@ class ChatStore {
       });
       return;
     }
+    if (evtType === 'task_board_updated') {
+      if (this.todoHideTimers[chatId]) {
+        clearTimeout(this.todoHideTimers[chatId]);
+        delete this.todoHideTimers[chatId];
+      }
+      const nextTodos = Array.isArray(payload?.items) ? payload.items.map((t: TodoBoardItem) => ({ ...t })) : [];
+      msg.todos = nextTodos.map((t: TodoBoardItem) => ({ ...t }));
+      this.todosByChat[chatId] = nextTodos;
+      this.saveLocalOnly(chatId);
+      return;
+    }
     if (evtType === 'retry') {
       msg.statusText = `Reconnecting (attempt ${payload?.attempt || 1})...`;
       msg.retryReason = payload?.reason;
@@ -1082,6 +1093,12 @@ class ChatStore {
       this.streamingChats[chatId] = false;
       if (sess && this.activeChatId !== chatId && !msg.error) {
         sess.hasUnreadCompletion = true;
+      }
+      const tgTodos = this.todosByChat[chatId] || [];
+      if (tgTodos.length > 0 && tgTodos.every((t) => t.status === 'completed')) {
+        this.todoHideTimers[chatId] = setTimeout(() => {
+          this.todosByChat[chatId] = [];
+        }, 3500);
       }
       this.saveLocalOnly(chatId);
     }
