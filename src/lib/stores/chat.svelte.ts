@@ -165,6 +165,7 @@ class ChatStore {
   private reasoningTimers: Record<string, number> = {};
   private resolveByChat: Record<string, (() => void) | null> = {};
   private streamSaveTimers: Record<string, number> = {};
+  private lastDbStreamSyncAt: Record<string, number> = {};
   private pendingTextByChat: Record<string, string> = {};
   private turnSnapshotByChat: Record<string, { contentLen: number; reasoningLen: number; stepsLen: number; toolsLen: number }> = {};
   private pendingReasoningByChat: Record<string, string> = {};
@@ -463,7 +464,7 @@ class ChatStore {
   }
 
   private buildRichSyncPayload(msgs: ChatMessage[]): any[] {
-    return this.compactMessagesForStorage(msgs).map((m) => ({
+    return this.compactMessagesForStorage(msgs, true).map((m) => ({
       id: m.id,
       chatId: m.chatId,
       role: m.role,
@@ -1321,9 +1322,13 @@ class ChatStore {
     } catch {}
   }
 
-  private compactMessagesForStorage(msgs: ChatMessage[]): ChatMessage[] {
+  private compactMessagesForStorage(msgs: ChatMessage[], forDb = false): ChatMessage[] {
+    const recentOutLimit = forDb ? 16000 : 4000;
+    const oldOutLimit = forDb ? 4000 : 800;
+    const oldReasonLimit = forDb ? 8000 : 1000;
     return msgs.map((m, idx) => {
       const isRecent = idx >= msgs.length - 6;
+      const outLimit = isRecent ? recentOutLimit : oldOutLimit;
       const compactedAttachments = m.attachments?.map((a) => ({
         id: a.id,
         name: a.name,
@@ -1333,14 +1338,14 @@ class ChatStore {
       }));
       const compactedTools = m.toolCalls?.map((tc) => ({
         ...tc,
-        output: tc.output && tc.output.length > (isRecent ? 4000 : 800)
-          ? tc.output.slice(0, isRecent ? 4000 : 800) + '...'
+        output: tc.output && tc.output.length > outLimit
+          ? tc.output.slice(0, outLimit) + '...'
           : tc.output,
         terminalData: tc.terminalData
           ? {
               ...tc.terminalData,
-              stdout: tc.terminalData.stdout && tc.terminalData.stdout.length > (isRecent ? 4000 : 800)
-                ? tc.terminalData.stdout.slice(0, isRecent ? 4000 : 800) + '...'
+              stdout: tc.terminalData.stdout && tc.terminalData.stdout.length > outLimit
+                ? tc.terminalData.stdout.slice(0, outLimit) + '...'
                 : tc.terminalData.stdout
             }
           : undefined
@@ -1351,14 +1356,14 @@ class ChatStore {
           kind: 'tool' as const,
           record: {
             ...s.record,
-            output: s.record.output && s.record.output.length > (isRecent ? 4000 : 800)
-              ? s.record.output.slice(0, isRecent ? 4000 : 800) + '...'
+            output: s.record.output && s.record.output.length > outLimit
+              ? s.record.output.slice(0, outLimit) + '...'
               : s.record.output,
             terminalData: s.record.terminalData
               ? {
                   ...s.record.terminalData,
-                  stdout: s.record.terminalData.stdout && s.record.terminalData.stdout.length > (isRecent ? 4000 : 800)
-                    ? s.record.terminalData.stdout.slice(0, isRecent ? 4000 : 800) + '...'
+                  stdout: s.record.terminalData.stdout && s.record.terminalData.stdout.length > outLimit
+                    ? s.record.terminalData.stdout.slice(0, outLimit) + '...'
                     : s.record.terminalData.stdout
                 }
               : undefined
@@ -1370,8 +1375,8 @@ class ChatStore {
         attachments: compactedAttachments,
         toolCalls: compactedTools,
         steps: compactedSteps,
-        reasoningContent: !isRecent && m.reasoningContent && m.reasoningContent.length > 1000
-          ? m.reasoningContent.slice(0, 1000) + '...'
+        reasoningContent: !isRecent && m.reasoningContent && m.reasoningContent.length > oldReasonLimit
+          ? m.reasoningContent.slice(0, oldReasonLimit) + '...'
           : m.reasoningContent
       };
     });
@@ -1433,7 +1438,9 @@ class ChatStore {
   }
 
   private persistPendingQueues(): void {
-    this.safeSetStorage('omni_pending_queues', JSON.stringify($state.snapshot(this.pendingQueueByChat)));
+    const json = JSON.stringify($state.snapshot(this.pendingQueueByChat));
+    this.safeSetStorage('omni_pending_queues', json);
+    invoke('save_ui_pending_queues', { queuesJson: json }).catch(() => {});
   }
 
   private getDraftKey(chatId: string | null): string {
@@ -1509,6 +1516,23 @@ class ChatStore {
           }
         }
       } catch {}
+      invoke<string | null>('load_ui_pending_queues')
+        .then((dbRaw) => {
+          if (!dbRaw) return;
+          const dbQueues = JSON.parse(dbRaw);
+          if (!dbQueues || typeof dbQueues !== 'object') return;
+          let merged = false;
+          for (const [k, arr] of Object.entries(dbQueues)) {
+            if (Array.isArray(arr) && arr.length > 0 && (!this.pendingQueueByChat[k] || this.pendingQueueByChat[k].length === 0)) {
+              this.pendingQueueByChat[k] = arr as PendingQueueItem[];
+              merged = true;
+            }
+          }
+          if (merged) {
+            this.safeSetStorage('omni_pending_queues', JSON.stringify($state.snapshot(this.pendingQueueByChat)));
+          }
+        })
+        .catch(() => {});
       const saved = localStorage.getItem('omni_chat_sessions');
       if (saved) {
         try {
@@ -1540,7 +1564,7 @@ class ChatStore {
     } catch {}
   }
 
-  public async saveSessions(targetChatId?: string, syncBackend = true): Promise<void> {
+  public async saveSessions(targetChatId?: string, syncBackend = true, streamingOnly = false): Promise<void> {
     const cid = targetChatId || this.activeChatId;
     this.saveLocalOnly(cid || undefined);
     if (syncBackend && cid) {
@@ -1552,7 +1576,8 @@ class ChatStore {
           messagesJson: JSON.stringify(this.buildRichSyncPayload($state.snapshot(this.messagesByChat[cid]))),
           projectPath: sess.projectPath || null,
           modelId: sess.modelId || settingsStore.data.activeModel || null,
-          isPinned: Boolean(sess.pinned)
+          isPinned: Boolean(sess.pinned),
+          streamingOnly
         };
         const prev = this.saveChainByChat[cid] || Promise.resolve();
         const next = prev
@@ -1562,6 +1587,14 @@ class ChatStore {
         await next;
       }
     }
+  }
+
+  private syncStreamingCheckpointToDb(chatId: string, minIntervalMs = 5000): void {
+    if (this.disposed) return;
+    const now = Date.now();
+    if (now - (this.lastDbStreamSyncAt[chatId] || 0) < minIntervalMs) return;
+    this.lastDbStreamSyncAt[chatId] = now;
+    void this.saveSessions(chatId, true, true);
   }
 
   private finalizeRunningTools(
@@ -1603,14 +1636,16 @@ class ChatStore {
     this.streamSaveTimers[chatId] = window.setTimeout(() => {
       delete this.streamSaveTimers[chatId];
       const runSave = () => {
-        if (!this.disposed) this.saveLocalOnly(chatId);
+        if (this.disposed) return;
+        this.saveLocalOnly(chatId);
+        this.syncStreamingCheckpointToDb(chatId, 12000);
       };
       if (typeof window !== 'undefined' && 'requestIdleCallback' in window) {
         (window as Window & { requestIdleCallback: (cb: () => void, opts?: { timeout: number }) => number }).requestIdleCallback(runSave, { timeout: 2500 });
       } else {
         runSave();
       }
-    }, 20000);
+    }, 15000);
   }
 
   private takeSmoothSlice(buf: string): [string, string] {
@@ -1812,6 +1847,61 @@ class ChatStore {
     return id;
   }
 
+  private scoreMessageList(msgs: ChatMessage[]): number {
+    if (!Array.isArray(msgs) || msgs.length === 0) return 0;
+    let score = msgs.length * 100000;
+    for (const m of msgs) {
+      score += (m.content?.length || 0) + (m.reasoningContent?.length || 0);
+      score += (m.steps?.length || 0) * 500 + (m.toolCalls?.length || 0) * 500;
+    }
+    return score;
+  }
+
+  private hydrateSnapshotMessages(chatId: string, parsed: any[]): ChatMessage[] {
+    const hydrated: ChatMessage[] = parsed.map((m: any, idx: number) => ({
+      id: m.id || `cached-${idx}-${Date.now()}`,
+      chatId,
+      role: m.role || 'assistant',
+      content: typeof m.content === 'string' ? m.content : '',
+      modelId: m.modelId,
+      attachments: m.attachments,
+      reasoningContent: m.reasoningContent,
+      toolCalls: m.toolCalls,
+      steps: m.steps,
+      todos: m.todos,
+      statusText: m.statusText,
+      startedAt: m.startedAt,
+      finishedAt: m.finishedAt,
+      error: m.error,
+      streaming: Boolean(m.streaming),
+      paused: Boolean(m.paused),
+      tokenUsage: m.tokenUsage,
+      createdAt: typeof m.createdAt === 'number' ? m.createdAt : Date.now()
+    }));
+    return this.normalizeLoadedMessages(chatId, hydrated).msgs;
+  }
+
+  private async fetchRecoverySnapshot(chatId: string): Promise<{ msgs: ChatMessage[]; recovered: boolean } | null> {
+    try {
+      const snap = await invoke<{
+        title: string;
+        messagesJson: string;
+        updatedAt: string;
+        recoveredFromCheckpoint: boolean;
+      } | null>('get_chat_recovery_snapshot', { chatId });
+      if (snap && typeof snap.messagesJson === 'string' && snap.messagesJson.trim()) {
+        const parsed = JSON.parse(snap.messagesJson);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          return {
+            msgs: this.hydrateSnapshotMessages(chatId, parsed),
+            recovered: Boolean(snap.recoveredFromCheckpoint)
+          };
+        }
+      }
+    } catch {}
+    return null;
+  }
+
   public async selectSession(id: string): Promise<void> {
     if (this.activeChatId && this.activeChatId !== id) {
       const prevIdx = this.sessions.findIndex((s) => s.id === this.activeChatId);
@@ -1857,7 +1947,20 @@ class ChatStore {
               this.saveChatMessagesToStorage(id, msgs);
             }
             if (!session?.isDraft && !session?.isThemeStudio) {
-              void this.pullBackendChats(id);
+              this.fetchRecoverySnapshot(id)
+                .then((snap) => {
+                  if (!snap || this.streamingChats[id]) return;
+                  const cur = this.messagesByChat[id] || [];
+                  if (this.scoreMessageList(snap.msgs) > this.scoreMessageList(cur) + 20) {
+                    this.messagesByChat[id] = snap.msgs;
+                    this.saveChatMessagesToStorage(id, snap.msgs);
+                    if (snap.recovered) {
+                      void this.saveSessions(id, true, false);
+                    }
+                  }
+                })
+                .catch(() => {})
+                .finally(() => { void this.pullBackendChats(id); });
             }
             return;
           }
@@ -1866,40 +1969,16 @@ class ChatStore {
     }
 
     if (!session?.isDraft && !session?.isThemeStudio) {
-      try {
-        const cachedRes = await invoke<[string, string] | string | null>('get_cached_chat_messages', { chatId: id });
-        const rawJson = Array.isArray(cachedRes) ? cachedRes[1] : cachedRes;
-        if (typeof rawJson === 'string' && rawJson.trim()) {
-          const parsed = JSON.parse(rawJson);
-          if (Array.isArray(parsed) && parsed.length > 0) {
-            const hydrated: ChatMessage[] = parsed.map((m: any, idx: number) => ({
-              id: m.id || `cached-${idx}-${Date.now()}`,
-              chatId: id,
-              role: m.role || 'assistant',
-              content: typeof m.content === 'string' ? m.content : '',
-              modelId: m.modelId,
-              attachments: m.attachments,
-              reasoningContent: m.reasoningContent,
-              toolCalls: m.toolCalls,
-              steps: m.steps,
-              todos: m.todos,
-              statusText: m.statusText,
-              startedAt: m.startedAt,
-              finishedAt: m.finishedAt,
-              error: m.error,
-              streaming: Boolean(m.streaming),
-              paused: Boolean(m.paused),
-              tokenUsage: m.tokenUsage,
-              createdAt: typeof m.createdAt === 'number' ? m.createdAt : Date.now()
-            }));
-            const { msgs } = this.normalizeLoadedMessages(id, hydrated);
-            this.messagesByChat[id] = msgs;
-            this.saveChatMessagesToStorage(id, msgs);
-            void this.pullBackendChats(id);
-            return;
-          }
+      const snap = await this.fetchRecoverySnapshot(id);
+      if (snap && snap.msgs.length > 0) {
+        this.messagesByChat[id] = snap.msgs;
+        this.saveChatMessagesToStorage(id, snap.msgs);
+        if (snap.recovered) {
+          void this.saveSessions(id, true, false);
         }
-      } catch {}
+        void this.pullBackendChats(id);
+        return;
+      }
     }
 
     this.messagesByChat[id] = [];
@@ -2869,6 +2948,7 @@ class ChatStore {
         toolsLen: (currentAssistantMsg.toolCalls || []).length
       };
       this.saveLocalOnly(cid);
+      this.syncStreamingCheckpointToDb(cid, 5000);
     } else if (event.type === 'done') {
       currentAssistantMsg.imageGenerating = false;
       delete this.turnSnapshotByChat[cid];

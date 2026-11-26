@@ -1116,10 +1116,12 @@ async fn sync_chat_context(
     project_path: Option<String>,
     model_id: Option<String>,
     is_pinned: Option<bool>,
+    streaming_only: Option<bool>,
 ) -> Result<(), String> {
     let db = &state.app_state.db;
     db.sync_chat_context(&chat_id, &title, &messages_json)
         .map_err(|e| e.to_string())?;
+    let is_streaming = streaming_only.unwrap_or(false);
 
     let has_messages = serde_json::from_str::<Vec<serde_json::Value>>(&messages_json)
         .map(|v| !v.is_empty())
@@ -1222,11 +1224,14 @@ async fn sync_chat_context(
                     let _ = db.create_message(&msg);
                 }
             }
-        } else {
+        } else if !is_streaming {
             let _ = db.replace_chat_messages(&chat_id, &clean_pairs);
             let _ = db.delete_checkpoint(&format!("tg_ctx:{}", chat_id));
             let _ = db.delete_checkpoint(&format!("full_ctx:{}", chat_id));
         }
+    }
+    if is_streaming {
+        db.checkpoint_wal();
     }
     Ok(())
 }
@@ -1239,6 +1244,212 @@ async fn sync_workspaces_to_backend(
     state.telegram_mgr.sync_projects(workspaces).await
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatRecoverySnapshot {
+    title: String,
+    messages_json: String,
+    updated_at: String,
+    recovered_from_checkpoint: bool,
+}
+
+fn convert_checkpoint_to_ui_messages(
+    chat_id: &str,
+    checkpoint_json: &str,
+    cached_json: Option<&str>,
+    model_id: Option<&str>,
+) -> Option<String> {
+    let llm_msgs: Vec<llm::request_compat::ChatMessage> = serde_json::from_str(checkpoint_json).ok()?;
+    if llm_msgs.is_empty() {
+        return None;
+    }
+
+    let cached_arr: Vec<serde_json::Value> = cached_json
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+
+    let mut ui_msgs: Vec<serde_json::Value> = Vec::new();
+    let mut tool_results: std::collections::HashMap<String, (String, bool)> = std::collections::HashMap::new();
+    for m in &llm_msgs {
+        if m.role == "tool" {
+            if let Some(id) = &m.tool_call_id {
+                let text = m.content.as_text_lossy();
+                let is_err = text.starts_with("Error:") || text.contains("\"error\":");
+                tool_results.insert(id.clone(), (text, is_err));
+            }
+        }
+    }
+
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut active_assistant: Option<serde_json::Value> = None;
+
+    let flush_assistant = |acc: &mut Option<serde_json::Value>, out: &mut Vec<serde_json::Value>| {
+        if let Some(mut msg) = acc.take() {
+            let cached_match = cached_arr.get(out.len());
+            if let Some(cm) = cached_match {
+                if cm.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+                    if let Some(id) = cm.get("id").and_then(|v| v.as_str()) {
+                        msg["id"] = serde_json::Value::String(id.to_string());
+                    }
+                    if let Some(ca) = cm.get("createdAt").and_then(|v| v.as_i64()) {
+                        msg["createdAt"] = serde_json::json!(ca);
+                    }
+                }
+            }
+            out.push(msg);
+        }
+    };
+
+    for m in &llm_msgs {
+        if m.role == "system" || m.role == "tool" {
+            continue;
+        }
+        if m.role == "user" {
+            flush_assistant(&mut active_assistant, &mut ui_msgs);
+            let idx = ui_msgs.len();
+            let cached_match = cached_arr.get(idx);
+            let id = cached_match
+                .and_then(|cm| cm.get("id").and_then(|v| v.as_str()))
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("rec-u-{}", idx));
+            let created_at = cached_match
+                .and_then(|cm| cm.get("createdAt").and_then(|v| v.as_i64()))
+                .unwrap_or(now_ms);
+            let mut obj = serde_json::json!({
+                "id": id,
+                "chatId": chat_id,
+                "role": "user",
+                "content": m.content.as_text_lossy(),
+                "createdAt": created_at,
+                "streaming": false
+            });
+            if let Some(atts) = cached_match.and_then(|cm| cm.get("attachments")) {
+                obj["attachments"] = atts.clone();
+            }
+            ui_msgs.push(obj);
+            continue;
+        }
+        if m.role == "assistant" {
+            let entry = active_assistant.get_or_insert_with(|| {
+                serde_json::json!({
+                    "id": format!("rec-a-{}", ui_msgs.len()),
+                    "chatId": chat_id,
+                    "role": "assistant",
+                    "content": "",
+                    "modelId": model_id,
+                    "reasoningContent": "",
+                    "toolCalls": [],
+                    "steps": [],
+                    "streaming": false,
+                    "paused": false,
+                    "createdAt": now_ms
+                })
+            });
+
+            if let Some(r) = &m.reasoning_content {
+                if !r.trim().is_empty() {
+                    let prev_r = entry["reasoningContent"].as_str().unwrap_or("");
+                    let next_r = if prev_r.is_empty() {
+                        r.clone()
+                    } else {
+                        format!("{}\n\n{}", prev_r, r)
+                    };
+                    entry["reasoningContent"] = serde_json::Value::String(next_r);
+                    if let Some(steps) = entry["steps"].as_array_mut() {
+                        steps.push(serde_json::json!({
+                            "kind": "thought",
+                            "text": r,
+                            "startedAt": now_ms,
+                            "finishedAt": now_ms
+                        }));
+                    }
+                }
+            }
+
+            let msg_text = m.content.as_text_lossy();
+            if !msg_text.trim().is_empty() {
+                let has_tools = m.tool_calls.as_ref().map(|t| !t.is_empty()).unwrap_or(false);
+                if has_tools {
+                    if let Some(steps) = entry["steps"].as_array_mut() {
+                        steps.push(serde_json::json!({
+                            "kind": "message",
+                            "text": msg_text
+                        }));
+                    }
+                } else {
+                    let prev_c = entry["content"].as_str().unwrap_or("");
+                    let next_c = if prev_c.is_empty() {
+                        msg_text
+                    } else {
+                        format!("{}\n\n{}", prev_c, msg_text)
+                    };
+                    entry["content"] = serde_json::Value::String(next_c);
+                }
+            }
+
+            if let Some(tcs) = &m.tool_calls {
+                for tc in tcs {
+                    let (output, is_err) = tool_results
+                        .get(&tc.id)
+                        .cloned()
+                        .unwrap_or_else(|| (String::new(), false));
+                    let status = if tool_results.contains_key(&tc.id) {
+                        if is_err { "error" } else { "success" }
+                    } else {
+                        "paused"
+                    };
+                    let args_val: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                        .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
+                    let rec = serde_json::json!({
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "args": args_val,
+                        "rawArgs": tc.function.arguments,
+                        "status": status,
+                        "output": output,
+                        "startedAt": now_ms,
+                        "finishedAt": now_ms
+                    });
+                    if let Some(arr) = entry["toolCalls"].as_array_mut() {
+                        arr.push(rec.clone());
+                    }
+                    if let Some(steps) = entry["steps"].as_array_mut() {
+                        steps.push(serde_json::json!({
+                            "kind": "tool",
+                            "record": rec
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    flush_assistant(&mut active_assistant, &mut ui_msgs);
+    if let Some(last) = ui_msgs.last_mut() {
+        if last.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+            let has_paused_tool = last
+                .get("toolCalls")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().any(|tc| tc.get("status").and_then(|s| s.as_str()) == Some("paused")))
+                .unwrap_or(false);
+            let empty_content = last
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true);
+            if has_paused_tool || empty_content {
+                last["paused"] = serde_json::Value::Bool(true);
+            }
+        }
+    }
+
+    if ui_msgs.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&ui_msgs).ok()
+    }
+}
+
 #[tauri::command]
 async fn get_cached_chat_messages(
     state: State<'_, AppManagedState>,
@@ -1248,6 +1459,83 @@ async fn get_cached_chat_messages(
     tokio::task::spawn_blocking(move || db.get_cached_chat_messages(&chat_id).map_err(|e| e.to_string()))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_chat_recovery_snapshot(
+    state: State<'_, AppManagedState>,
+    chat_id: String,
+) -> Result<Option<ChatRecoverySnapshot>, String> {
+    let db = state.app_state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let cached = db.get_cached_chat_messages_with_ts(&chat_id).map_err(|e| e.to_string())?;
+        let full_ckpt = db
+            .load_checkpoint_with_ts(&format!("full_ctx:{}", chat_id))
+            .map_err(|e| e.to_string())?;
+        let chat_meta = db.get_chat(&chat_id).ok();
+
+        let cached_ts_ms = cached
+            .as_ref()
+            .and_then(|(_, _, ts)| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(0);
+        let ckpt_ts_ms = full_ckpt
+            .as_ref()
+            .and_then(|(_, ts)| chrono::DateTime::parse_from_rfc3339(ts).ok())
+            .map(|dt| dt.timestamp_millis())
+            .unwrap_or(0);
+
+        if let Some((ckpt_json, ckpt_ts)) = full_ckpt {
+            if cached.is_none() || ckpt_ts_ms > cached_ts_ms + 2000 {
+                let cached_json_ref = cached.as_ref().map(|(_, j, _)| j.as_str());
+                let model_id = chat_meta.as_ref().map(|c| c.model_id.as_str()).filter(|s| !s.is_empty());
+                if let Some(recovered_json) =
+                    convert_checkpoint_to_ui_messages(&chat_id, &ckpt_json, cached_json_ref, model_id)
+                {
+                    let title = cached
+                        .as_ref()
+                        .map(|(t, _, _)| t.clone())
+                        .or_else(|| chat_meta.as_ref().map(|c| c.title.clone()))
+                        .unwrap_or_else(|| chat_id.clone());
+                    return Ok(Some(ChatRecoverySnapshot {
+                        title,
+                        messages_json: recovered_json,
+                        updated_at: ckpt_ts,
+                        recovered_from_checkpoint: true,
+                    }));
+                }
+            }
+        }
+
+        if let Some((title, messages_json, updated_at)) = cached {
+            return Ok(Some(ChatRecoverySnapshot {
+                title,
+                messages_json,
+                updated_at,
+                recovered_from_checkpoint: false,
+            }));
+        }
+
+        Ok(None)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn save_ui_pending_queues(
+    state: State<'_, AppManagedState>,
+    queues_json: String,
+) -> Result<(), String> {
+    let db = &state.app_state.db;
+    db.save_checkpoint("ui_pending_queues", &queues_json)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn load_ui_pending_queues(state: State<'_, AppManagedState>) -> Result<Option<String>, String> {
+    let db = &state.app_state.db;
+    db.load_checkpoint("ui_pending_queues").map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3726,6 +4014,9 @@ pub fn run() {
             search_workspace_files,
             sync_chat_context,
             get_cached_chat_messages,
+            get_chat_recovery_snapshot,
+            save_ui_pending_queues,
+            load_ui_pending_queues,
             get_bootstrap_config,
             complete_first_run,
             get_workspace_dir,

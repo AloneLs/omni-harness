@@ -562,6 +562,17 @@ impl Database {
         Ok(out)
     }
 
+    pub fn load_checkpoint_with_ts(&self, chat_id: &str) -> Result<Option<(String, String)>, AppError> {
+        let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        let mut stmt = conn.prepare("SELECT history_json, updated_at FROM agent_checkpoints WHERE chat_id = ?1")?;
+        let mut rows = stmt.query([chat_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn get_cached_chat_messages(&self, chat_id: &str) -> Result<Option<(String, String)>, AppError> {
         let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
         let mut stmt = conn.prepare("SELECT title, messages_json FROM chat_context_cache WHERE chat_id = ?1")?;
@@ -570,6 +581,23 @@ impl Database {
             Ok(Some((row.get(0)?, row.get(1)?)))
         } else {
             Ok(None)
+        }
+    }
+
+    pub fn get_cached_chat_messages_with_ts(&self, chat_id: &str) -> Result<Option<(String, String, String)>, AppError> {
+        let conn = self.conn.lock().map_err(|e| AppError::Database(e.to_string()))?;
+        let mut stmt = conn.prepare("SELECT title, messages_json, updated_at FROM chat_context_cache WHERE chat_id = ?1")?;
+        let mut rows = stmt.query([chat_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn checkpoint_wal(&self) {
+        if let Ok(conn) = self.conn.lock() {
+            let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);");
         }
     }
 
