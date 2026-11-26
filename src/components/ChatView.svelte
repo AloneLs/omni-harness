@@ -266,7 +266,7 @@ $effect(() => {
     onwheel={handleUserWheel}
     ontouchmove={handleUserTouch}
     role="presentation"
-    class="flex-1 min-h-0 overflow-y-auto px-6 pt-2 pb-4"
+    class="flex-1 min-h-0 overflow-y-auto pl-9 pr-6 pt-2 pb-4"
   >
     {#if !isEmpty}
       {#key chatStore.activeChatId}

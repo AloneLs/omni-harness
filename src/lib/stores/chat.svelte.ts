@@ -103,6 +103,7 @@ export interface FilePreviewRequest {
   path: string;
   addedTexts?: string[];
   removedTexts?: string[];
+  fallbackContent?: string;
 }
 
 export interface TurnFileDiff {
@@ -552,8 +553,8 @@ class ChatStore {
     return Boolean(this.streamingChats[chatId]);
   }
 
-  public openFilePreview(path: string, addedTexts?: string[], removedTexts?: string[]): void {
-    this.filePreview = { path, addedTexts, removedTexts };
+  public openFilePreview(path: string, addedTexts?: string[], removedTexts?: string[], fallbackContent?: string): void {
+    this.filePreview = { path, addedTexts, removedTexts, fallbackContent };
   }
 
   public closeFilePreview(): void {

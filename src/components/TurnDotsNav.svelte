@@ -118,7 +118,7 @@ let hoveredTurn = $derived(hoveredIdx !== null ? turns[hoveredIdx] || null : nul
 {#if turns.length >= 2}
   <div
     bind:this={navContainerEl}
-    class="absolute left-3.5 top-1/2 -translate-y-1/2 z-30 flex items-center select-none"
+    class="absolute left-2 top-1/2 -translate-y-1/2 z-30 flex items-center select-none"
     onmouseleave={() => (hoveredIdx = null)}
     role="navigation"
     aria-label="Conversation turns"

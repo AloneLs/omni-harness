@@ -148,7 +148,6 @@ let activeSettingsTab = $state<
 >('providers');
 
 const launchSpring = new Spring({ opacity: 0, scale: 0.96, y: 10 }, SPRING_LAUNCH);
-const sidebarWidth = new Spring(240, SPRING_PANEL);
 const contractsWidth = new Spring(0, SPRING_PANEL);
 const settingsModalSpring = new Spring({ opacity: 0, scale: 0.96, y: 8 }, SPRING_POPUP);
 const navIndicator = new Spring({ y: 0, height: 34 }, { stiffness: 0.28, damping: 0.8 });
@@ -202,10 +201,6 @@ onMount(() => {
     window.removeEventListener('keydown', captureKeydown, { capture: true });
     window.removeEventListener('keyup', blockAltKeyup, { capture: true });
   };
-});
-
-$effect(() => {
-  sidebarWidth.target = sidebarOpen ? 240 : 0;
 });
 
 $effect(() => {
@@ -416,14 +411,16 @@ $effect(() => {
   class="w-full h-full flex bg-[#101012] text-[#E5E5E8] overflow-hidden select-none font-sans"
   style="opacity: {launchSpring.current.opacity}; transform: translateY({launchSpring.current.y}px) scale({launchSpring.current.scale});"
 >
-  {#if sidebarWidth.current > 0.5}
-    <div class="h-full shrink-0 overflow-hidden" style="width: {sidebarWidth.current}px;">
-      <Sidebar
-        onToggleSidebar={toggleSidebar}
-        onOpenSettings={() => settingsStore.openSettings()}
-      />
-    </div>
-  {/if}
+  <div
+    class="h-full shrink-0 overflow-hidden transition-[width] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] will-change-[width]"
+    style="width: {sidebarOpen ? '240px' : '0px'};"
+    aria-hidden={!sidebarOpen}
+  >
+    <Sidebar
+      onToggleSidebar={toggleSidebar}
+      onOpenSettings={() => settingsStore.openSettings()}
+    />
+  </div>
 
   <section class="flex-1 flex flex-col h-full min-w-0 relative">
     <DotGridCanvas active={chatStore.isStreaming} />
@@ -435,10 +432,10 @@ $effect(() => {
       class="h-11 w-full flex items-center justify-between pl-3 pr-2 shrink-0 z-40 relative"
     >
       <div>
-        {#if !sidebarOpen && sidebarWidth.current < 16}
+        {#if !sidebarOpen}
           <button
             type="button"
-            transition:fade={{ duration: 110 }}
+            transition:fade={{ duration: 130 }}
             data-tauri-drag-region="false"
             class="w-7 h-7 rounded-[4px] flex items-center justify-center text-[#7A7A82] hover:text-[#E5E5E8] hover:bg-white/[0.06] transition-colors"
             onclick={toggleSidebar}
@@ -510,10 +507,10 @@ $effect(() => {
           </div>
         </div>
       {/if}
+
+      <FilePreviewDrawer />
     </div>
   </section>
-
-  <FilePreviewDrawer />
 </div>
 </div>
 

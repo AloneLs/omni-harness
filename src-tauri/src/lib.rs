@@ -345,8 +345,46 @@ async fn delete_chat(state: State<'_, AppManagedState>, id: String) -> Result<()
 }
 
 #[tauri::command]
-async fn read_file_full(path: String) -> Result<String, String> {
-    let target = std::path::PathBuf::from(&path);
+async fn read_file_full(
+    state: State<'_, AppManagedState>,
+    path: String,
+    workspace_dir: Option<String>,
+    chat_id: Option<String>,
+) -> Result<String, String> {
+    let raw = path.trim();
+    let direct = std::path::PathBuf::from(raw);
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if direct.is_absolute() {
+        candidates.push(direct);
+    } else {
+        if let Some(wd) = workspace_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            candidates.push(std::path::PathBuf::from(wd).join(raw));
+        }
+        if let Some(cid) = chat_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Ok(chat) = state.app_state.db.get_chat(cid) {
+                if let Some(proj) = chat.project_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    candidates.push(std::path::PathBuf::from(proj).join(raw));
+                }
+            }
+            candidates.push(state::AppState::resolve_install_workspace().join(cid).join(raw));
+        }
+        let ws_dir = state.app_state.workspace_dir.read().await.clone();
+        if !ws_dir.as_os_str().is_empty() {
+            candidates.push(ws_dir.join(raw));
+        }
+        candidates.push(state::AppState::resolve_data_dir().join(raw));
+        candidates.push(direct);
+    }
+
+    let mut chosen: Option<std::path::PathBuf> = None;
+    for cand in &candidates {
+        tools::safety::SecretShield::check_path(cand)?;
+        if cand.is_file() {
+            chosen = Some(cand.clone());
+            break;
+        }
+    }
+    let target = chosen.unwrap_or_else(|| candidates.into_iter().next().unwrap_or_else(|| std::path::PathBuf::from(raw)));
     tools::safety::SecretShield::check_path(&target)?;
     tokio::task::spawn_blocking(move || std::fs::read_to_string(&target).map_err(|e| e.to_string()))
         .await

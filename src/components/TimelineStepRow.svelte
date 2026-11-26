@@ -95,6 +95,14 @@ let expandedToolView = $derived.by(() => {
   }
   return { readableOut, genImg, imgFile, writeFile, readFile, toolImg, cu, miniDiff, skillHtml };
 });
+let fallbackPreviewContent = $derived.by(() => {
+  if (step.kind !== 'tool') return undefined;
+  const rf = parseReadFile(step.record);
+  if (rf?.content) return rf.content;
+  const wf = parseWriteFile(step.record);
+  if (wf?.content) return wf.content;
+  return undefined;
+});
 </script>
 
 <div class="timeline-step-row">
@@ -175,12 +183,12 @@ let expandedToolView = $derived.by(() => {
                 class="{isToolRunning ? '' : 'text-[#D4D4D8] hover:text-white hover:underline'} {toolInfo.verb ? 'ml-1' : ''}"
                 onclick={(e) => {
                   e.stopPropagation();
-                  chatStore.openFilePreview(toolEditMeta.filePath, toolEditMeta.addedTexts, toolEditMeta.removedTexts);
+                  chatStore.openFilePreview(toolEditMeta.filePath, toolEditMeta.addedTexts, toolEditMeta.removedTexts, fallbackPreviewContent);
                 }}
                 onkeydown={(e) => {
                   if (e.key === 'Enter') {
                     e.stopPropagation();
-                    chatStore.openFilePreview(toolEditMeta.filePath, toolEditMeta.addedTexts, toolEditMeta.removedTexts);
+                    chatStore.openFilePreview(toolEditMeta.filePath, toolEditMeta.addedTexts, toolEditMeta.removedTexts, fallbackPreviewContent);
                   }
                 }}
               >{toolInfo.target}</span>
@@ -330,8 +338,7 @@ let expandedToolView = $derived.by(() => {
                 class="rounded-[6px] border border-white/[0.08] max-h-72 w-auto object-contain bg-[#0B0B0D] hover:opacity-95 transition-opacity"
               />
             </button>
-          {/if}
-          {#if call.terminalData}
+          {:else if call.terminalData}
             <div class="text-[#D4D4D8] whitespace-pre-wrap break-all">$ {call.terminalData.command}</div>
             {#if call.terminalData.stdout}
               <pre class="text-[#9BA1B0] whitespace-pre-wrap break-all max-h-52 overflow-y-auto">{call.terminalData.stdout}</pre>

@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { fly } from 'svelte/transition';
 import { cubicOut } from 'svelte/easing';
 import { chatStore } from '../lib/stores/chat.svelte';
+import { workspaceStore } from '../lib/stores/workspace.svelte';
 import { highlightCode } from '../lib/markdown';
 import FileToolIcon from './FileToolIcon.svelte';
 import Icon from './Icon.svelte';
@@ -10,6 +11,7 @@ import Icon from './Icon.svelte';
 let fileContent = $state<string>('');
 let loading = $state<boolean>(false);
 let errorMsg = $state<string | null>(null);
+let isFallbackContent = $state<boolean>(false);
 
 let preview = $derived(chatStore.filePreview);
 let fileName = $derived(preview ? (preview.path.split(/[\\/]/).pop() || preview.path) : '');
@@ -96,12 +98,20 @@ $effect(() => {
     fileContent = '';
     errorMsg = null;
     loading = false;
+    isFallbackContent = false;
     return;
   }
   let cancelled = false;
   loading = true;
   errorMsg = null;
-  invoke<string>('read_file_full', { path: req.path })
+  isFallbackContent = false;
+  const activeSession = chatStore.sessions.find((s) => s.id === chatStore.activeChatId);
+  const workspaceDir = activeSession?.projectPath || workspaceStore.currentPath || null;
+  invoke<string>('read_file_full', {
+    path: req.path,
+    workspaceDir,
+    chatId: chatStore.activeChatId || null
+  })
     .then((res) => {
       if (cancelled) return;
       fileContent = res;
@@ -109,6 +119,13 @@ $effect(() => {
     })
     .catch((err) => {
       if (cancelled) return;
+      if (req.fallbackContent) {
+        fileContent = req.fallbackContent;
+        isFallbackContent = true;
+        errorMsg = null;
+        loading = false;
+        return;
+      }
       errorMsg = err instanceof Error ? err.message : String(err);
       fileContent = '';
       loading = false;
@@ -122,7 +139,7 @@ $effect(() => {
 {#if preview}
   <aside
     transition:fly={{ x: 24, duration: 180, easing: cubicOut }}
-    class="w-[460px] max-w-[46vw] h-full shrink-0 bg-[#141417] border-l border-white/[0.08] flex flex-col select-none z-30"
+    class="w-[440px] max-w-[44vw] min-w-[260px] h-full shrink-0 bg-[#141417] border-l border-white/[0.08] flex flex-col select-none z-30"
   >
     <div class="h-11 px-3.5 border-b border-white/[0.06] flex items-center justify-between gap-2 shrink-0">
       <div class="flex items-center gap-2 min-w-0">
@@ -153,6 +170,11 @@ $effect(() => {
       {:else if errorMsg}
         <div class="p-4 text-[#F87171] text-xs whitespace-pre-wrap">{errorMsg}</div>
       {:else}
+        {#if isFallbackContent}
+          <div class="px-3 py-1.5 border-b border-white/[0.06] bg-[#F59E0B]/10 text-[#FCD34D] text-[11px] font-sans">
+            Cached tool output (file is not on disk at this path)
+          </div>
+        {/if}
         <div class="py-2">
           {#each renderedRows as row (row.key)}
             {#if row.kind === 'del'}
