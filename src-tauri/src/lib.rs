@@ -1291,13 +1291,13 @@ struct ChatRecoverySnapshot {
     recovered_from_checkpoint: bool,
 }
 
-fn convert_checkpoint_to_ui_messages(
+pub(crate) fn history_to_ui_json(
     chat_id: &str,
-    checkpoint_json: &str,
+    llm_msgs: &[llm::request_compat::ChatMessage],
     cached_json: Option<&str>,
     model_id: Option<&str>,
+    last_error: Option<&str>,
 ) -> Option<String> {
-    let llm_msgs: Vec<llm::request_compat::ChatMessage> = serde_json::from_str(checkpoint_json).ok()?;
     if llm_msgs.is_empty() {
         return None;
     }
@@ -1308,7 +1308,7 @@ fn convert_checkpoint_to_ui_messages(
 
     let mut ui_msgs: Vec<serde_json::Value> = Vec::new();
     let mut tool_results: std::collections::HashMap<String, (String, bool)> = std::collections::HashMap::new();
-    for m in &llm_msgs {
+    for m in llm_msgs {
         if m.role == "tool" {
             if let Some(id) = &m.tool_call_id {
                 let text = m.content.as_text_lossy();
@@ -1332,13 +1332,31 @@ fn convert_checkpoint_to_ui_messages(
                     if let Some(ca) = cm.get("createdAt").and_then(|v| v.as_i64()) {
                         msg["createdAt"] = serde_json::json!(ca);
                     }
+                    if let Some(mid) = cm.get("modelId").and_then(|v| v.as_str()) {
+                        if !mid.trim().is_empty() {
+                            msg["modelId"] = serde_json::Value::String(mid.to_string());
+                        }
+                    }
+                    if let Some(err) = cm.get("error").and_then(|v| v.as_str()) {
+                        if !err.trim().is_empty() {
+                            msg["error"] = serde_json::Value::String(err.to_string());
+                        }
+                    }
+                    let cached_steps_len = cm.get("steps").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                    let built_steps_len = msg.get("steps").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                    if cached_steps_len > 0 && cached_steps_len >= built_steps_len {
+                        msg["steps"] = cm["steps"].clone();
+                        if let Some(tc) = cm.get("toolCalls") {
+                            msg["toolCalls"] = tc.clone();
+                        }
+                    }
                 }
             }
             out.push(msg);
         }
     };
 
-    for m in &llm_msgs {
+    for m in llm_msgs {
         if m.role == "system" || m.role == "tool" {
             continue;
         }
@@ -1439,8 +1457,8 @@ fn convert_checkpoint_to_ui_messages(
                     let args_val: serde_json::Value = serde_json::from_str(&tc.function.arguments)
                         .unwrap_or_else(|_| serde_json::Value::Object(Default::default()));
                     let rec = serde_json::json!({
-                        "id": tc.id,
-                        "name": tc.function.name,
+                        "toolCallId": tc.id,
+                        "toolName": tc.function.name,
                         "args": args_val,
                         "rawArgs": tc.function.arguments,
                         "status": status,
@@ -1463,7 +1481,35 @@ fn convert_checkpoint_to_ui_messages(
     }
 
     flush_assistant(&mut active_assistant, &mut ui_msgs);
-    if let Some(last) = ui_msgs.last_mut() {
+    if let Some(err) = last_error.map(str::trim).filter(|s| !s.is_empty()) {
+        let append_new = match ui_msgs.last_mut() {
+            Some(last) if last.get("role").and_then(|v| v.as_str()) == Some("assistant") => {
+                last["error"] = serde_json::Value::String(err.to_string());
+                last["paused"] = serde_json::Value::Bool(false);
+                if let Some(mid) = model_id {
+                    last["modelId"] = serde_json::Value::String(mid.to_string());
+                }
+                false
+            }
+            _ => true,
+        };
+        if append_new {
+            ui_msgs.push(serde_json::json!({
+                "id": format!("rec-a-{}", ui_msgs.len()),
+                "chatId": chat_id,
+                "role": "assistant",
+                "content": "",
+                "modelId": model_id,
+                "reasoningContent": "",
+                "toolCalls": [],
+                "steps": [],
+                "error": err,
+                "streaming": false,
+                "paused": false,
+                "createdAt": now_ms
+            }));
+        }
+    } else if let Some(last) = ui_msgs.last_mut() {
         if last.get("role").and_then(|v| v.as_str()) == Some("assistant") {
             let has_paused_tool = last
                 .get("toolCalls")
@@ -1486,6 +1532,16 @@ fn convert_checkpoint_to_ui_messages(
     } else {
         serde_json::to_string(&ui_msgs).ok()
     }
+}
+
+fn convert_checkpoint_to_ui_messages(
+    chat_id: &str,
+    checkpoint_json: &str,
+    cached_json: Option<&str>,
+    model_id: Option<&str>,
+) -> Option<String> {
+    let llm_msgs: Vec<llm::request_compat::ChatMessage> = serde_json::from_str(checkpoint_json).ok()?;
+    history_to_ui_json(chat_id, &llm_msgs, cached_json, model_id, None)
 }
 
 #[tauri::command]

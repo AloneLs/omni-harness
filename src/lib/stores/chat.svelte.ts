@@ -1061,17 +1061,49 @@ class ChatStore {
       this.saveLocalOnly(chatId);
       return;
     }
+    if (evtType === 'turn_buffer_reset') {
+      msg.content = '';
+      msg.reasoningContent = '';
+      return;
+    }
+    if (evtType === 'retroactive_reasoning_move') {
+      const text = typeof payload?.reasoningContent === 'string' ? payload.reasoningContent : '';
+      if (text && msg.content.endsWith(text)) {
+        msg.content = msg.content.slice(0, msg.content.length - text.length);
+      } else {
+        msg.content = '';
+      }
+      if (text) {
+        msg.reasoningContent = msg.reasoningContent ? `${msg.reasoningContent}\n\n${text}` : text;
+        if (!msg.steps) msg.steps = [];
+        msg.steps.push({
+          kind: 'thought',
+          id: `th-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          text,
+          startedAt: Date.now(),
+          finishedAt: Date.now()
+        });
+      }
+      return;
+    }
     if (evtType === 'retry') {
       msg.statusText = `Reconnecting (attempt ${payload?.attempt || 1})...`;
       msg.retryReason = payload?.reason;
       return;
     }
     if (evtType === 'error') {
+      const evtModelId = typeof payload?.modelId === 'string' && payload.modelId.trim() ? payload.modelId.trim() : undefined;
+      const evtProviderId = typeof payload?.providerId === 'string' && payload.providerId.trim() ? payload.providerId.trim() : undefined;
       msg.error = payload?.error || 'Telegram execution failed';
       msg.streaming = false;
+      msg.statusText = undefined;
       msg.finishedAt = Date.now();
+      if (evtModelId) msg.modelId = evtModelId;
+      this.finalizeRunningTools(msg, 'error', msg.error);
       this.streamingChats[chatId] = false;
       if (sess) {
+        if (evtProviderId) sess.providerId = evtProviderId;
+        if (evtModelId) sess.modelId = evtModelId;
         sess.hasError = true;
         sess.updatedAt = Date.now();
       }
@@ -1269,6 +1301,32 @@ class ChatStore {
               dbMsgs.length > localMsgs.length ||
               (dbMsgs.length === localMsgs.length && changed && !hasTrailingIncompleteLocal);
             if (!this.streamingChats[bc.id] && (allowReplace || isTgDoneInDb)) {
+              let richConverted: ChatMessage[] | null = null;
+              try {
+                const snap = await invoke<{
+                  title: string;
+                  messagesJson: string;
+                  updatedAt: string;
+                  recoveredFromCheckpoint: boolean;
+                } | null>('get_chat_recovery_snapshot', { chatId: bc.id });
+                if (snap && typeof snap.messagesJson === 'string' && snap.messagesJson.trim()) {
+                  const parsed = JSON.parse(snap.messagesJson);
+                  if (Array.isArray(parsed) && parsed.length > 0) {
+                    const normalized = this.normalizeLoadedMessages(bc.id, parsed);
+                    const hasRichData = normalized.msgs.some(
+                      (m) =>
+                        (m.steps && m.steps.length > 0) ||
+                        (m.toolCalls && m.toolCalls.length > 0) ||
+                        Boolean(m.error)
+                    );
+                    if (hasRichData && normalized.msgs.length >= dbMsgs.length - 1) {
+                      richConverted = normalized.msgs;
+                    }
+                  }
+                }
+              } catch {
+              }
+
               const dedupedDb: typeof dbMsgs = [];
               for (const m of dbMsgs) {
                 const tail = dedupedDb[dedupedDb.length - 1];
@@ -1278,7 +1336,7 @@ class ChatStore {
                 dedupedDb.push(m);
               }
               const usedPrevIds = new Set<string>();
-              const converted: ChatMessage[] = dedupedDb.map((m, idx) => {
+              const converted: ChatMessage[] = richConverted || dedupedDb.map((m, idx) => {
                 let prev = localMsgs.find((lm) => lm.id === m.id && !usedPrevIds.has(lm.id));
                 if (!prev && localMsgs[idx]?.role === m.role && localMsgs[idx]?.content.trim() === m.content.trim() && !usedPrevIds.has(localMsgs[idx].id)) {
                   prev = localMsgs[idx];

@@ -3742,6 +3742,8 @@ async fn run_telegram_agent_turn(
                 crate::llm::StreamEvent::RetroactiveReasoningMove { text } => {
                     if final_text.ends_with(&text) {
                         final_text.truncate(final_text.len() - text.len());
+                    } else {
+                        final_text.clear();
                     }
                     reasoning_text.push_str(&text);
                     if let Some(ref app) = stream_app_ev {
@@ -4069,8 +4071,29 @@ async fn run_telegram_agent_turn(
             created_at: chrono::Utc::now().to_rfc3339(),
         };
         let _ = ctx.app_state.db.create_message(&asst_msg);
-        if let Ok(all_db_msgs) = ctx.app_state.db.list_messages(&chat_id) {
-            let chat_title = ctx.app_state.db.get_chat(&chat_id).map(|c| c.title).unwrap_or_else(|_| "Telegram Chat".to_string());
+        let chat_title = ctx
+            .app_state
+            .db
+            .get_chat(&chat_id)
+            .map(|c| c.title)
+            .unwrap_or_else(|_| "Telegram Chat".to_string());
+        let prev_cached_json = ctx
+            .app_state
+            .db
+            .get_cached_chat_messages(&chat_id)
+            .ok()
+            .flatten()
+            .map(|(_, j)| j);
+        let rich_json = crate::history_to_ui_json(
+            &chat_id,
+            &history,
+            prev_cached_json.as_deref(),
+            Some(&model.id),
+            None,
+        );
+        if let Some(j) = rich_json {
+            let _ = ctx.app_state.db.sync_chat_context(&chat_id, &chat_title, &j);
+        } else if let Ok(all_db_msgs) = ctx.app_state.db.list_messages(&chat_id) {
             let json_msgs: Vec<_> = all_db_msgs.into_iter().map(|m| {
                 serde_json::json!({
                     "id": m.id,
@@ -4165,21 +4188,48 @@ async fn run_telegram_agent_turn(
             emit_chat_updated(&ctx, &chat_id).await;
             return chat_id.clone();
         }
-        let asst_msg = crate::db::chats::Message {
-            id: uuid::Uuid::new_v4().to_string(),
-            chat_id: chat_id.clone(),
-            role: "assistant".to_string(),
-            content: format!("[Telegram] {}", err_msg),
-            model_id: Some(model.id.clone()),
-            reasoning_content: None,
-            tool_calls: None,
-            tool_call_id: None,
-            sequence_num: seq + 1,
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-        let _ = ctx.app_state.db.create_message(&asst_msg);
-        if let Ok(all_db_msgs) = ctx.app_state.db.list_messages(&chat_id) {
-            let chat_title = ctx.app_state.db.get_chat(&chat_id).map(|c| c.title).unwrap_or_else(|_| "Telegram Chat".to_string());
+        let has_turn_history = history
+            .last()
+            .map(|m| m.role == "assistant" || m.role == "tool")
+            .unwrap_or(false);
+        if !has_turn_history {
+            let asst_msg = crate::db::chats::Message {
+                id: uuid::Uuid::new_v4().to_string(),
+                chat_id: chat_id.clone(),
+                role: "assistant".to_string(),
+                content: format!("[Telegram] {}", err_msg),
+                model_id: Some(model.id.clone()),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                sequence_num: seq + 1,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let _ = ctx.app_state.db.create_message(&asst_msg);
+        }
+        let chat_title = ctx
+            .app_state
+            .db
+            .get_chat(&chat_id)
+            .map(|c| c.title)
+            .unwrap_or_else(|_| "Telegram Chat".to_string());
+        let prev_cached_json = ctx
+            .app_state
+            .db
+            .get_cached_chat_messages(&chat_id)
+            .ok()
+            .flatten()
+            .map(|(_, j)| j);
+        let rich_json = crate::history_to_ui_json(
+            &chat_id,
+            &history,
+            prev_cached_json.as_deref(),
+            Some(&model.id),
+            Some(&err_msg),
+        );
+        if let Some(j) = rich_json {
+            let _ = ctx.app_state.db.sync_chat_context(&chat_id, &chat_title, &j);
+        } else if let Ok(all_db_msgs) = ctx.app_state.db.list_messages(&chat_id) {
             let json_msgs: Vec<_> = all_db_msgs.into_iter().map(|m| {
                 serde_json::json!({
                     "id": m.id,
@@ -4200,7 +4250,8 @@ async fn run_telegram_agent_turn(
                 "telegram-chat-stream",
                 json!({
                     "chatId": chat_id,
-                    "type": "done",
+                    "type": "error",
+                    "error": err_msg,
                     "modelId": model.id,
                     "providerId": provider.id,
                 }),
