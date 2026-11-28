@@ -93,6 +93,9 @@ let splitPipeline = $derived.by(() => {
   if (!message.streaming && last && last.kind === 'message') {
     return { timelineSteps: allSteps.slice(0, -1), finalContent: last.text };
   }
+  if (!message.streaming && message.content && message.content.trim()) {
+    return { timelineSteps: allSteps, finalContent: message.content };
+  }
   return { timelineSteps: allSteps, finalContent: '' };
 });
 

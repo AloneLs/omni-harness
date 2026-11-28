@@ -1303,8 +1303,11 @@ pub(crate) fn history_to_ui_json(
     }
 
     let cached_arr: Vec<serde_json::Value> = cached_json
-        .and_then(|s| serde_json::from_str(s).ok())
-        .unwrap_or_default();
+        .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|v| v.get("role").and_then(|r| r.as_str()) != Some("system"))
+        .collect();
 
     let mut ui_msgs: Vec<serde_json::Value> = Vec::new();
     let mut tool_results: std::collections::HashMap<String, (String, bool)> = std::collections::HashMap::new();
@@ -1435,11 +1438,19 @@ pub(crate) fn history_to_ui_json(
                 } else {
                     let prev_c = entry["content"].as_str().unwrap_or("");
                     let next_c = if prev_c.is_empty() {
-                        msg_text
+                        msg_text.clone()
                     } else {
                         format!("{}\n\n{}", prev_c, msg_text)
                     };
                     entry["content"] = serde_json::Value::String(next_c);
+                    if let Some(steps) = entry["steps"].as_array_mut() {
+                        if !steps.is_empty() {
+                            steps.push(serde_json::json!({
+                                "kind": "message",
+                                "text": msg_text
+                            }));
+                        }
+                    }
                 }
             }
 
