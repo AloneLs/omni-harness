@@ -1107,6 +1107,10 @@ class ChatStore {
         sess.hasError = true;
         sess.updatedAt = Date.now();
       }
+      const tgTodos = this.todosByChat[chatId] || [];
+      if (tgTodos.length > 0) {
+        this.scheduleTodoAutoHideIfTerminal(chatId);
+      }
       this.saveLocalOnly(chatId);
       return;
     }
@@ -1126,12 +1130,7 @@ class ChatStore {
       if (sess && this.activeChatId !== chatId && !msg.error) {
         sess.hasUnreadCompletion = true;
       }
-      const tgTodos = this.todosByChat[chatId] || [];
-      if (tgTodos.length > 0 && tgTodos.every((t) => t.status === 'completed')) {
-        this.todoHideTimers[chatId] = setTimeout(() => {
-          this.todosByChat[chatId] = [];
-        }, 3500);
-      }
+      this.scheduleTodoAutoHideIfTerminal(chatId);
       this.saveLocalOnly(chatId);
     }
   }
@@ -2627,6 +2626,23 @@ class ChatStore {
     await this.runAssistantStream(chatId, newText.trim());
   }
 
+  private isTodoTerminal(t: TodoBoardItem): boolean {
+    return t.status === 'completed' || t.status === 'failed' || t.status === 'blocked';
+  }
+
+  private scheduleTodoAutoHideIfTerminal(chatId: string): void {
+    const todos = this.todosByChat[chatId] || [];
+    if (todos.length > 0 && todos.every((t) => this.isTodoTerminal(t))) {
+      if (this.todoHideTimers[chatId]) {
+        clearTimeout(this.todoHideTimers[chatId]);
+      }
+      this.todoHideTimers[chatId] = setTimeout(() => {
+        this.todosByChat[chatId] = [];
+        delete this.todoHideTimers[chatId];
+      }, 3500);
+    }
+  }
+
   private syncTodosFromMessages(chatId: string): void {
     if (this.todoHideTimers[chatId]) {
       clearTimeout(this.todoHideTimers[chatId]);
@@ -2636,7 +2652,7 @@ class ChatStore {
     for (let i = list.length - 1; i >= 0; i--) {
       const m = list[i];
       if (Array.isArray(m.todos) && m.todos.length > 0) {
-        const allDone = m.todos.every((t) => t.status === 'completed');
+        const allDone = !m.streaming && m.todos.every((t) => this.isTodoTerminal(t));
         this.todosByChat[chatId] = allDone ? [] : m.todos.map((t) => ({ ...t }));
         return;
       }
@@ -3054,12 +3070,7 @@ class ChatStore {
       currentAssistantMsg.streaming = false;
       currentAssistantMsg.paused = false;
       this.finalizeRunningTools(currentAssistantMsg, 'success');
-      const todos = this.todosByChat[cid] || [];
-      if (todos.length > 0 && todos.every((t) => t.status === 'completed')) {
-        this.todoHideTimers[cid] = setTimeout(() => {
-          this.todosByChat[cid] = [];
-        }, 3500);
-      }
+      this.scheduleTodoAutoHideIfTerminal(cid);
       void this.saveSessions(cid);
     } else if (event.type === 'error') {
       currentAssistantMsg.imageGenerating = false;
@@ -3080,6 +3091,7 @@ class ChatStore {
       currentAssistantMsg.paused = false;
       const isCancel = currentAssistantMsg.error === 'User canceled execution';
       this.finalizeRunningTools(currentAssistantMsg, isCancel ? 'cancelled' : 'error', currentAssistantMsg.error);
+      this.scheduleTodoAutoHideIfTerminal(cid);
       const s = this.sessions.find((x) => x.id === cid);
       if (s) {
         s.hasError = !isCancel;

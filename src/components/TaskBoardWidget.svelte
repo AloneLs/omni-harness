@@ -28,6 +28,8 @@ $effect(() => {
 let todos = $derived(chatStore.activeTodos);
 let hasTodos = $derived(todos.length > 0);
 let doneCount = $derived(todos.filter((t) => t.status === 'completed').length);
+let failedCount = $derived(todos.filter((t) => t.status === 'failed' || t.status === 'blocked').length);
+let terminalCount = $derived(doneCount + failedCount);
 
 const widgetSpring = new Spring({ opacity: 0, scale: 0.94, y: -10, x: 10 }, SPRING_POPUP);
 
@@ -54,11 +56,15 @@ $effect(() => {
       >
         <div class="flex items-center gap-2 min-w-0">
           {#if collapsed}
-            {#if doneCount < todos.length && chatStore.isStreaming}
+            {#if terminalCount < todos.length && chatStore.isStreaming}
               <svg class="w-3.5 h-3.5 text-[#EDEDEF] animate-spin shrink-0" viewBox="0 0 24 24" fill="none">
                 <circle class="opacity-20" cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2.2"></circle>
                 <path d="M21 12a9 9 0 0 0-9-9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
               </svg>
+            {:else if todos.length > 0 && terminalCount === todos.length && failedCount > 0}
+              <span class="w-3.5 h-3.5 rounded-full bg-[#F87171]/20 text-[#F87171] flex items-center justify-center shrink-0">
+                <Icon name="close" class="w-2.5 h-2.5" strokeWidth={2.4} />
+              </span>
             {:else if todos.length > 0 && doneCount === todos.length}
               <span class="w-3.5 h-3.5 rounded-full bg-[#6EE7B7]/20 text-[#6EE7B7] flex items-center justify-center shrink-0">
                 <Icon name="check" class="w-2.5 h-2.5" strokeWidth={2.5} />
